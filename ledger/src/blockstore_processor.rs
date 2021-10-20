@@ -1001,42 +1001,17 @@ fn load_frozen_forks(
             )
             .is_err()
             {
-                use solana_runtime::accounts_db::AccountsDb;
-                use solana_sdk::account::ReadableAccount;
                 if let Some(parent) = bank.parent() {
-                    let parent_slot = parent.slot();
-                    warn!("Error while processing single slot {}! Dumping accounts info for parent bank at slot {}:", slot, parent_slot);
-                    parent
-                        .rc
-                        .accounts
-                        .accounts_db
-                        .accounts_index
-                        .account_maps
-                        .iter()
-                        .for_each(|account_map| {
-                            account_map.read().unwrap().iter().for_each(
-                                |(pubkey, _account_info)| {
-                                    parent.get_account_with_fixed_root(pubkey).map(
-                                        |account_data| {
-                                            warn!(
-                                                "pubkey, lamports, accounts hash: {}, {}, {}",
-                                                pubkey,
-                                                account_data.lamports(),
-                                                AccountsDb::hash_account(
-                                                    parent_slot,
-                                                    &account_data,
-                                                    pubkey
-                                                )
-                                            )
-                                        },
-                                    );
-                                },
-                            )
-                        });
-                    warn!("parent bank hash: {}", parent.hash());
+                    warn!(
+                        "Error while processing single slot {}! bank hash: {}, parent bank slot {}, parent bank hash: {}",
+                        slot,
+                        bank.hash(),
+                        parent.slot(),
+                        parent.hash()
+                    );
                 }
 
-                std::process::exit(1);
+                continue;
             }
             txs += progress.num_txs;
 
