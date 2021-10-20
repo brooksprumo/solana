@@ -1066,30 +1066,27 @@ fn load_frozen_forks(
                 }
             };
 
-            /* bprumo DEBUG: Comment out the squash and the "filtering" at the bottom of the block
-             *
-             *             if let Some(new_root_bank) = new_root_bank {
-             *                 *root = new_root_bank.slot();
-             *                 last_root = new_root_bank.slot();
-             *
-             *                 leader_schedule_cache.set_root(new_root_bank);
-             *                 new_root_bank.squash();
-             *
-             *                 if last_free.elapsed() > Duration::from_secs(10) {
-             *                     // Must be called after `squash()`, so that AccountsDb knows what
-             *                     // the roots are for the cache flushing in exhaustively_free_unused_resource().
-             *                     // This could take few secs; so update last_free later
-             *                     new_root_bank.exhaustively_free_unused_resource();
-             *                     last_free = Instant::now();
-             *                 }
-             *
-             *                 // Filter out all non descendants of the new root
-             *                 pending_slots
-             *                     .retain(|(_, pending_bank, _)| pending_bank.ancestors.contains_key(root));
-             *                 initial_forks.retain(|_, fork_tip_bank| fork_tip_bank.ancestors.contains_key(root));
-             *                 all_banks.retain(|_, bank| bank.ancestors.contains_key(root));
-             *             }
-             */
+            if let Some(new_root_bank) = new_root_bank {
+                *root = new_root_bank.slot();
+                last_root = new_root_bank.slot();
+
+                leader_schedule_cache.set_root(new_root_bank);
+                new_root_bank.squash();
+
+                if last_free.elapsed() > Duration::from_secs(10) {
+                    // Must be called after `squash()`, so that AccountsDb knows what
+                    // the roots are for the cache flushing in exhaustively_free_unused_resource().
+                    // This could take few secs; so update last_free later
+                    new_root_bank.exhaustively_free_unused_resource();
+                    last_free = Instant::now();
+                }
+
+                // Filter out all non descendants of the new root
+                pending_slots
+                    .retain(|(_, pending_bank, _)| pending_bank.ancestors.contains_key(root));
+                initial_forks.retain(|_, fork_tip_bank| fork_tip_bank.ancestors.contains_key(root));
+                all_banks.retain(|_, bank| bank.ancestors.contains_key(root));
+            }
 
             slots_elapsed += 1;
 
