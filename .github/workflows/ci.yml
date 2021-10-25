@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  sanitizer-tests:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [ address, memory, thread, leak ]
+
+    name: Test with ${{ matrix.sanitizer }} sanitizer
+    steps:
+      - uses: actions/checkout@v2
+      - uses: hecrj/setup-rust-action@v1
+        with:
+          rust-version: nightly
+          components: rust-src
+      - name: Test with sanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=${{ matrix.sanitizer }}
+          RUSTDOCFLAGS: -Zsanitizer=${{ matrix.sanitizer }}
+          # only needed by asan
+          ASAN_OPTIONS: detect_stack_use_after_return=1
+          # Asan's leak detection occasionally complains
+          # about some small leaks if backtraces are captured,
+          # so ensure they're not
+          RUST_BACKTRACE: 0
+        run: |
+          cargo test -Zbuild-std --verbose --target=x86_64-unknown-linux-gnu --no-default-features
+          cargo test -Zbuild-std --verbose --target=x86_64-unknown-linux-gnu --all-features
+
+          on: [push]
+
+
+  check:
+    name: Rust project
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Install latest nightly
+        uses: actions-rs/toolchain@v1
+        with:
+            toolchain: nightly
+            override: true
+            components: rustfmt, clippy
+
+      # `cargo check` command here will use installed `nightly`
+      # as it is set as an "override" for current directory
+
+      - name: Run cargo check
+        uses: actions-rs/cargo@v1
+        with:
+          command: check
+
