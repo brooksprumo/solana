@@ -1095,6 +1095,8 @@ struct AccountsStats {
     store_find_existing: AtomicU64,
     dropped_stores: AtomicU64,
     store_uncleaned_update: AtomicU64,
+
+    num_new_rent_paying_accounts: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -6353,6 +6355,13 @@ impl AccountsDb {
                     self.stats.calc_stored_meta.swap(0, Ordering::Relaxed),
                     i64
                 ),
+                (
+                    "num_new_rent_paying_accounts",
+                    self.stats
+                        .num_new_rent_paying_accounts
+                        .swap(0, Ordering::Relaxed),
+                    i64
+                ),
             );
 
             let recycle_stores = self.recycle_stores.read().unwrap();
@@ -6490,29 +6499,35 @@ impl AccountsDb {
 
         let previous_slot_entry_was_cached = self.caching_enabled && is_cached_store;
 
-        if self.is_rooted_slot(slot) {
-            let mut count_rent_paying = 0;
-            for account in infos/accounts {
-                if account is rent_paying {
-                    // some code like this:
-                    let lock = self.accounts_index.get_account_maps_read_lock(&key);
-                    let x = lock.get(&key).unwrap();
-                    let sl = x.slot_list.read().unwrap();
-                    let mut found_in_earlier_slot = false;
-                    for (slot2, account_info2) in sl.iter() {
-                        if slot2 < slot && self.is_root(slot2) {
-                            // you are looking for entries fro rooted slots that are < 'slot'
-                            found_in_earlier_slot = true;
-                            break;
-                        }
-                    }
-                    if !found_in_earlier_slot {
-                        count_rent_paying += 1;
-                    }
+        fn is_rent_paying(pubkey: &Pubkey, account: &impl ReadableAccount) -> bool {
+            let rent_collector = RentCollector::default();
+            rent_collector.should_collect_rent(pubkey, account, false)
+                || !rent_collector.get_rent_due(account).1
+        }
 
+        if self.accounts_index.is_root(slot) {
+            let mut num_new_rent_paying_accounts = 0;
+            for &(pubkey, account) in accounts {
+                if is_rent_paying(pubkey, account) {
+                    let account_maps = self.accounts_index.get_account_maps_read_lock(pubkey);
+                    let account_map = account_maps.get(pubkey).unwrap();
+                    let slot_list = account_map.slot_list.read().unwrap();
+
+                    let found_in_earlier_slot = slot_list.iter().any(|&(other_slot, _)| {
+                        other_slot < slot && self.accounts_index.is_root(other_slot)
+                    });
+                    if !found_in_earlier_slot {
+                        num_new_rent_paying_accounts += 1;
+                    }
                 }
             }
-            // TODO log count_rent_paying here
+            error!(
+                "bprumo DEBUG: num new rent paying accounts: {}",
+                num_new_rent_paying_accounts
+            );
+            self.stats
+                .store_accounts
+                .fetch_add(num_new_rent_paying_accounts, Ordering::Relaxed);
         }
 
         // If the cache was flushed, then because `update_index` occurs
