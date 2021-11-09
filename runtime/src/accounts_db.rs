@@ -6526,7 +6526,7 @@ impl AccountsDb {
                 num_new_rent_paying_accounts
             );
             self.stats
-                .store_accounts
+                .num_new_rent_paying_accounts
                 .fetch_add(num_new_rent_paying_accounts, Ordering::Relaxed);
         }
 
