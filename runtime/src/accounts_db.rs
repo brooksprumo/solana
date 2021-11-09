@@ -6499,11 +6499,18 @@ impl AccountsDb {
 
         let previous_slot_entry_was_cached = self.caching_enabled && is_cached_store;
 
-        fn is_rent_paying(pubkey: &Pubkey, account: &impl ReadableAccount) -> bool {
+        let is_rent_paying = |pubkey, account| {
+            fn _is_rent_paying(
+                rent_collector: &RentCollector,
+                pubkey: &Pubkey,
+                account: &impl ReadableAccount,
+            ) -> bool {
+                rent_collector.should_collect_rent(pubkey, account, false)
+                    || !rent_collector.get_rent_due(account).1
+            }
             let rent_collector = RentCollector::default();
-            rent_collector.should_collect_rent(pubkey, account, false)
-                || !rent_collector.get_rent_due(account).1
-        }
+            _is_rent_paying(&rent_collector, pubkey, account)
+        };
 
         if self.accounts_index.is_root(slot) {
             let mut num_new_rent_paying_accounts = 0;
