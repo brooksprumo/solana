@@ -6514,6 +6514,7 @@ impl AccountsDb {
 
         if self.accounts_index.is_root(slot) {
             let mut num_new_rent_paying_accounts = 0;
+            let mut num_old_rent_paying_accounts = 0;
             for &(pubkey, account) in accounts {
                 if account.lamports() > 0 && is_rent_paying(pubkey, account) {
                     let account_maps = self.accounts_index.get_account_maps_read_lock(pubkey);
@@ -6525,12 +6526,14 @@ impl AccountsDb {
                     });
                     if !found_in_earlier_slot {
                         num_new_rent_paying_accounts += 1;
+                    } else {
+                        num_old_rent_paying_accounts += 1;
                     }
                 }
             }
             error!(
-                "bprumo DEBUG: num new rent paying accounts: {}",
-                num_new_rent_paying_accounts
+                "bprumo DEBUG: num new rent paying accounts: {}, num old rent paying accounts: {}",
+                num_new_rent_paying_accounts, num_old_rent_paying_accounts
             );
             self.stats
                 .num_new_rent_paying_accounts
