@@ -6515,8 +6515,8 @@ impl AccountsDb {
         if self.accounts_index.is_root(slot) {
             let mut num_new_rent_paying_accounts = 0;
             let mut num_old_rent_paying_accounts = 0;
-            for &(pubkey, account) in accounts {
-                if account.lamports() > 0 && is_rent_paying(pubkey, account) {
+            for (&(pubkey, account), info) in accounts.iter().zip(infos.iter()) {
+                if account.lamports() > 0 && info.is_cached() && is_rent_paying(pubkey, account) {
                     let account_maps = self.accounts_index.get_account_maps_read_lock(pubkey);
                     let account_map = account_maps.get(pubkey).unwrap();
                     let slot_list = account_map.slot_list.read().unwrap();
