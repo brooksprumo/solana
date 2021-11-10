@@ -6497,48 +6497,10 @@ impl AccountsDb {
             .fetch_add(store_accounts_time.as_us(), Ordering::Relaxed);
         let mut update_index_time = Measure::start("update_index");
 
+        let rent_collector = RentCollector::default();
+        self.do_num_new_rent_paying_accounts_stats(&rent_collector, slot, accounts, &infos);
+
         let previous_slot_entry_was_cached = self.caching_enabled && is_cached_store;
-
-        let is_rent_paying = {
-            fn _is_rent_paying(
-                rent_collector: &RentCollector,
-                pubkey: &Pubkey,
-                account: &impl ReadableAccount,
-            ) -> bool {
-                rent_collector.should_collect_rent(pubkey, account, false)
-                    || !rent_collector.get_rent_due(account).1
-            }
-            let rent_collector = RentCollector::default();
-            move |pubkey, account| _is_rent_paying(&rent_collector, pubkey, account)
-        };
-
-        if self.accounts_index.is_root(slot) {
-            let mut num_new_rent_paying_accounts = 0;
-            let mut num_old_rent_paying_accounts = 0;
-            for (&(pubkey, account), info) in accounts.iter().zip(infos.iter()) {
-                if account.lamports() > 0 && info.is_cached() && is_rent_paying(pubkey, account) {
-                    let account_maps = self.accounts_index.get_account_maps_read_lock(pubkey);
-                    let account_map = account_maps.get(pubkey).unwrap();
-                    let slot_list = account_map.slot_list.read().unwrap();
-
-                    let found_in_earlier_slot = slot_list.iter().any(|&(other_slot, _)| {
-                        other_slot < slot && self.accounts_index.is_root(other_slot)
-                    });
-                    if !found_in_earlier_slot {
-                        num_new_rent_paying_accounts += 1;
-                    } else {
-                        num_old_rent_paying_accounts += 1;
-                    }
-                }
-            }
-            error!(
-                "bprumo DEBUG: num new rent paying accounts: {}, num old rent paying accounts: {}",
-                num_new_rent_paying_accounts, num_old_rent_paying_accounts
-            );
-            self.stats
-                .num_new_rent_paying_accounts
-                .fetch_add(num_new_rent_paying_accounts, Ordering::Relaxed);
-        }
 
         // If the cache was flushed, then because `update_index` occurs
         // after the account are stored by the above `store_accounts_to`
@@ -6585,6 +6547,48 @@ impl AccountsDb {
             store_accounts_elapsed: store_accounts_time.as_us(),
             update_index_elapsed: update_index_time.as_us(),
             handle_reclaims_elapsed: handle_reclaims_time.as_us(),
+        }
+    }
+
+    /// For stats, check to see how many new rent-paying accounts there are.
+    fn do_num_new_rent_paying_accounts_stats<T: ReadableAccount>(
+        &self,
+        rent_collector: &RentCollector,
+        slot: Slot,
+        accounts: &[(&Pubkey, &T)],
+        infos: &[AccountInfo],
+    ) {
+        fn _is_rent_paying(
+            rent_collector: &RentCollector,
+            pubkey: &Pubkey,
+            account: &impl ReadableAccount,
+        ) -> bool {
+            rent_collector.should_collect_rent(pubkey, account, false)
+                || !rent_collector.get_rent_due(account).1
+        }
+
+        if self.accounts_index.is_root(slot) {
+            let mut num_new_rent_paying_accounts = 0;
+            for (&(pubkey, account), info) in accounts.iter().zip(infos.iter()) {
+                if account.lamports() > 0
+                    && info.is_cached()
+                    && _is_rent_paying(rent_collector, pubkey, account)
+                {
+                    let account_maps = self.accounts_index.get_account_maps_read_lock(pubkey);
+                    let account_map = account_maps.get(pubkey).unwrap();
+                    let slot_list = account_map.slot_list.read().unwrap();
+
+                    let found_in_earlier_slot = slot_list.iter().any(|&(other_slot, _)| {
+                        other_slot < slot && self.accounts_index.is_root(other_slot)
+                    });
+                    if !found_in_earlier_slot {
+                        num_new_rent_paying_accounts += 1;
+                    }
+                }
+            }
+            self.stats
+                .num_new_rent_paying_accounts
+                .fetch_add(num_new_rent_paying_accounts, Ordering::Relaxed);
         }
     }
 
