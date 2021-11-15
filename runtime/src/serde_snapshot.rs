@@ -206,14 +206,18 @@ pub(crate) fn bank_from_streams<R>(
     verify_index: bool,
     accounts_db_config: Option<AccountsDbConfig>,
     accounts_update_notifier: Option<AccountsUpdateNotifier>,
-) -> std::result::Result<Bank, Error>
+) -> std::result::Result<(Bank, u64), Error>
 where
     R: Read,
 {
     macro_rules! INTO {
         ($x:ident) => {{
+            // bprumo TODO: get the block height from the full_snapshot_bank_fields and then return
+            // it up. Plumb that through all the way to SnapshotPackagerService for the starting
+            // snapshot hashes.
             let (full_snapshot_bank_fields, full_snapshot_accounts_db_fields) =
                 $x::deserialize_bank_fields(snapshot_streams.full_snapshot_stream)?;
+            let full_snapshot_block_height = full_snapshot_bank_fields.block_height;
             let (incremental_snapshot_bank_fields, incremental_snapshot_accounts_db_fields) =
                 if let Some(ref mut incremental_snapshot_stream) =
                     snapshot_streams.incremental_snapshot_stream
@@ -246,7 +250,7 @@ where
                 accounts_db_config,
                 accounts_update_notifier,
             )?;
-            Ok(bank)
+            Ok((bank, full_snapshot_block_height))
         }};
     }
     match serde_style {
