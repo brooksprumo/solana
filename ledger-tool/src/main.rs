@@ -2444,7 +2444,7 @@ fn main() {
                             let incremental_snapshot_archive_info =
                                 snapshot_utils::bank_to_incremental_snapshot_archive(
                                     ledger_path,
-                                    &bank,
+                                    Arc::clone(&bank),
                                     full_snapshot_slot,
                                     Some(snapshot_version),
                                     output_directory,
@@ -2468,7 +2468,7 @@ fn main() {
                             let full_snapshot_archive_info =
                                 snapshot_utils::bank_to_full_snapshot_archive(
                                     ledger_path,
-                                    &bank,
+                                    Arc::clone(&bank),
                                     Some(snapshot_version),
                                     output_directory,
                                     ArchiveFormat::TarZstd,

@@ -1622,7 +1622,7 @@ where
 /// snapshot is not permitted to fail, any errors returned here will trigger the node to shutdown.
 /// So, be careful whenever adding new code that may return errors.
 pub fn snapshot_bank(
-    root_bank: &Bank,
+    root_bank: Arc<Bank>,
     status_cache_slot_deltas: Vec<BankSlotDelta>,
     accounts_package_sender: &AccountsPackageSender,
     bank_snapshots_dir: impl AsRef<Path>,
@@ -1632,12 +1632,12 @@ pub fn snapshot_bank(
     hash_for_testing: Option<Hash>,
     snapshot_type: Option<SnapshotType>,
 ) -> Result<()> {
-    let snapshot_storages = get_snapshot_storages(root_bank, snapshot_type);
+    let snapshot_storages = get_snapshot_storages(&root_bank, snapshot_type);
 
     let mut add_snapshot_time = Measure::start("add-snapshot-ms");
     let bank_snapshot_info = add_bank_snapshot(
         &bank_snapshots_dir,
-        root_bank,
+        &root_bank,
         &snapshot_storages,
         snapshot_version,
     )?;
@@ -1712,7 +1712,7 @@ fn get_snapshot_storages(bank: &Bank, snapshot_type: Option<SnapshotType>) -> Sn
 ///     - `bank` is complete
 pub fn bank_to_full_snapshot_archive(
     bank_snapshots_dir: impl AsRef<Path>,
-    bank: &Bank,
+    bank: Arc<Bank>,
     snapshot_version: Option<SnapshotVersion>,
     snapshot_archives_dir: impl AsRef<Path>,
     archive_format: ArchiveFormat,
@@ -1731,7 +1731,7 @@ pub fn bank_to_full_snapshot_archive(
     let temp_dir = tempfile::tempdir_in(bank_snapshots_dir)?;
     let snapshot_storages = bank.get_snapshot_storages(None);
     let bank_snapshot_info =
-        add_bank_snapshot(&temp_dir, bank, &snapshot_storages, snapshot_version)?;
+        add_bank_snapshot(&temp_dir, &bank, &snapshot_storages, snapshot_version)?;
 
     package_and_archive_full_snapshot(
         bank,
@@ -1754,7 +1754,7 @@ pub fn bank_to_full_snapshot_archive(
 ///     - `bank`'s slot is greater than `full_snapshot_slot`
 pub fn bank_to_incremental_snapshot_archive(
     bank_snapshots_dir: impl AsRef<Path>,
-    bank: &Bank,
+    bank: Arc<Bank>,
     full_snapshot_slot: Slot,
     snapshot_version: Option<SnapshotVersion>,
     snapshot_archives_dir: impl AsRef<Path>,
@@ -1775,7 +1775,7 @@ pub fn bank_to_incremental_snapshot_archive(
     let temp_dir = tempfile::tempdir_in(bank_snapshots_dir)?;
     let snapshot_storages = bank.get_snapshot_storages(Some(full_snapshot_slot));
     let bank_snapshot_info =
-        add_bank_snapshot(&temp_dir, bank, &snapshot_storages, snapshot_version)?;
+        add_bank_snapshot(&temp_dir, &bank, &snapshot_storages, snapshot_version)?;
 
     package_and_archive_incremental_snapshot(
         bank,
@@ -1793,7 +1793,7 @@ pub fn bank_to_incremental_snapshot_archive(
 
 /// Helper function to hold shared code to package, process, and archive full snapshots
 pub fn package_and_archive_full_snapshot(
-    bank: &Bank,
+    bank: Arc<Bank>,
     bank_snapshot_info: &BankSnapshotInfo,
     bank_snapshots_dir: impl AsRef<Path>,
     snapshot_archives_dir: impl AsRef<Path>,
@@ -1803,11 +1803,12 @@ pub fn package_and_archive_full_snapshot(
     maximum_full_snapshot_archives_to_retain: usize,
     maximum_incremental_snapshot_archives_to_retain: usize,
 ) -> Result<FullSnapshotArchiveInfo> {
+    let slot_deltas = bank.src.slot_deltas(&bank.src.roots());
     let accounts_package = AccountsPackage::new(
         bank,
         bank_snapshot_info,
         bank_snapshots_dir,
-        bank.src.slot_deltas(&bank.src.roots()),
+        slot_deltas,
         snapshot_archives_dir,
         snapshot_storages,
         archive_format,
@@ -1831,7 +1832,7 @@ pub fn package_and_archive_full_snapshot(
 /// Helper function to hold shared code to package, process, and archive incremental snapshots
 #[allow(clippy::too_many_arguments)]
 pub fn package_and_archive_incremental_snapshot(
-    bank: &Bank,
+    bank: Arc<Bank>,
     incremental_snapshot_base_slot: Slot,
     bank_snapshot_info: &BankSnapshotInfo,
     bank_snapshots_dir: impl AsRef<Path>,
@@ -1842,11 +1843,12 @@ pub fn package_and_archive_incremental_snapshot(
     maximum_full_snapshot_archives_to_retain: usize,
     maximum_incremental_snapshot_archives_to_retain: usize,
 ) -> Result<IncrementalSnapshotArchiveInfo> {
+    let slot_deltas = bank.src.slot_deltas(&bank.src.roots());
     let accounts_package = AccountsPackage::new(
         bank,
         bank_snapshot_info,
         bank_snapshots_dir,
-        bank.src.slot_deltas(&bank.src.roots()),
+        slot_deltas,
         snapshot_archives_dir,
         snapshot_storages,
         archive_format,
@@ -2673,6 +2675,7 @@ mod tests {
         solana_logger::setup();
         let genesis_config = GenesisConfig::default();
         let original_bank = Bank::new_for_tests(&genesis_config);
+        let original_bank = Arc::new(original_bank);
 
         while !original_bank.is_complete() {
             original_bank.register_tick(&Hash::new_unique());
@@ -2685,7 +2688,7 @@ mod tests {
 
         let snapshot_archive_info = bank_to_full_snapshot_archive(
             &bank_snapshots_dir,
-            &original_bank,
+            Arc::clone(&original_bank),
             None,
             snapshot_archives_dir.path(),
             snapshot_archive_format,
@@ -2714,7 +2717,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(original_bank, roundtrip_bank);
+        assert_eq!(*original_bank, roundtrip_bank);
     }
 
     /// Test roundtrip of bank to a full snapshot, then back again.  This test is more involved
@@ -2776,7 +2779,7 @@ mod tests {
 
         let full_snapshot_archive_info = bank_to_full_snapshot_archive(
             bank_snapshots_dir.path(),
-            &bank4,
+            Arc::clone(&bank4),
             None,
             snapshot_archives_dir.path(),
             snapshot_archive_format,
@@ -2853,7 +2856,7 @@ mod tests {
         let full_snapshot_slot = slot;
         let full_snapshot_archive_info = bank_to_full_snapshot_archive(
             bank_snapshots_dir.path(),
-            &bank1,
+            Arc::clone(&bank1),
             None,
             snapshot_archives_dir.path(),
             snapshot_archive_format,
@@ -2885,7 +2888,7 @@ mod tests {
 
         let incremental_snapshot_archive_info = bank_to_incremental_snapshot_archive(
             bank_snapshots_dir.path(),
-            &bank4,
+            Arc::clone(&bank4),
             full_snapshot_slot,
             None,
             snapshot_archives_dir.path(),
@@ -2953,7 +2956,7 @@ mod tests {
         let full_snapshot_slot = slot;
         bank_to_full_snapshot_archive(
             &bank_snapshots_dir,
-            &bank1,
+            Arc::clone(&bank1),
             None,
             &snapshot_archives_dir,
             snapshot_archive_format,
@@ -2985,7 +2988,7 @@ mod tests {
 
         bank_to_incremental_snapshot_archive(
             &bank_snapshots_dir,
-            &bank4,
+            Arc::clone(&bank4),
             full_snapshot_slot,
             None,
             &snapshot_archives_dir,
@@ -3084,7 +3087,7 @@ mod tests {
         let full_snapshot_slot = slot;
         let full_snapshot_archive_info = bank_to_full_snapshot_archive(
             bank_snapshots_dir.path(),
-            &bank1,
+            Arc::clone(&bank1),
             None,
             snapshot_archives_dir.path(),
             snapshot_archive_format,
@@ -3123,7 +3126,7 @@ mod tests {
         // deserializes correctly.
         let incremental_snapshot_archive_info = bank_to_incremental_snapshot_archive(
             bank_snapshots_dir.path(),
-            &bank2,
+            Arc::clone(&bank2),
             full_snapshot_slot,
             None,
             snapshot_archives_dir.path(),
@@ -3184,7 +3187,7 @@ mod tests {
         // deserializes correctly
         let incremental_snapshot_archive_info = bank_to_incremental_snapshot_archive(
             bank_snapshots_dir.path(),
-            &bank4,
+            Arc::clone(&bank4),
             full_snapshot_slot,
             None,
             snapshot_archives_dir.path(),

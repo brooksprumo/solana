@@ -1379,7 +1379,7 @@ fn new_banks_from_ledger(
 
         let full_snapshot_archive_info = snapshot_utils::bank_to_full_snapshot_archive(
             ledger_path,
-            &bank_forks.root_bank(),
+            Arc::clone(&bank_forks.root_bank()),
             None,
             &snapshot_config.snapshot_archives_dir,
             snapshot_config.archive_format,

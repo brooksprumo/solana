@@ -67,6 +67,8 @@ impl AccountsHashVerifier {
                                 thread_pool = Some(accounts_db::make_min_priority_thread_pool());
                             }
 
+                            error!("bprumo DEBUG: bank slot: {}", accounts_package.bank.slot());
+
                             Self::process_accounts_package(
                                 accounts_package,
                                 &cluster_info,
@@ -284,7 +286,10 @@ mod tests {
     use {
         super::*,
         solana_gossip::{cluster_info::make_accounts_hashes_message, contact_info::ContactInfo},
-        solana_runtime::snapshot_utils::{ArchiveFormat, SnapshotVersion},
+        solana_runtime::{
+            bank::Bank,
+            snapshot_utils::{ArchiveFormat, SnapshotVersion},
+        },
         solana_sdk::{
             genesis_config::ClusterType,
             hash::hash,
@@ -368,6 +373,7 @@ mod tests {
                 hash_for_testing: None,
                 cluster_type: ClusterType::MainnetBeta,
                 snapshot_type: None,
+                bank: Arc::new(Bank::default_for_tests()),
             };
 
             let ledger_path = TempDir::new().unwrap();

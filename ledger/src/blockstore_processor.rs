@@ -1288,7 +1288,7 @@ fn load_frozen_forks(
                             false,
                         );
                         snapshot_utils::snapshot_bank(
-                            new_root_bank,
+                            Arc::clone(new_root_bank),
                             new_root_bank.src.slot_deltas(&new_root_bank.src.roots()),
                             &accounts_package_sender,
                             &snapshot_config.bank_snapshots_dir,

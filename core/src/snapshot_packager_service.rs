@@ -79,6 +79,8 @@ impl SnapshotPackagerService {
                     }
                     let snapshot_package = snapshot_package.unwrap();
 
+                    error!("bprumo DEBUG: bank slot: {}", snapshot_package.bank.slot());
+
                     // Archiving the snapshot package is not allowed to fail.
                     // AccountsBackgroundService calls `clean_accounts()` with a value for
                     // last_full_snapshot_slot that requires this archive call to succeed.
@@ -215,7 +217,7 @@ mod tests {
         bincode::serialize_into,
         solana_runtime::{
             accounts_db::AccountStorageEntry,
-            bank::BankSlotDelta,
+            bank::{Bank, BankSlotDelta},
             snapshot_archive_info::SnapshotArchiveInfo,
             snapshot_package::{SnapshotPackage, SnapshotType},
             snapshot_utils::{
@@ -320,6 +322,7 @@ mod tests {
             snapshot_storages: vec![storage_entries],
             snapshot_version: SnapshotVersion::default(),
             snapshot_type: SnapshotType::FullSnapshot,
+            bank: Arc::new(Bank::default_for_tests()),
         };
 
         // Make tarball from packageable snapshot

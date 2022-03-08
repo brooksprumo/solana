@@ -278,7 +278,7 @@ mod tests {
             snapshot_utils::get_highest_bank_snapshot_info(bank_snapshots_dir)
                 .expect("no bank snapshots found in path");
         let accounts_package = AccountsPackage::new(
-            last_bank,
+            Arc::clone(last_bank),
             &last_bank_snapshot_info,
             bank_snapshots_dir,
             last_bank.src.slot_deltas(&last_bank.src.roots()),
@@ -406,8 +406,9 @@ mod tests {
                 }
             };
 
+            let bank = bank_forks.insert(bank);
             snapshot_utils::snapshot_bank(
-                &bank,
+                Arc::clone(&bank),
                 vec![],
                 package_sender,
                 bank_snapshots_dir,
@@ -419,7 +420,6 @@ mod tests {
             )
             .unwrap();
 
-            bank_forks.insert(bank);
             if slot == saved_slot as u64 {
                 // Find the relevant snapshot storages
                 let snapshot_storage_files: HashSet<_> = bank_forks[slot]
@@ -719,7 +719,11 @@ mod tests {
             // at the right interval
             if snapshot_utils::should_take_full_snapshot(slot, FULL_SNAPSHOT_ARCHIVE_INTERVAL_SLOTS)
             {
-                make_full_snapshot_archive(&bank, &snapshot_test_config.snapshot_config).unwrap();
+                make_full_snapshot_archive(
+                    Arc::clone(&bank),
+                    &snapshot_test_config.snapshot_config,
+                )
+                .unwrap();
             }
             // Similarly, make an incremental snapshot archive at the right interval, but only if
             // there's been at least one full snapshot first, and a full snapshot wasn't already
@@ -733,7 +737,7 @@ mod tests {
             ) && slot != last_full_snapshot_slot.unwrap()
             {
                 make_incremental_snapshot_archive(
-                    &bank,
+                    Arc::clone(&bank),
                     last_full_snapshot_slot.unwrap(),
                     &snapshot_test_config.snapshot_config,
                 )
@@ -751,7 +755,7 @@ mod tests {
     }
 
     fn make_full_snapshot_archive(
-        bank: &Bank,
+        bank: Arc<Bank>,
         snapshot_config: &SnapshotConfig,
     ) -> snapshot_utils::Result<()> {
         let slot = bank.slot();
@@ -766,12 +770,13 @@ mod tests {
                         "did not find bank snapshot with this path",
                     )
                 })?;
+        let snapshot_storages = bank.get_snapshot_storages(None);
         snapshot_utils::package_and_archive_full_snapshot(
             bank,
             &bank_snapshot_info,
             &snapshot_config.bank_snapshots_dir,
             &snapshot_config.snapshot_archives_dir,
-            bank.get_snapshot_storages(None),
+            snapshot_storages,
             snapshot_config.archive_format,
             snapshot_config.snapshot_version,
             snapshot_config.maximum_full_snapshot_archives_to_retain,
@@ -782,7 +787,7 @@ mod tests {
     }
 
     fn make_incremental_snapshot_archive(
-        bank: &Bank,
+        bank: Arc<Bank>,
         incremental_snapshot_base_slot: Slot,
         snapshot_config: &SnapshotConfig,
     ) -> snapshot_utils::Result<()> {
@@ -801,14 +806,14 @@ mod tests {
                         "did not find bank snapshot with this path",
                     )
                 })?;
-        let storages = bank.get_snapshot_storages(Some(incremental_snapshot_base_slot));
+        let snapshot_storages = bank.get_snapshot_storages(Some(incremental_snapshot_base_slot));
         snapshot_utils::package_and_archive_incremental_snapshot(
             bank,
             incremental_snapshot_base_slot,
             &bank_snapshot_info,
             &snapshot_config.bank_snapshots_dir,
             &snapshot_config.snapshot_archives_dir,
-            storages,
+            snapshot_storages,
             snapshot_config.archive_format,
             snapshot_config.snapshot_version,
             snapshot_config.maximum_full_snapshot_archives_to_retain,

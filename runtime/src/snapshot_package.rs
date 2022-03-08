@@ -47,13 +47,14 @@ pub struct AccountsPackage {
     pub hash_for_testing: Option<Hash>,
     pub cluster_type: ClusterType,
     pub snapshot_type: Option<SnapshotType>,
+    pub bank: Arc<Bank>,
 }
 
 impl AccountsPackage {
     /// Package up bank files, storages, and slot deltas for a snapshot
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        bank: &Bank,
+        bank: Arc<Bank>,
         bank_snapshot_info: &BankSnapshotInfo,
         bank_snapshots_dir: impl AsRef<Path>,
         slot_deltas: Vec<BankSlotDelta>,
@@ -115,6 +116,7 @@ impl AccountsPackage {
             hash_for_testing,
             cluster_type: bank.cluster_type(),
             snapshot_type,
+            bank,
         })
     }
 }
@@ -127,6 +129,7 @@ pub struct SnapshotPackage {
     pub snapshot_storages: SnapshotStorages,
     pub snapshot_version: SnapshotVersion,
     pub snapshot_type: SnapshotType,
+    pub bank: Arc<Bank>,
 }
 
 impl From<AccountsPackage> for SnapshotPackage {
@@ -167,6 +170,7 @@ impl From<AccountsPackage> for SnapshotPackage {
             snapshot_storages: accounts_package.snapshot_storages,
             snapshot_version: accounts_package.snapshot_version,
             snapshot_type: accounts_package.snapshot_type.unwrap(),
+            bank: accounts_package.bank,
         }
     }
 }
