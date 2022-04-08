@@ -36,22 +36,47 @@ pub fn process_instruction(
     trace!("process_instruction: {:?}", data);
     trace!("keyed_accounts: {:?}", keyed_accounts);
 
-    let me = &keyed_account_at_index(keyed_accounts, first_instruction_account)?;
-    if me.owner()? != id() {
-        return Err(InstructionError::InvalidAccountOwner);
-    }
+    let me = if invoke_context
+        .feature_set
+        .is_active(&feature_set::add_get_minimum_delegation_instruction_to_stake_program::id())
+    {
+        let stake_instruction = limited_deserialize(data)?;
+        if matches!(stake_instruction, StakeInstruction::GetMinimumDelegation) {
+            None
+        } else {
+            let me = keyed_account_at_index(keyed_accounts, first_instruction_account)?;
+            if me.owner()? != id() {
+                return Err(InstructionError::InvalidAccountOwner);
+            }
+            Some(me)
+        }
+    } else {
+        let me = keyed_account_at_index(keyed_accounts, first_instruction_account)?;
+        if me.owner()? != id() {
+            return Err(InstructionError::InvalidAccountOwner);
+        }
+        Some(me)
+    };
 
     let signers = instruction_context.get_signers(transaction_context);
     match limited_deserialize(data)? {
         StakeInstruction::Initialize(authorized, lockup) => {
             let rent = get_sysvar_with_account_check::rent(invoke_context, instruction_context, 1)?;
-            initialize(me, &authorized, &lockup, &rent, &invoke_context.feature_set)
+            debug_assert!(me.is_some());
+            initialize(
+                me.unwrap(),
+                &authorized,
+                &lockup,
+                &rent,
+                &invoke_context.feature_set,
+            )
         }
         StakeInstruction::Authorize(authorized_pubkey, stake_authorize) => {
             let require_custodian_for_locked_stake_authorize = invoke_context
                 .feature_set
                 .is_active(&feature_set::require_custodian_for_locked_stake_authorize::id());
 
+            debug_assert!(me.is_some());
             if require_custodian_for_locked_stake_authorize {
                 let clock =
                     get_sysvar_with_account_check::clock(invoke_context, instruction_context, 1)?;
@@ -62,7 +87,7 @@ pub fn process_instruction(
                         .map(|ka| ka.unsigned_key());
 
                 authorize(
-                    me,
+                    me.unwrap(),
                     &signers,
                     &authorized_pubkey,
                     stake_authorize,
@@ -72,7 +97,7 @@ pub fn process_instruction(
                 )
             } else {
                 authorize(
-                    me,
+                    me.unwrap(),
                     &signers,
                     &authorized_pubkey,
                     stake_authorize,
@@ -90,6 +115,7 @@ pub fn process_instruction(
                 .feature_set
                 .is_active(&feature_set::require_custodian_for_locked_stake_authorize::id());
 
+            debug_assert!(me.is_some());
             if require_custodian_for_locked_stake_authorize {
                 let clock =
                     get_sysvar_with_account_check::clock(invoke_context, instruction_context, 2)?;
@@ -99,7 +125,7 @@ pub fn process_instruction(
                         .map(|ka| ka.unsigned_key());
 
                 authorize_with_seed(
-                    me,
+                    me.unwrap(),
                     authority_base,
                     &args.authority_seed,
                     &args.authority_owner,
@@ -111,7 +137,7 @@ pub fn process_instruction(
                 )
             } else {
                 authorize_with_seed(
-                    me,
+                    me.unwrap(),
                     authority_base,
                     &args.authority_seed,
                     &args.authority_owner,
@@ -141,13 +167,15 @@ pub fn process_instruction(
             }
             let config = config::from(&*config_account.try_account_ref()?)
                 .ok_or(InstructionError::InvalidArgument)?;
-            delegate(me, vote, &clock, &stake_history, &config, &signers)
+            debug_assert!(me.is_some());
+            delegate(me.unwrap(), vote, &clock, &stake_history, &config, &signers)
         }
         StakeInstruction::Split(lamports) => {
             instruction_context.check_number_of_instruction_accounts(2)?;
             let split_stake =
                 &keyed_account_at_index(keyed_accounts, first_instruction_account + 1)?;
-            split(me, invoke_context, lamports, split_stake, &signers)
+            debug_assert!(me.is_some());
+            split(me.unwrap(), invoke_context, lamports, split_stake, &signers)
         }
         StakeInstruction::Merge => {
             instruction_context.check_number_of_instruction_accounts(2)?;
@@ -160,8 +188,9 @@ pub fn process_instruction(
                 instruction_context,
                 3,
             )?;
+            debug_assert!(me.is_some());
             merge(
-                me,
+                me.unwrap(),
                 invoke_context,
                 source_stake,
                 &clock,
@@ -180,8 +209,9 @@ pub fn process_instruction(
                 3,
             )?;
             instruction_context.check_number_of_instruction_accounts(5)?;
+            debug_assert!(me.is_some());
             withdraw(
-                me,
+                me.unwrap(),
                 lamports,
                 to,
                 &clock,
@@ -194,11 +224,13 @@ pub fn process_instruction(
         StakeInstruction::Deactivate => {
             let clock =
                 get_sysvar_with_account_check::clock(invoke_context, instruction_context, 1)?;
-            deactivate(me, &clock, &signers)
+            debug_assert!(me.is_some());
+            deactivate(me.unwrap(), &clock, &signers)
         }
         StakeInstruction::SetLockup(lockup) => {
             let clock = invoke_context.get_sysvar_cache().get_clock()?;
-            set_lockup(me, &lockup, &signers, &clock)
+            debug_assert!(me.is_some());
+            set_lockup(me.unwrap(), &lockup, &signers, &clock)
         }
         StakeInstruction::InitializeChecked => {
             if invoke_context
@@ -219,8 +251,9 @@ pub fn process_instruction(
 
                 let rent =
                     get_sysvar_with_account_check::rent(invoke_context, instruction_context, 1)?;
+                debug_assert!(me.is_some());
                 initialize(
-                    me,
+                    me.unwrap(),
                     &authorized,
                     &Lockup::default(),
                     &rent,
@@ -249,8 +282,9 @@ pub fn process_instruction(
                         .ok()
                         .map(|ka| ka.unsigned_key());
 
+                debug_assert!(me.is_some());
                 authorize(
-                    me,
+                    me.unwrap(),
                     &signers,
                     authorized_pubkey,
                     stake_authorize,
@@ -282,8 +316,9 @@ pub fn process_instruction(
                         .ok()
                         .map(|ka| ka.unsigned_key());
 
+                debug_assert!(me.is_some());
                 authorize_with_seed(
-                    me,
+                    me.unwrap(),
                     authority_base,
                     &args.authority_seed,
                     &args.authority_owner,
@@ -320,7 +355,8 @@ pub fn process_instruction(
                     custodian,
                 };
                 let clock = invoke_context.get_sysvar_cache().get_clock()?;
-                set_lockup(me, &lockup, &signers, &clock)
+                debug_assert!(me.is_some());
+                set_lockup(me.unwrap(), &lockup, &signers, &clock)
             } else {
                 Err(InstructionError::InvalidInstructionData)
             }
