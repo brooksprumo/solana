@@ -36,12 +36,12 @@ pub fn process_instruction(
     trace!("process_instruction: {:?}", data);
     trace!("keyed_accounts: {:?}", keyed_accounts);
 
-    let me = if invoke_context
+    let (me, stake_instruction) = if invoke_context
         .feature_set
         .is_active(&feature_set::add_get_minimum_delegation_instruction_to_stake_program::id())
     {
         let stake_instruction = limited_deserialize(data)?;
-        if matches!(stake_instruction, StakeInstruction::GetMinimumDelegation) {
+        let me = if matches!(stake_instruction, StakeInstruction::GetMinimumDelegation) {
             None
         } else {
             let me = keyed_account_at_index(keyed_accounts, first_instruction_account)?;
@@ -49,17 +49,19 @@ pub fn process_instruction(
                 return Err(InstructionError::InvalidAccountOwner);
             }
             Some(me)
-        }
+        };
+        (me, stake_instruction)
     } else {
         let me = keyed_account_at_index(keyed_accounts, first_instruction_account)?;
         if me.owner()? != id() {
             return Err(InstructionError::InvalidAccountOwner);
         }
-        Some(me)
+        let stake_instruction = limited_deserialize(data)?;
+        (Some(me), stake_instruction)
     };
 
     let signers = instruction_context.get_signers(transaction_context);
-    match limited_deserialize(data)? {
+    match stake_instruction {
         StakeInstruction::Initialize(authorized, lockup) => {
             let rent = get_sysvar_with_account_check::rent(invoke_context, instruction_context, 1)?;
             debug_assert!(me.is_some());
