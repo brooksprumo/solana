@@ -2051,6 +2051,13 @@ impl Bank {
             debug_do_not_add_builtins,
         );
 
+        error!(
+            "bprumo DEBUG: Bank::new_from_fields() DONE! bank.slot(): {}, bank.accounts_data_len: {}, bank.capitalization: {}",
+            bank.slot(),
+            bank.load_accounts_data_len(),
+            bank.capitalization(),
+        );
+
         // Sanity assertions between bank snapshot and genesis config
         // Consider removing from serializable bank state
         // (BankFieldsToSerialize/BankFieldsToDeserialize) and initializing

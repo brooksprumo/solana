@@ -263,6 +263,26 @@ impl BankForks {
                 {
                     let snapshot_root_bank = self.root_bank();
                     let root_slot = snapshot_root_bank.slot();
+
+                    {
+                        use solana_sdk::account::ReadableAccount;
+                        let (_, measure) = solana_measure::measure!(snapshot_root_bank.get_all_accounts_with_modified_slots()
+                        .unwrap()
+                        .iter()
+                        .for_each(|(pubkey, account_shared_data, slot)|  {
+                            let lamports = account_shared_data.lamports();
+                            let data_len = account_shared_data.data().len();
+                            error!("bprumo DEBUG: bank_forks::set_root() snapshot request, {slot}, {pubkey}, {lamports}, {data_len}");
+                        }));
+                        error!(
+                            "bprumo DEBUG: bank_forks::set_root() snapshot request DONE! bank.slot(): {}, bank.accounts_data_len: {}, bank.capitalization: {}, measure time: {}",
+                            snapshot_root_bank.slot(),
+                            snapshot_root_bank.load_accounts_data_len(),
+                            snapshot_root_bank.capitalization(),
+                            measure,
+                        );
+                    }
+
                     if let Err(e) =
                         accounts_background_request_sender.send_snapshot_request(SnapshotRequest {
                             snapshot_root_bank,

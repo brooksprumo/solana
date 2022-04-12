@@ -6794,6 +6794,12 @@ impl AccountsDb {
                 }
                 if !stored_account.is_zero_lamport() {
                     accounts_data_len += stored_account.data().len() as u64;
+                    {
+                        let pubkey = &stored_account.meta.pubkey;
+                        let lamports = stored_account.lamports();
+                        let data_len = stored_account.data().len();
+                        error!("bprumo DEBUG: generate_index(), {slot}, {pubkey}, {lamports}, {data_len}");
+                    }
                 }
 
                 if !rent_collector.should_collect_rent(&pubkey, &stored_account)
