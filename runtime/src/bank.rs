@@ -2370,6 +2370,13 @@ impl Bank {
         let old_account = self.get_account_with_fixed_root(pubkey);
         let mut new_account = updater(&old_account);
 
+        let old_account_size = old_account.map(|account| account.data().len());
+        let new_account_size = new_account.data().len();
+
+        if old_account_size != Some(new_account_size) {
+            error!("bprumo DEBUG: update_sysvar_account() new size! slot: {}, pubkey: {pubkey}, old account size: {old_account_size:?}, new account size: {new_account_size}", self.slot());
+        }
+
         // When new sysvar comes into existence (with RENT_UNADJUSTED_INITIAL_BALANCE lamports),
         // this code ensures that the sysvar's balance is adjusted to be rent-exempt.
         //
