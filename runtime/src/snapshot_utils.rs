@@ -1663,6 +1663,15 @@ fn rebuild_bank_from_snapshots(
         Ok(slot_deltas)
     })?;
 
+    let size_of_slot_deltas: usize = slot_deltas
+        .iter()
+        .map(crate::status_cache::size_of_slot_delta)
+        .sum();
+    log::error!(
+        "bprumo DEBUG: rebuild bank from snapshots() size of slot deltas: {}",
+        size_of_slot_deltas,
+    );
+
     bank.src.status_cache.write().unwrap().append(&slot_deltas);
 
     bank.prepare_rewrites_for_hash();

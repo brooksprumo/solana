@@ -286,6 +286,27 @@ impl<T: Serialize + Clone> StatusCache<T> {
     }
 }
 
+/// Get the size of the slot delta, in bytes
+///
+/// This accounts for the heap allocations within the HashMap of the Status
+pub fn size_of_slot_delta<T>(slot_delta: &SlotDelta<T>) -> usize {
+    let size_on_stack = std::mem::size_of_val(slot_delta);
+    let size_on_heap = {
+        slot_delta
+            .2
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(key, value)| {
+                std::mem::size_of_val(key)
+                    + std::mem::size_of_val(value)
+                    + value.1.iter().map(std::mem::size_of_val).sum::<usize>()
+            })
+            .sum::<usize>()
+    };
+    size_on_stack + size_on_heap
+}
+
 #[cfg(test)]
 mod tests {
     use {
@@ -531,5 +552,42 @@ mod tests {
                 .get_status(&hash_key, &blockhash, &ancestors)
                 .is_some());
         }
+    }
+
+    #[test]
+    fn test_size_of_slot_delta() {
+        solana_logger::setup();
+        let mut status_cache = StatusCache::<Result<(), ()>>::default();
+
+        let slot_deltas = status_cache.slot_deltas(&[0]);
+        let slot_deltas_size: usize = slot_deltas.iter().map(size_of_slot_delta).sum();
+        log::error!(
+            "bprumo DEBUG: test(), size of slot deltas: {}, slot deltas: {:?}",
+            slot_deltas_size,
+            slot_deltas
+        );
+
+        // fill the status cache
+        let slots: Vec<_> = (42..).take(MAX_CACHE_ENTRIES).collect();
+        for slot in &slots {
+            for _ in 0..5 {
+                status_cache.insert(&Hash::new_unique(), Hash::new_unique(), *slot, Ok(()));
+                let slot_deltas = status_cache.slot_deltas(&[*slot]);
+                let slot_deltas_size: usize = slot_deltas.iter().map(size_of_slot_delta).sum();
+                log::error!(
+                    "bprumo DEBUG: test(), slot: {slot} size of slot deltas: {}, slot deltas: {:?}",
+                    slot_deltas_size,
+                    slot_deltas
+                );
+            }
+        }
+
+        let slot_deltas = status_cache.slot_deltas(&slots);
+        let slot_deltas_size: usize = slot_deltas.iter().map(size_of_slot_delta).sum();
+        log::error!(
+            "bprumo DEBUG: test(), size of slot deltas: {}, slot deltas: {:?}",
+            slot_deltas_size,
+            slot_deltas
+        );
     }
 }
