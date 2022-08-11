@@ -2533,6 +2533,36 @@ fn main() {
                     let working_bank = bank_forks.read().unwrap().working_bank();
                     working_bank.print_accounts_stats();
                 }
+                let print_vote_stats = true;
+                if print_vote_stats {
+                    let working_bank = bank_forks.read().unwrap().working_bank();
+                    let default_vote_state = VoteState::default();
+                    let total_stake: u64 = working_bank
+                        .vote_accounts()
+                        .iter()
+                        .map(|(_, (stake, _))| stake)
+                        .sum();
+                    let mut vote_states = Vec::new();
+                    for (key, (stake, vote_account)) in working_bank.vote_accounts().iter() {
+                        if *stake > 0 {
+                            let vote_state = vote_account.vote_state();
+                            let vote_state = vote_state.as_ref().unwrap_or(&default_vote_state);
+                            if let Some(last_vote) = vote_state.votes.iter().last() {
+                                vote_states.push((*key, last_vote.slot, *stake));
+                            }
+                        }
+                    }
+                    vote_states.sort_by(|a, b| a.1.cmp(b.1));
+                    for (key, slot, stake) in &vote_states {
+                        println!(
+                            "{} last vote slot: {} stake: {} % of stake: {}",
+                            key,
+                            slot,
+                            stake,
+                            (100 * *stake) as f64 / total_stake as f64,
+                        );
+                    }
+                }
                 exit_signal.store(true, Ordering::Relaxed);
                 system_monitor_service.join().unwrap();
                 println!("Ok");
