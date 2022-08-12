@@ -2552,7 +2552,7 @@ fn main() {
                             }
                         }
                     }
-                    vote_states.sort_by(|a, b| a.1.cmp(b.1));
+                    vote_states.sort_by(|a, b| a.1.cmp(&b.1));
                     for (key, slot, stake) in &vote_states {
                         println!(
                             "{} last vote slot: {} stake: {} % of stake: {}",
