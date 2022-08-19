@@ -30,6 +30,7 @@ use {
             ShredStorageType,
         },
         blockstore_processor::{BlockstoreProcessorError, ProcessOptions},
+        leader_schedule_utils,
         shred::Shred,
     },
     solana_measure::{measure, measure::Measure},
@@ -510,8 +511,34 @@ fn graph_forks(bank_forks: &BankForks, config: &GraphConfig) -> String {
     dot.push("    style=invis".to_string());
     let mut styled_slots = HashSet::new();
     let mut all_votes: HashMap<Pubkey, HashMap<Slot, VoteState>> = HashMap::new();
+
     for fork_slot in &fork_slots {
         let mut bank = bank_forks[*fork_slot].clone();
+
+        // bprumo DEBUG: this is me vv
+        {
+            let mut slots_and_leaders = Vec::new();
+            if bank.slot() == 144861334 {
+                let mut ancestor_slots = bank.ancestors.keys();
+                ancestor_slots.retain(|&slot| slot >= 144860980);
+                error!("bprumo DEBUG: ancestor slots:\n{:?}", ancestor_slots);
+
+                //pub fn slot_leader_at(slot: Slot, bank: &Bank) -> Option<Pubkey> {
+                ancestor_slots.iter().for_each(|&slot| {
+                    let leader = leader_schedule_utils::slot_leader_at(slot, &bank);
+                    slots_and_leaders.push((slot, leader));
+                });
+
+                error!("bprumo DEBUG: slots and leaders:\n{:#?}", slots_and_leaders);
+                println!("slot, leader");
+                slots_and_leaders.iter().for_each(|(slot, leader)| {
+                    println!("{}, {}", slot, leader.unwrap());
+                });
+                println!("Done.");
+                exit(1);
+            }
+        }
+        // bprumo DEBUG: this is me ^^
 
         let mut first = true;
         loop {
