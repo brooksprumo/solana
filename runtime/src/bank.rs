@@ -4456,6 +4456,14 @@ impl Bank {
             touched_account_count,
             accounts_resize_delta,
         } = transaction_context.into();
+
+        if accounts_data_len_delta > 0 {
+            error!(
+                "bprumo DEBUG: accounts_data_len_delta: {}, accounts_resize_delta: {}",
+                accounts_data_len_delta, accounts_resize_delta
+            );
+        }
+
         loaded_transaction.accounts = accounts;
         if self
             .feature_set
