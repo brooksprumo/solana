@@ -16043,4 +16043,30 @@ pub mod tests {
         );
         assert_eq!(db.accounts_index.ref_count_from_storage(&pk1), 0);
     }
+
+    #[test]
+    fn brooks() {
+        let caching_enabled = true;
+        let accounts_db = Arc::new(AccountsDb::new_with_config_for_tests(
+            Vec::new(),
+            &ClusterType::Development,
+            AccountSecondaryIndexes::default(),
+            caching_enabled,
+            AccountShrinkThreshold::default(),
+        ));
+
+        let account_key = Pubkey::new_unique();
+        let account_data = AccountSharedData::new(0, 0, AccountSharedData::default().owner());
+        accounts_db.store_cached((0, &[(&account_key, &account_data)][..]), None);
+        accounts_db.add_root(0);
+
+        let account = accounts_db.do_load(
+            &Ancestors::default(),
+            &account_key,
+            None,
+            LoadHint::Unspecified,
+        );
+        _ = dbg!(&account);
+        assert!(account.is_some());
+    }
 }
