@@ -104,7 +104,7 @@ pub fn new_spinner_progress_bar() -> ProgressBar {
     progress_bar.set_draw_target(ProgressDrawTarget::stdout());
     progress_bar.set_style(
         ProgressStyle::default_spinner()
-            .template("{spinner:.green} {wide_msg}")
+            .template("{spinner:.green} {msg}")
             .expect("ProgresStyle::template direct input to be correct"),
     );
     progress_bar.enable_steady_tick(Duration::from_millis(100));
