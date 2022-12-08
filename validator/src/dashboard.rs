@@ -116,6 +116,7 @@ impl Dashboard {
 
             let progress_bar = new_spinner_progress_bar();
             let mut snapshot_slot_info = None;
+            let mut progress_bar_length = None;
             for i in 0.. {
                 if exit.load(Ordering::Relaxed) {
                     break;
@@ -155,7 +156,7 @@ impl Dashboard {
                             "{}{}| \
                                     Processed Slot: {} | Confirmed Slot: {} | Finalized Slot: {} | \
                                     Full Snapshot Slot: {} | Incremental Snapshot Slot: {} | \
-                                    Transactions: {} | {}",
+                                    Transactions: {} | {} | length: {:?}",
                             uptime,
                             if health == "ok" {
                                 "".to_string()
@@ -176,8 +177,10 @@ impl Dashboard {
                                     .map(|incremental| incremental.to_string()))
                                 .unwrap_or_else(|| '-'.to_string()),
                             transaction_count,
-                            identity_balance
+                            identity_balance,
+                            progress_bar_length,
                         ));
+                        progress_bar_length = progress_bar.progress_bar.length();
                         thread::sleep(refresh_interval);
                     }
                     Err(err) => {
