@@ -2308,6 +2308,7 @@ dependencies = [
  "console",
  "number_prefix",
  "portable-atomic",
+ "unicode-segmentation",
  "unicode-width",
 ]
 
