@@ -100,7 +100,7 @@ pub fn println_name_value(name: &str, value: &str) {
 
 /// Creates a new process bar for processing that will take an unknown amount of time
 pub fn new_spinner_progress_bar() -> ProgressBar {
-    let progress_bar = indicatif::ProgressBar::new(42);
+    let progress_bar = indicatif::ProgressBar::new(180);
     progress_bar.set_draw_target(ProgressDrawTarget::stdout());
     progress_bar.set_style(
         ProgressStyle::default_spinner()
