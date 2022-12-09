@@ -155,8 +155,8 @@ impl Dashboard {
                         progress_bar.set_message(format!(
                             "{}{}| \
                                     Processed Slot: {} | Confirmed Slot: {} | Finalized Slot: {} | \
-                                    Full Snapshot Slot: {} | Incremental Snapshot Slot: {} | \
-                                    Transactions: {} | {} | length: {:?}",
+                                    Snapshot Slot: {} | \
+                                    Transactions: {} | {}",
                             uptime,
                             if health == "ok" {
                                 "".to_string()
@@ -170,15 +170,19 @@ impl Dashboard {
                                 .as_ref()
                                 .map(|snapshot_slot_info| snapshot_slot_info.full.to_string())
                                 .unwrap_or_else(|| '-'.to_string()),
-                            snapshot_slot_info
-                                .as_ref()
-                                .and_then(|snapshot_slot_info| snapshot_slot_info
-                                    .incremental
-                                    .map(|incremental| incremental.to_string()))
-                                .unwrap_or_else(|| '-'.to_string()),
+                            /*
+                             * snapshot_slot_info
+                             *     .as_ref()
+                             *     .and_then(|snapshot_slot_info| snapshot_slot_info
+                             *         .incremental
+                             *         .map(|incremental| incremental.to_string()))
+                             *     .unwrap_or_else(|| '-'.to_string()),
+                             */
                             transaction_count,
                             identity_balance,
-                            progress_bar_length,
+                            /*
+                             * progress_bar_length,
+                             */
                         ));
                         progress_bar_length = progress_bar.progress_bar.length();
                         thread::sleep(refresh_interval);
