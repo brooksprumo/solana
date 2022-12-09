@@ -2301,6 +2301,18 @@ dependencies = [
 
 [[package]]
 name = "indicatif"
+version = "0.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d207dc617c7a380ab07ff572a6e52fa202a2a8f355860ac9c38e23f8196be1b"
+dependencies = [
+ "console",
+ "lazy_static",
+ "number_prefix",
+ "regex",
+]
+
+[[package]]
+name = "indicatif"
 version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4295cbb7573c16d310e99e713cf9e75101eb190ab31fccd35f2d2691b4352b19"
@@ -2308,7 +2320,6 @@ dependencies = [
  "console",
  "number_prefix",
  "portable-atomic",
- "unicode-segmentation",
  "unicode-width",
 ]
 
@@ -5075,7 +5086,7 @@ dependencies = [
  "console",
  "ed25519-dalek",
  "humantime",
- "indicatif",
+ "indicatif 0.17.2",
  "pretty-hex",
  "semver 1.0.14",
  "serde",
@@ -5100,7 +5111,7 @@ dependencies = [
  "futures 0.3.24",
  "futures-util",
  "indexmap",
- "indicatif",
+ "indicatif 0.17.2",
  "log",
  "rand 0.7.3",
  "rand_chacha 0.2.2",
@@ -5278,7 +5289,7 @@ name = "solana-download-utils"
 version = "1.15.0"
 dependencies = [
  "console",
- "indicatif",
+ "indicatif 0.17.2",
  "log",
  "reqwest",
  "solana-runtime",
@@ -5552,7 +5563,7 @@ dependencies = [
  "crossbeam-channel",
  "ctrlc",
  "dirs-next",
- "indicatif",
+ "indicatif 0.17.2",
  "lazy_static",
  "nix",
  "reqwest",
@@ -6214,7 +6225,7 @@ dependencies = [
  "bs58",
  "crossbeam-channel",
  "futures 0.3.24",
- "indicatif",
+ "indicatif 0.17.2",
  "jsonrpc-core",
  "jsonrpc-http-server",
  "log",
@@ -6697,7 +6708,7 @@ dependencies = [
  "csv",
  "ctrlc",
  "indexmap",
- "indicatif",
+ "indicatif 0.17.2",
  "pickledb",
  "serde",
  "solana-account-decoder",
@@ -6726,7 +6737,7 @@ dependencies = [
  "bincode",
  "futures-util",
  "indexmap",
- "indicatif",
+ "indicatif 0.17.2",
  "log",
  "rand 0.7.3",
  "rand_chacha 0.2.2",
@@ -6825,7 +6836,7 @@ dependencies = [
  "core_affinity",
  "crossbeam-channel",
  "fd-lock",
- "indicatif",
+ "indicatif 0.16.2",
  "jsonrpc-core",
  "jsonrpc-core-client",
  "jsonrpc-derive",

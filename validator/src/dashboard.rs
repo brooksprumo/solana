@@ -180,7 +180,7 @@ impl Dashboard {
                             identity_balance,
                             progress_bar_length,
                         ));
-                        progress_bar_length = progress_bar.progress_bar.length();
+                        progress_bar_length = Some(progress_bar.progress_bar.length());
                         thread::sleep(refresh_interval);
                     }
                     Err(err) => {

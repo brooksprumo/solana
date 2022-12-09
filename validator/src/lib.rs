@@ -102,12 +102,9 @@ pub fn println_name_value(name: &str, value: &str) {
 pub fn new_spinner_progress_bar() -> ProgressBar {
     let progress_bar = indicatif::ProgressBar::new(180);
     progress_bar.set_draw_target(ProgressDrawTarget::stdout());
-    progress_bar.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.green} {wide_msg}")
-            .expect("ProgresStyle::template direct input to be correct"),
-    );
-    progress_bar.enable_steady_tick(Duration::from_millis(100));
+    progress_bar
+        .set_style(ProgressStyle::default_spinner().template("{spinner:.green} {wide_msg}"));
+    progress_bar.enable_steady_tick(100);
 
     ProgressBar {
         progress_bar,
