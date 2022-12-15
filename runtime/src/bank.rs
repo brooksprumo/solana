@@ -2572,7 +2572,19 @@ impl Bank {
         let invalid_cached_vote_accounts = AtomicUsize::default();
         let invalid_cached_stake_accounts_rent_epoch = AtomicUsize::default();
 
-        let stake_delegations: Vec<_> = stakes.stake_delegations().iter().collect();
+        let stake_minimum_delegation =
+            solana_stake_program::get_minimum_delegation(&self.feature_set);
+        let no_stake_rewards_if_delegation_below_minimum = self
+            .feature_set
+            .is_active(&feature_set::no_stake_rewards_if_delegation_below_minimum::id());
+        let stake_delegations: Vec<_> = stakes
+            .stake_delegations()
+            .iter()
+            .filter(|(_pubkey, stake_account)| {
+                !(no_stake_rewards_if_delegation_below_minimum
+                    && stake_account.delegation().stake < stake_minimum_delegation)
+            })
+            .collect();
         thread_pool.install(|| {
             stake_delegations
                 .into_par_iter()
@@ -2721,7 +2733,19 @@ impl Bank {
         F: Fn(&RewardCalculationEvent) + Send + Sync,
     {
         let stakes = self.stakes_cache.stakes();
-        let stake_delegations: Vec<_> = stakes.stake_delegations().iter().collect();
+        let stake_minimum_delegation =
+            solana_stake_program::get_minimum_delegation(&self.feature_set);
+        let no_stake_rewards_if_delegation_below_minimum = self
+            .feature_set
+            .is_active(&feature_set::no_stake_rewards_if_delegation_below_minimum::id());
+        let stake_delegations: Vec<_> = stakes
+            .stake_delegations()
+            .iter()
+            .filter(|(_pubkey, stake_account)| {
+                !(no_stake_rewards_if_delegation_below_minimum
+                    && stake_account.delegation().stake < stake_minimum_delegation)
+            })
+            .collect();
         // Obtain all unique voter pubkeys from stake delegations.
         fn merge(mut acc: HashSet<Pubkey>, other: HashSet<Pubkey>) -> HashSet<Pubkey> {
             if acc.len() < other.len() {

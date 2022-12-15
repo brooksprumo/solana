@@ -554,6 +554,11 @@ pub mod enable_program_redeployment_cooldown {
     solana_sdk::declare_id!("J4HFT8usBxpcF63y46t1upYobJgChmKyZPm5uTBRg25Z");
 }
 
+pub mod no_stake_rewards_if_delegation_below_minimum {
+    // bprumo TODO: change this to a feature proposal ID
+    solana_sdk::declare_id!("HgXgVDw6x6c9H6kXt1WUkosLXWhxz1sUqKDh76UZRHSy");
+}
+
 lazy_static! {
     /// Map of feature identifiers to user-visible description
     pub static ref FEATURE_NAMES: HashMap<Pubkey, &'static str> = [
@@ -687,6 +692,7 @@ lazy_static! {
         (cap_transaction_accounts_data_size::id(), "cap transaction accounts data size up to its compute unit limits #27839"),
         (enable_alt_bn128_syscall::id(), "add alt_bn128 syscalls #27961"),
         (enable_program_redeployment_cooldown::id(), "enable program redeployment cooldown #29135"),
+        (no_stake_rewards_if_delegation_below_minimum::id(), "stake accounts below the minimum delegation do not get rewards"), // bprumo TODO: add feature gate issue #
         /*************** ADD NEW FEATURES HERE ***************/
     ]
     .iter()
