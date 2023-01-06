@@ -2586,7 +2586,7 @@ impl Bank {
         let invalid_cached_vote_accounts = AtomicUsize::default();
         let invalid_cached_stake_accounts_rent_epoch = AtomicUsize::default();
 
-        let stake_delegations: Vec<_> = stakes.stake_delegations().iter().collect();
+        let stake_delegations = stake_delegations_for_rewards(&stakes, &self.feature_set);
         thread_pool.install(|| {
             stake_delegations
                 .into_par_iter()
@@ -2735,7 +2735,8 @@ impl Bank {
         F: Fn(&RewardCalculationEvent) + Send + Sync,
     {
         let stakes = self.stakes_cache.stakes();
-        let stake_delegations: Vec<_> = stakes.stake_delegations().iter().collect();
+        let stake_delegations = stake_delegations_for_rewards(&stakes, &self.feature_set);
+
         // Obtain all unique voter pubkeys from stake delegations.
         fn merge(mut acc: HashSet<Pubkey>, other: HashSet<Pubkey>) -> HashSet<Pubkey> {
             if acc.len() < other.len() {
@@ -7805,6 +7806,21 @@ impl Bank {
         compute_budget::LoadedAccountsDataLimitType::V0
         // In the future, use feature_set to determine correct LoadedAccountsDataLimitType here.
     }
+}
+
+/// Get the stake delegations to consider for rewards calculations and payout
+/// bprumo TODO: add tests
+fn stake_delegations_for_rewards<'stakes, 'bank>(
+    stakes: &'stakes Stakes<StakeAccount<Delegation>>,
+    feature_set: &'bank FeatureSet,
+) -> Vec<(&'stakes Pubkey, &'stakes StakeAccount<Delegation>)> {
+    let min_delegation_for_rewards =
+        solana_stake_program::get_minimum_delegation_for_rewards(&feature_set);
+    stakes
+        .stake_delegations()
+        .iter()
+        .filter(|(_, stake_account)| stake_account.delegation().stake >= min_delegation_for_rewards)
+        .collect()
 }
 
 /// Compute how much an account has changed size.  This function is useful when the data size delta

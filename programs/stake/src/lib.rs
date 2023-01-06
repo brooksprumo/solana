@@ -19,16 +19,34 @@ pub fn add_genesis_accounts(genesis_config: &mut GenesisConfig) -> u64 {
     config::add_genesis_account(genesis_config)
 }
 
+/// The minimum amount, in lamports, that stake accounts should delegate
+///
+/// While it may be technically possible to delegate a smaller amount than what is returned, it is
+/// not advised to do so, as you will not receive staking rewards.
+pub fn get_minimum_delegation(feature_set: &FeatureSet) -> u64 {
+    std::cmp::max(
+        get_minimum_delegation_for_new_stakes(feature_set),
+        get_minimum_delegation_for_rewards(feature_set),
+    )
+}
+
 /// The minimum stake amount that can be delegated, in lamports.
 /// NOTE: This is also used to calculate the minimum balance of a stake account, which is the
 /// rent exempt reserve _plus_ the minimum stake delegation.
 #[inline(always)]
-pub fn get_minimum_delegation(feature_set: &FeatureSet) -> u64 {
+pub fn get_minimum_delegation_for_new_stakes(feature_set: &FeatureSet) -> u64 {
     if feature_set.is_active(&feature_set::stake_raise_minimum_delegation_to_1_sol::id()) {
-        const MINIMUM_DELEGATION_SOL: u64 = 1;
-        MINIMUM_DELEGATION_SOL * LAMPORTS_PER_SOL
+        LAMPORTS_PER_SOL
     } else {
-        #[allow(deprecated)]
-        solana_sdk::stake::MINIMUM_STAKE_DELEGATION
+        1
+    }
+}
+
+/// The minimum amount, in lamports, that must be delegated in order to be considered for staking rewards
+pub fn get_minimum_delegation_for_rewards(feature_set: &FeatureSet) -> u64 {
+    if feature_set.is_active(&feature_set::stake_rewards_minimum_delegation_1_sol::id()) {
+        LAMPORTS_PER_SOL
+    } else {
+        0
     }
 }

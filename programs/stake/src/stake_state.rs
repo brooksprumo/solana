@@ -475,7 +475,7 @@ pub fn initialize(
         let minimum_balance = if feature_set.is_active(&stake_allow_zero_undelegated_amount::id()) {
             rent_exempt_reserve
         } else {
-            let minimum_delegation = crate::get_minimum_delegation(feature_set);
+            let minimum_delegation = crate::get_minimum_delegation_for_new_stakes(feature_set);
             rent_exempt_reserve + minimum_delegation
         };
 
@@ -698,7 +698,8 @@ pub fn split(
     match stake_state {
         StakeState::Stake(meta, mut stake) => {
             meta.authorized.check(signers, StakeAuthorize::Staker)?;
-            let minimum_delegation = crate::get_minimum_delegation(&invoke_context.feature_set);
+            let minimum_delegation =
+                crate::get_minimum_delegation_for_new_stakes(&invoke_context.feature_set);
             let validated_split_info = validate_split_amount(
                 invoke_context,
                 transaction_context,
@@ -762,7 +763,7 @@ pub fn split(
             {
                 0
             } else {
-                crate::get_minimum_delegation(&invoke_context.feature_set)
+                crate::get_minimum_delegation_for_new_stakes(&invoke_context.feature_set)
             };
             let validated_split_info = validate_split_amount(
                 invoke_context,
@@ -1048,7 +1049,7 @@ pub fn withdraw(
             } else {
                 checked_add(
                     meta.rent_exempt_reserve,
-                    crate::get_minimum_delegation(feature_set),
+                    crate::get_minimum_delegation_for_new_stakes(feature_set),
                 )?
             };
 
@@ -1184,7 +1185,7 @@ fn validate_delegated_amount(
     // that the minimum is met before delegation.
     if (feature_set.is_active(&stake_allow_zero_undelegated_amount::id())
         || feature_set.is_active(&feature_set::stake_raise_minimum_delegation_to_1_sol::id()))
-        && stake_amount < crate::get_minimum_delegation(feature_set)
+        && stake_amount < crate::get_minimum_delegation_for_new_stakes(feature_set)
     {
         return Err(StakeError::InsufficientDelegation.into());
     }

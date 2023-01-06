@@ -398,7 +398,7 @@ pub fn process_instruction(
                 return Err(InstructionError::InvalidInstructionData);
             }
 
-            let minimum_delegation = crate::get_minimum_delegation(feature_set);
+            let minimum_delegation = crate::get_minimum_delegation_for_new_stakes(feature_set);
             let minimum_delegation = Vec::from(minimum_delegation.to_le_bytes());
             invoke_context
                 .transaction_context
@@ -938,7 +938,7 @@ mod tests {
         let config_address = stake_config::id();
         let config_account = config::create_account(0, &stake_config::Config::default());
         let rent_exempt_reserve = rent.minimum_balance(StakeState::size_of());
-        let minimum_delegation = crate::get_minimum_delegation(&feature_set);
+        let minimum_delegation = crate::get_minimum_delegation_for_new_stakes(&feature_set);
         let withdrawal_amount = rent_exempt_reserve + minimum_delegation;
 
         // gets the "is_empty()" check
@@ -1203,7 +1203,7 @@ mod tests {
         let rent_address = sysvar::rent::id();
         let rent_account = account::create_account_shared_data_for_test(&rent);
         let rent_exempt_reserve = rent.minimum_balance(StakeState::size_of());
-        let minimum_delegation = crate::get_minimum_delegation(&feature_set);
+        let minimum_delegation = crate::get_minimum_delegation_for_new_stakes(&feature_set);
 
         // Test InitializeChecked with non-signing withdrawer
         let mut instruction =
@@ -2076,7 +2076,7 @@ mod tests {
     fn test_authorize_delegated_stake(feature_set: FeatureSet) {
         let authority_address = solana_sdk::pubkey::new_rand();
         let stake_address = solana_sdk::pubkey::new_rand();
-        let minimum_delegation = crate::get_minimum_delegation(&feature_set);
+        let minimum_delegation = crate::get_minimum_delegation_for_new_stakes(&feature_set);
         let stake_lamports = minimum_delegation;
         let stake_account = AccountSharedData::new_data_with_space(
             stake_lamports,
@@ -2282,7 +2282,7 @@ mod tests {
         vote_account_2
             .set_state(&VoteStateVersions::new_current(vote_state))
             .unwrap();
-        let minimum_delegation = crate::get_minimum_delegation(&feature_set);
+        let minimum_delegation = crate::get_minimum_delegation_for_new_stakes(&feature_set);
         let stake_lamports = minimum_delegation;
         let stake_address = solana_sdk::pubkey::new_rand();
         let mut stake_account = AccountSharedData::new_data_with_space(
@@ -2734,7 +2734,7 @@ mod tests {
     #[test_case(feature_set_new_behavior(); "new_behavior")]
     fn test_split(feature_set: FeatureSet) {
         let stake_address = solana_sdk::pubkey::new_rand();
-        let minimum_delegation = crate::get_minimum_delegation(&feature_set);
+        let minimum_delegation = crate::get_minimum_delegation_for_new_stakes(&feature_set);
         let stake_lamports = minimum_delegation * 2;
         let split_to_address = solana_sdk::pubkey::new_rand();
         let split_to_account = AccountSharedData::new_data_with_space(
@@ -2847,7 +2847,7 @@ mod tests {
         let authority_address = solana_sdk::pubkey::new_rand();
         let custodian_address = solana_sdk::pubkey::new_rand();
         let stake_address = solana_sdk::pubkey::new_rand();
-        let minimum_delegation = crate::get_minimum_delegation(&feature_set);
+        let minimum_delegation = crate::get_minimum_delegation_for_new_stakes(&feature_set);
         let stake_lamports = minimum_delegation;
         let stake_account = AccountSharedData::new_data_with_space(
             stake_lamports,
@@ -3136,7 +3136,7 @@ mod tests {
     fn test_withdraw_stake_before_warmup(feature_set: FeatureSet) {
         let recipient_address = solana_sdk::pubkey::new_rand();
         let stake_address = solana_sdk::pubkey::new_rand();
-        let minimum_delegation = crate::get_minimum_delegation(&feature_set);
+        let minimum_delegation = crate::get_minimum_delegation_for_new_stakes(&feature_set);
         let stake_lamports = minimum_delegation;
         let total_lamports = stake_lamports + 33;
         let stake_account = AccountSharedData::new_data_with_space(
@@ -3398,7 +3398,7 @@ mod tests {
         let stake_address = solana_sdk::pubkey::new_rand();
         let rent = Rent::default();
         let rent_exempt_reserve = rent.minimum_balance(StakeState::size_of());
-        let minimum_delegation = crate::get_minimum_delegation(&feature_set);
+        let minimum_delegation = crate::get_minimum_delegation_for_new_stakes(&feature_set);
         let stake_lamports = 7 * minimum_delegation;
         let stake_account = AccountSharedData::new_data_with_space(
             stake_lamports + rent_exempt_reserve,
@@ -3486,7 +3486,7 @@ mod tests {
     #[test_case(feature_set_new_behavior(); "new_behavior")]
     fn test_deactivate(feature_set: FeatureSet) {
         let stake_address = solana_sdk::pubkey::new_rand();
-        let minimum_delegation = crate::get_minimum_delegation(&feature_set);
+        let minimum_delegation = crate::get_minimum_delegation_for_new_stakes(&feature_set);
         let stake_lamports = minimum_delegation;
         let stake_account = AccountSharedData::new_data_with_space(
             stake_lamports,
@@ -3612,7 +3612,7 @@ mod tests {
         let custodian_address = solana_sdk::pubkey::new_rand();
         let authorized_address = solana_sdk::pubkey::new_rand();
         let stake_address = solana_sdk::pubkey::new_rand();
-        let minimum_delegation = crate::get_minimum_delegation(&feature_set);
+        let minimum_delegation = crate::get_minimum_delegation_for_new_stakes(&feature_set);
         let stake_lamports = minimum_delegation;
         let stake_account = AccountSharedData::new_data_with_space(
             stake_lamports,
@@ -3953,7 +3953,7 @@ mod tests {
     #[test_case(feature_set_old_behavior(); "old_behavior")]
     #[test_case(feature_set_new_behavior(); "new_behavior")]
     fn test_delegate_minimum_stake_delegation(feature_set: FeatureSet) {
-        let minimum_delegation = crate::get_minimum_delegation(&feature_set);
+        let minimum_delegation = crate::get_minimum_delegation_for_new_stakes(&feature_set);
         let rent = Rent::default();
         let rent_exempt_reserve = rent.minimum_balance(StakeState::size_of());
         let stake_address = solana_sdk::pubkey::new_rand();
@@ -4048,7 +4048,7 @@ mod tests {
     #[test_case(feature_set_old_behavior(); "old_behavior")]
     #[test_case(feature_set_new_behavior(); "new_behavior")]
     fn test_split_minimum_stake_delegation(feature_set: FeatureSet) {
-        let minimum_delegation = crate::get_minimum_delegation(&feature_set);
+        let minimum_delegation = crate::get_minimum_delegation_for_new_stakes(&feature_set);
         let rent = Rent::default();
         let rent_exempt_reserve = rent.minimum_balance(StakeState::size_of());
         let source_address = Pubkey::new_unique();
@@ -4143,7 +4143,7 @@ mod tests {
     #[test_case(feature_set_old_behavior(); "old_behavior")]
     #[test_case(feature_set_new_behavior(); "new_behavior")]
     fn test_split_full_amount_minimum_stake_delegation(feature_set: FeatureSet) {
-        let minimum_delegation = crate::get_minimum_delegation(&feature_set);
+        let minimum_delegation = crate::get_minimum_delegation_for_new_stakes(&feature_set);
         let rent = Rent::default();
         let rent_exempt_reserve = rent.minimum_balance(StakeState::size_of());
         let source_address = Pubkey::new_unique();
@@ -4316,7 +4316,7 @@ mod tests {
         feature_set: FeatureSet,
         expected_results: &[Result<(), InstructionError>],
     ) {
-        let minimum_delegation = crate::get_minimum_delegation(&feature_set);
+        let minimum_delegation = crate::get_minimum_delegation_for_new_stakes(&feature_set);
         let rent = Rent::default();
         let rent_exempt_reserve = rent.minimum_balance(StakeState::size_of());
         let source_address = Pubkey::new_unique();
@@ -4466,7 +4466,7 @@ mod tests {
     #[test_case(feature_set_old_behavior(); "old_behavior")]
     #[test_case(feature_set_new_behavior(); "new_behavior")]
     fn test_withdraw_minimum_stake_delegation(feature_set: FeatureSet) {
-        let minimum_delegation = crate::get_minimum_delegation(&feature_set);
+        let minimum_delegation = crate::get_minimum_delegation_for_new_stakes(&feature_set);
         let rent = Rent::default();
         let rent_exempt_reserve = rent.minimum_balance(StakeState::size_of());
         let stake_address = solana_sdk::pubkey::new_rand();
@@ -4579,7 +4579,7 @@ mod tests {
         feature_set: FeatureSet,
         expected_result: Result<(), InstructionError>,
     ) {
-        let minimum_delegation = crate::get_minimum_delegation(&feature_set);
+        let minimum_delegation = crate::get_minimum_delegation_for_new_stakes(&feature_set);
         let rent = Rent::default();
         let rent_exempt_reserve = rent.minimum_balance(StakeState::size_of());
         let stake_address = solana_sdk::pubkey::new_rand();
@@ -4760,7 +4760,7 @@ mod tests {
     fn test_split_source_uninitialized(feature_set: FeatureSet) {
         let rent = Rent::default();
         let rent_exempt_reserve = rent.minimum_balance(StakeState::size_of());
-        let minimum_delegation = crate::get_minimum_delegation(&feature_set);
+        let minimum_delegation = crate::get_minimum_delegation_for_new_stakes(&feature_set);
         let stake_lamports = (rent_exempt_reserve + minimum_delegation) * 2;
         let stake_address = solana_sdk::pubkey::new_rand();
         let stake_account = AccountSharedData::new_data_with_space(
@@ -4911,7 +4911,7 @@ mod tests {
     fn test_split_more_than_staked(feature_set: FeatureSet) {
         let rent = Rent::default();
         let rent_exempt_reserve = rent.minimum_balance(StakeState::size_of());
-        let minimum_delegation = crate::get_minimum_delegation(&feature_set);
+        let minimum_delegation = crate::get_minimum_delegation_for_new_stakes(&feature_set);
         let stake_lamports = (rent_exempt_reserve + minimum_delegation) * 2;
         let stake_address = solana_sdk::pubkey::new_rand();
         let stake_account = AccountSharedData::new_data_with_space(
@@ -4970,7 +4970,7 @@ mod tests {
     fn test_split_with_rent(feature_set: FeatureSet) {
         let rent = Rent::default();
         let rent_exempt_reserve = rent.minimum_balance(StakeState::size_of());
-        let minimum_delegation = crate::get_minimum_delegation(&feature_set);
+        let minimum_delegation = crate::get_minimum_delegation_for_new_stakes(&feature_set);
         let stake_address = solana_sdk::pubkey::new_rand();
         let split_to_address = solana_sdk::pubkey::new_rand();
         let split_to_account = AccountSharedData::new_data_with_space(
@@ -5080,7 +5080,7 @@ mod tests {
     fn test_split_to_account_with_rent_exempt_reserve(feature_set: FeatureSet) {
         let rent = Rent::default();
         let rent_exempt_reserve = rent.minimum_balance(StakeState::size_of());
-        let minimum_delegation = crate::get_minimum_delegation(&feature_set);
+        let minimum_delegation = crate::get_minimum_delegation_for_new_stakes(&feature_set);
         let stake_lamports = (rent_exempt_reserve + minimum_delegation) * 2;
         let stake_address = solana_sdk::pubkey::new_rand();
         let meta = Meta {
@@ -5206,7 +5206,7 @@ mod tests {
         let rent = Rent::default();
         let source_larger_rent_exempt_reserve = rent.minimum_balance(StakeState::size_of() + 100);
         let split_rent_exempt_reserve = rent.minimum_balance(StakeState::size_of());
-        let minimum_delegation = crate::get_minimum_delegation(&feature_set);
+        let minimum_delegation = crate::get_minimum_delegation_for_new_stakes(&feature_set);
         let stake_lamports = (source_larger_rent_exempt_reserve + minimum_delegation) * 2;
         let stake_address = solana_sdk::pubkey::new_rand();
         let meta = Meta {
@@ -5415,7 +5415,7 @@ mod tests {
     fn test_split_100_percent_of_source(feature_set: FeatureSet) {
         let rent = Rent::default();
         let rent_exempt_reserve = rent.minimum_balance(StakeState::size_of());
-        let minimum_delegation = crate::get_minimum_delegation(&feature_set);
+        let minimum_delegation = crate::get_minimum_delegation_for_new_stakes(&feature_set);
         let stake_lamports = rent_exempt_reserve + minimum_delegation;
         let stake_address = solana_sdk::pubkey::new_rand();
         let meta = Meta {
@@ -5511,7 +5511,7 @@ mod tests {
     fn test_split_100_percent_of_source_to_account_with_lamports(feature_set: FeatureSet) {
         let rent = Rent::default();
         let rent_exempt_reserve = rent.minimum_balance(StakeState::size_of());
-        let minimum_delegation = crate::get_minimum_delegation(&feature_set);
+        let minimum_delegation = crate::get_minimum_delegation_for_new_stakes(&feature_set);
         let stake_lamports = rent_exempt_reserve + minimum_delegation;
         let stake_address = solana_sdk::pubkey::new_rand();
         let meta = Meta {
@@ -5608,7 +5608,7 @@ mod tests {
         let rent = Rent::default();
         let source_rent_exempt_reserve = rent.minimum_balance(StakeState::size_of() + 100);
         let split_rent_exempt_reserve = rent.minimum_balance(StakeState::size_of());
-        let minimum_delegation = crate::get_minimum_delegation(&feature_set);
+        let minimum_delegation = crate::get_minimum_delegation_for_new_stakes(&feature_set);
         let stake_lamports = source_rent_exempt_reserve + minimum_delegation;
         let stake_address = solana_sdk::pubkey::new_rand();
         let meta = Meta {
@@ -6478,7 +6478,8 @@ mod tests {
             |first_instruction_account, invoke_context| {
                 super::process_instruction(first_instruction_account, invoke_context)?;
                 let expected_minimum_delegation =
-                    crate::get_minimum_delegation(&invoke_context.feature_set).to_le_bytes();
+                    crate::get_minimum_delegation_for_new_stakes(&invoke_context.feature_set)
+                        .to_le_bytes();
                 let actual_minimum_delegation =
                     invoke_context.transaction_context.get_return_data().1;
                 assert_eq!(expected_minimum_delegation, actual_minimum_delegation);
@@ -6889,7 +6890,7 @@ mod tests {
     fn test_redelegate(feature_set: FeatureSet) {
         let feature_set = Arc::new(feature_set);
 
-        let minimum_delegation = crate::get_minimum_delegation(&feature_set);
+        let minimum_delegation = crate::get_minimum_delegation_for_new_stakes(&feature_set);
         let rent = Rent::default();
         let rent_exempt_reserve = rent.minimum_balance(StakeState::size_of());
         let stake_history = StakeHistory::default();
