@@ -3200,6 +3200,11 @@ impl Bank {
             *hash = self.hash_internal_state();
             self.rc.accounts.accounts_db.mark_slot_frozen(self.slot());
             self.bank_frozen_or_destroyed();
+            error!(
+                "bprumo DEBUG: bank {} frozen, size: {}",
+                self.slot(),
+                std::mem::size_of_val(self)
+            );
         }
     }
 
