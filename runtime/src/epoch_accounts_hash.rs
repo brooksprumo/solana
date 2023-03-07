@@ -14,6 +14,7 @@ pub use utils::*;
 
 mod manager;
 pub use manager::Manager as EpochAccountsHashManager;
+pub use manager::Source as EpochAccountsHashSource;
 
 /// The EpochAccountsHash holds the result after calculating the accounts hash once per epoch
 #[derive(Debug, Serialize, Deserialize, Hash, PartialEq, Eq, Clone, Copy)]

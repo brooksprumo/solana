@@ -49,25 +49,34 @@ impl Manager {
     /// An epoch accounts hash calculation has completed; update our state
     pub fn set_valid(&self, epoch_accounts_hash: EpochAccountsHash, slot: Slot) {
         let mut state = self.state.lock().unwrap();
-        if let State::Valid(old_epoch_accounts_hash, old_slot) = &*state {
+        if let State::Valid(old_epoch_accounts_hash, old_source) = &*state {
             panic!(
                 "The epoch accounts hash is already valid! \
-                \nold slot: {old_slot}, epoch accounts hash: {old_epoch_accounts_hash:?} \
+                \nold source: {old_source:?}, epoch accounts hash: {old_epoch_accounts_hash:?} \
                 \nnew slot: {slot}, epoch accounts hash: {epoch_accounts_hash:?}"
             );
         }
-        *state = State::Valid(epoch_accounts_hash, slot);
+        *state = State::Valid(epoch_accounts_hash, Source::Calculation(slot));
+        self.cvar.notify_all();
+    }
+
+    /// bprumo TODO: doc
+    /// An epoch accounts hash calculation has completed; update our state
+    pub fn set_valid_for_warping(&self, epoch_accounts_hash: EpochAccountsHash, slot: Slot) {
+        let mut state = self.state.lock().unwrap();
+        *state = State::Valid(epoch_accounts_hash, Source::Warping(slot));
+        // bprumo TODO: remove cvar notify? No one *should* be waiting, right?
         self.cvar.notify_all();
     }
 
     /// Get the epoch accounts hash
     ///
     /// If an EAH calculation is in-flight, then this call will block until it completes.
-    pub fn wait_get_epoch_accounts_hash(&self) -> EpochAccountsHash {
+    pub fn wait_get_epoch_accounts_hash(&self) -> (EpochAccountsHash, Source) {
         let mut state = self.state.lock().unwrap();
         loop {
             match &*state {
-                State::Valid(epoch_accounts_hash, _slot) => break *epoch_accounts_hash,
+                State::Valid(epoch_accounts_hash, source) => break (*epoch_accounts_hash, *source),
                 State::InFlight(_slot) => state = self.cvar.wait(state).unwrap(),
                 State::Invalid => panic!("The epoch accounts hash cannot be awaited when Invalid!"),
             }
@@ -77,10 +86,10 @@ impl Manager {
     /// Get the epoch accounts hash
     ///
     /// This fn does not block, and will only yield an EAH if the state is `Valid`
-    pub fn try_get_epoch_accounts_hash(&self) -> Option<EpochAccountsHash> {
+    pub fn try_get_epoch_accounts_hash(&self) -> Option<(EpochAccountsHash, Source)> {
         let state = self.state.lock().unwrap();
         match &*state {
-            State::Valid(epoch_accounts_hash, _slot) => Some(*epoch_accounts_hash),
+            State::Valid(epoch_accounts_hash, source) => Some((*epoch_accounts_hash, *source)),
             _ => None,
         }
     }
@@ -97,8 +106,19 @@ enum State {
     /// An EAH calculation has been requested (for `Slot`) and is in flight.  The Bank that should
     /// save the EAH must wait until the calculation has completed.
     InFlight(Slot),
-    /// The EAH calculation is complete (for `Slot`) and the EAH value is valid to read/use.
-    Valid(EpochAccountsHash, Slot),
+    /// The EAH calculation is complete and the EAH value is valid to read/use.
+    Valid(EpochAccountsHash, Source),
+}
+
+/// Where did the EpochAccountsHash come from?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// bprumo TODO: doc
+    Calculation(Slot),
+    /// bprumo TODO: doc
+    Snapshot(Slot),
+    /// bprumo TODO: doc
+    Warping(Slot),
 }
 
 #[cfg(test)]

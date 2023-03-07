@@ -57,7 +57,7 @@ use {
         blockhash_queue::BlockhashQueue,
         builtins::{self, BuiltinAction, BuiltinFeatureTransition, Builtins},
         cost_tracker::CostTracker,
-        epoch_accounts_hash::{self, EpochAccountsHash},
+        epoch_accounts_hash::{self, EpochAccountsHash, EpochAccountsHashSource},
         epoch_stakes::{EpochStakes, NodeVoteAccounts},
         inline_spl_associated_token_account, inline_spl_token,
         message_processor::MessageProcessor,
@@ -6862,7 +6862,21 @@ impl Bank {
         ]);
 
         let epoch_accounts_hash = self.should_include_epoch_accounts_hash().then(|| {
-            let epoch_accounts_hash = self.wait_get_epoch_accounts_hash();
+            let (epoch_accounts_hash, source) = self.wait_get_epoch_accounts_hash();
+            match source {
+                EpochAccountsHashSource::Calculation(actual_slot) => {
+                    let expected_slot = epoch_accounts_hash::calculation_start(self);
+                    assert_eq!(expected_slot, actual_slot, "EAH calculation slot mismatch! expected: {expected_slot}, actual: {actual_slot}");
+                },
+                EpochAccountsHashSource::Snapshot(actual_slot) => {
+                    // When loading from a snapshot with an EAH, the slot is populated as 0.
+                    let expected_slot = 0;
+                    assert_eq!(expected_slot, actual_slot, "EAH snapshot slot mismatch! expected: {expected_slot}, actual: {actual_slot}");
+                },
+                EpochAccountsHashSource::Warping(actual_slot) => {
+                    // nothing to do here
+                }
+            }
             hash = hashv(&[hash.as_ref(), epoch_accounts_hash.as_ref().as_ref()]);
             epoch_accounts_hash
         });
@@ -6919,7 +6933,7 @@ impl Bank {
 
     /// If the epoch accounts hash should be included in this Bank, then fetch it.  If the EAH
     /// calculation has not completed yet, this fn will block until it does complete.
-    fn wait_get_epoch_accounts_hash(&self) -> EpochAccountsHash {
+    fn wait_get_epoch_accounts_hash(&self) -> (EpochAccountsHash, EpochAccountsHashSource) {
         let (epoch_accounts_hash, measure) = measure!(self
             .rc
             .accounts
@@ -6929,8 +6943,8 @@ impl Bank {
 
         datapoint_info!(
             "bank-wait_get_epoch_accounts_hash",
-            ("slot", self.slot() as i64, i64),
-            ("waiting-time-us", measure.as_us() as i64, i64),
+            ("slot", self.slot(), i64),
+            ("waiting-time-us", measure.as_us(), i64),
         );
         epoch_accounts_hash
     }
