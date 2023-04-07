@@ -3020,3 +3020,113 @@ fn run_test_load_program_accounts(scan_commitment: CommitmentConfig) {
     t_update.join().unwrap();
     t_scan.join().unwrap();
 }
+
+// bprumo TODO: doc
+// bprumo TODO: make the validators HALT on accounts hash calculation mismatch
+#[test]
+#[serial]
+fn test_incremental_accounts_hash() {
+    //solana_logger::setup_with_default(RUST_LOG_FILTER);
+    solana_logger::setup_with_default("error,local_cluster=info,solana_runtime::accounts_background_service=debug,solana_core::accounts_hash_verifier=debug,solana_core::snapshot_packager_service=debug");
+    const NUM_NODES: usize = 3;
+
+    let accounts_hash_interval = 10;
+    let incremental_snapshot_interval = accounts_hash_interval;
+    let full_snapshot_interval = incremental_snapshot_interval * 10;
+    info!(
+        "snapshot config: \
+        \n\taccounts hash interval: {accounts_hash_interval} \
+        \n\tincremental snapshot interval: {incremental_snapshot_interval} \
+        \n\tfull snapshot interval: {full_snapshot_interval}"
+    );
+
+    let validator_configs: Vec<_> = std::iter::repeat_with(move || {
+        SnapshotValidatorConfig::new(
+            full_snapshot_interval,
+            incremental_snapshot_interval,
+            accounts_hash_interval,
+            1,
+        )
+    })
+    .take(NUM_NODES)
+    .collect();
+
+    let mut cluster_config = ClusterConfig {
+        node_stakes: vec![DEFAULT_NODE_STAKE; NUM_NODES],
+        cluster_lamports: DEFAULT_CLUSTER_LAMPORTS,
+        validator_configs: validator_configs
+            .iter()
+            .map(|config| &config.validator_config)
+            .map(safe_clone_config)
+            .collect(),
+        ticks_per_slot: 4,
+        //slots_per_epoch: 1_000, // to exercise EAH? bprumo TODO
+        skip_warmup_slots: true,
+        ..ClusterConfig::default()
+    };
+
+    let mut cluster = LocalCluster::new(&mut cluster_config, SocketAddrSpace::Unspecified);
+
+    // bprumo TODO: log known validators: .get_validator_client(&validator_configs[i].validator_config.known_validators
+    // and cluster_config.validator_keys
+    for i in 0..NUM_NODES {
+        error!(
+            "{i} known validators: {:?}",
+            validator_configs[i].validator_config.known_validators
+        );
+    }
+    error!("cluster node pubkeys: {:?}", cluster.get_node_pubkeys());
+    error!("cluster validator pubkeys: {:?}", cluster.validators.keys());
+
+    // bprumo TODO: impl
+
+    /*
+     * for i in 0..NUM_NODES {
+     *     error!("{i} Waiting for snapshots");
+     *     let (incremental_snapshot_archive_info, full_snapshot_archive_info) = cluster
+     *         .wait_for_next_incremental_snapshot(
+     *             &validator_configs[i].full_snapshot_archives_dir,
+     *             &validator_configs[i].incremental_snapshot_archives_dir,
+     *             Some(Duration::from_secs(5 * 60)),
+     *         );
+     *     error!(
+     *         "{i} found: {} and {}",
+     *         full_snapshot_archive_info.path().display(),
+     *         incremental_snapshot_archive_info.path().display()
+     *     );
+     * }
+     */
+
+    cluster_tests::send_many_transactions(
+        &LegacyContactInfo::try_from(&cluster.entry_point_info).unwrap(),
+        &cluster.funding_keypair,
+        &cluster.connection_cache,
+        11,
+        123,
+    );
+
+    cluster.validators.keys().for_each(|validator_pubkey| {
+        let timer = Instant::now();
+        loop {
+            let validator_current_slot = cluster
+                .get_validator_client(validator_pubkey)
+                .unwrap()
+                .get_slot_with_commitment(CommitmentConfig::finalized())
+                .unwrap();
+            if validator_current_slot > 500 {
+                break;
+            }
+            assert!(
+                timer.elapsed() < Duration::from_secs(30),
+                "It should not take longer than 30 seconds to cross the next full snapshot interval."
+            );
+            std::thread::yield_now();
+        }
+        info!(
+            "Waited {:?} for the validator to see enough slots to cross a full snapshot interval... DONE", timer.elapsed()
+        );
+
+    });
+
+    cluster.exit();
+}

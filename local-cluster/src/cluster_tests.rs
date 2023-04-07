@@ -138,7 +138,8 @@ pub fn send_many_transactions(
     let (rpc, tpu) = get_client_facing_addr(node);
     let client = ThinClient::new(rpc, tpu, connection_cache.clone());
     let mut expected_balances = HashMap::new();
-    for _ in 0..num_txs {
+    for i in 0..num_txs {
+        error!("sending transaction {i} of {num_txs}...");
         let random_keypair = Keypair::new();
         let bal = client
             .poll_get_balance_with_commitment(
