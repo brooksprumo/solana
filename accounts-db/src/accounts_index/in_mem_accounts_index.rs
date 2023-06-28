@@ -20,6 +20,7 @@ use {
             atomic::{AtomicBool, AtomicU64, Ordering},
             Arc, Mutex, RwLock, RwLockWriteGuard,
         },
+        time::Duration,
     },
 };
 type K = Pubkey;
@@ -371,7 +372,17 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
             } else {
                 // not in cache, look on disk
                 let stats = self.stats();
+
+                let measure = Measure::start("");
                 let disk_entry = self.load_account_entry_from_disk(pubkey);
+                let measure_us = measure.end_as_us();
+                const SLOW_LOAD_THRESHOLD: Duration = Duration::from_millis(5);
+                const SLOW_LOAD_THRESHOLD_US: u64 = SLOW_LOAD_THRESHOLD.as_micros() as u64;
+                if measure_us >= SLOW_LOAD_THRESHOLD_US {
+                    log::error!(
+                        "bprumo DEBUG: SLOW (> 5ms) index load from disk took {measure_us} us, pubkey: {pubkey}"
+                    );
+                }
                 if disk_entry.is_none() {
                     return callback(None).1;
                 }

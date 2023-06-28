@@ -610,6 +610,12 @@ impl AccountsBackgroundService {
                     // Grab the current root bank
                     let bank = bank_forks.read().unwrap().root_bank();
 
+                    // bprumo NOTE: here's where we submit the histogram datapoints
+                    bank.rc
+                        .accounts
+                        .accounts_db
+                        .maybe_submit_load_accounts_stats();
+
                     // Purge accounts of any dead slots
                     request_handlers
                         .pruned_banks_request_handler

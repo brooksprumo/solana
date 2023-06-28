@@ -17,6 +17,7 @@ bytemuck = { workspace = true }
 bzip2 = { workspace = true }
 crossbeam-channel = { workspace = true }
 dashmap = { workspace = true, features = ["rayon", "raw-api"] }
+hdrhistogram.workspace = true
 index_list = { workspace = true }
 indexmap = { workspace = true }
 itertools = { workspace = true }

@@ -71,6 +71,7 @@ use {
     blake3::traits::digest::Digest,
     crossbeam_channel::{unbounded, Receiver, Sender},
     dashmap::{DashMap, DashSet},
+    hdrhistogram::Histogram,
     log::*,
     rand::{thread_rng, Rng},
     rayon::{prelude::*, ThreadPool},
@@ -1472,6 +1473,9 @@ pub struct AccountsDb {
     /// Some time later (to allow for slow calculation time), the bank hash at a slot calculated using 'M' includes the full accounts hash.
     /// Thus, the state of all accounts on a validator is known to be correct at least once per epoch.
     pub epoch_accounts_hash_manager: EpochAccountsHashManager,
+
+    pub load_accounts_samples_ns: Mutex<Option<Vec<u64>>>,
+    pub load_accounts_last_submit: Mutex<Instant>,
 }
 
 #[derive(Debug, Default)]
@@ -2446,6 +2450,8 @@ impl AccountsDb {
             partitioned_epoch_rewards_config: PartitionedEpochRewardsConfig::default(),
             epoch_accounts_hash_manager: EpochAccountsHashManager::new_invalid(),
             test_skip_rewrites_but_include_in_bank_hash: false,
+            load_accounts_samples_ns: Mutex::new(Some(Vec::new())),
+            load_accounts_last_submit: Mutex::new(Instant::now()),
         }
     }
 
@@ -5018,7 +5024,24 @@ impl AccountsDb {
         pubkey: &Pubkey,
         load_hint: LoadHint,
     ) -> Option<(AccountSharedData, Slot)> {
-        self.do_load(ancestors, pubkey, None, load_hint, LoadZeroLamports::None)
+        let measure = Measure::start("");
+        let account = self.do_load(ancestors, pubkey, None, load_hint, LoadZeroLamports::None);
+        let measure_ns = measure.end_as_ns();
+        self.record_load_accounts_measurement(measure_ns);
+
+        const SLOW_LOAD_THRESHOLD: Duration = Duration::from_millis(10);
+        const SLOW_LOAD_THRESHOLD_NS: u64 = SLOW_LOAD_THRESHOLD.as_nanos() as u64;
+        if measure_ns >= SLOW_LOAD_THRESHOLD_NS {
+            let the_rest = if let Some((account, slot)) = account.as_ref() {
+                format!(", slot: {slot}, {account:?}")
+            } else {
+                "".to_string()
+            };
+            let measure_us = measure_ns / 1000;
+            error!("bprumo DEBUG: SLOW (>10ms) LOAD took {measure_us} us, {pubkey}{the_rest}");
+        }
+
+        account
     }
 
     /// Return Ok(index_of_matching_owner) if the account owner at `offset` is one of the pubkeys in `owners`.
@@ -5418,6 +5441,9 @@ impl AccountsDb {
         #[cfg(not(test))]
         assert!(max_root.is_none());
 
+        const SLOW_THRESHOLD: Duration = Duration::from_millis(5);
+        const SLOW_THRESHOLD_US: u64 = SLOW_THRESHOLD.as_micros() as u64;
+
         let (slot, storage_location, _maybe_account_accesor) =
             self.read_index_for_accessor_or_load_slow(ancestors, pubkey, max_root, false)?;
         // Notice the subtle `?` at previous line, we bail out pretty early if missing.
@@ -5425,12 +5451,18 @@ impl AccountsDb {
         let in_write_cache = storage_location.is_cached();
         if !load_into_read_cache_only {
             if !in_write_cache {
+                let measure = Measure::start("");
                 let result = self.read_only_accounts_cache.load(*pubkey, slot);
+                let measure_us = measure.end_as_us();
                 if let Some(account) = result {
                     if matches!(load_zero_lamports, LoadZeroLamports::None)
                         && account.is_zero_lamport()
                     {
                         return None;
+                    }
+
+                    if measure_us >= SLOW_THRESHOLD_US {
+                        error!("bprumo DEBUG: SLOW (> 5ms) read cache load took {measure_us} us, pubkey: {pubkey}, account: {account:?}");
                     }
                     return Some((account, slot));
                 }
@@ -5447,6 +5479,7 @@ impl AccountsDb {
             }
         }
 
+        let mut measure_total = Measure::start("");
         let (mut account_accessor, slot) = self.retry_to_get_account_accessor(
             slot,
             storage_location,
@@ -5458,9 +5491,16 @@ impl AccountsDb {
         // note that the account being in the cache could be different now than it was previously
         // since the cache could be flushed in between the 2 calls.
         let in_write_cache = matches!(account_accessor, LoadedAccountAccessor::Cached(_));
+        let measure_load = Measure::start("");
         let account = account_accessor.check_and_get_loaded_account_shared_data();
+        let measure_load_us = measure_load.end_as_us();
         if matches!(load_zero_lamports, LoadZeroLamports::None) && account.is_zero_lamport() {
             return None;
+        }
+        measure_total.stop();
+
+        if measure_total.as_duration() >= SLOW_THRESHOLD {
+            error!("bprumo DEBUG: SLOW account load{measure_total}, just loading time: {measure_load_us} us, pubkey: {pubkey}, account: {account:?}");
         }
 
         if !in_write_cache && load_hint != LoadHint::FixedMaxRootDoNotPopulateReadCache {
@@ -9243,6 +9283,100 @@ impl AccountsDb {
                 entry.accounts.capacity(),
             );
         }
+    }
+
+    pub fn record_load_accounts_measurement(&self, measurement_ns: u64) {
+        self.load_accounts_samples_ns
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("get samples")
+            .push(measurement_ns);
+    }
+
+    pub fn maybe_submit_load_accounts_stats(&self) {
+        const SUBMIT_INTERVAL: Duration = Duration::from_secs(60);
+
+        let mut last_submit = self.load_accounts_last_submit.lock().unwrap();
+        if last_submit.elapsed() >= SUBMIT_INTERVAL {
+            *last_submit = Instant::now();
+            drop(last_submit);
+            self.submit_load_accounts_stats();
+        }
+    }
+
+    pub fn submit_load_accounts_stats(&self) {
+        let mut histogram = Histogram::<u64>::new(3).expect("create histogram");
+        let samples = self
+            .load_accounts_samples_ns
+            .lock()
+            .unwrap()
+            .replace(Vec::new())
+            .expect("get samples");
+        for sample in samples {
+            histogram.record(sample).expect("record sample")
+        }
+
+        datapoint_info!(
+            "load_accounts_histogram",
+            ("num_samples", histogram.len(), i64),
+            ("load_time_ns-mean", histogram.mean(), i64),
+            (
+                "load_time_ns-p10",
+                histogram.value_at_quantile(0.10000),
+                i64
+            ),
+            (
+                "load_time_ns-p25",
+                histogram.value_at_quantile(0.25000),
+                i64
+            ),
+            (
+                "load_time_ns-p50",
+                histogram.value_at_quantile(0.50000),
+                i64
+            ),
+            (
+                "load_time_ns-p75",
+                histogram.value_at_quantile(0.75000),
+                i64
+            ),
+            (
+                "load_time_ns-p90",
+                histogram.value_at_quantile(0.90000),
+                i64
+            ),
+            (
+                "load_time_ns-p95",
+                histogram.value_at_quantile(0.95000),
+                i64
+            ),
+            (
+                "load_time_ns-p99",
+                histogram.value_at_quantile(0.99000),
+                i64
+            ),
+            (
+                "load_time_ns-p99.9",
+                histogram.value_at_quantile(0.99900),
+                i64
+            ),
+            (
+                "load_time_ns-p99.99",
+                histogram.value_at_quantile(0.99990),
+                i64
+            ),
+            (
+                "load_time_ns-p99.999",
+                histogram.value_at_quantile(0.99999),
+                i64
+            ),
+            (
+                "load_time_ns-p100",
+                histogram.value_at_quantile(1.00000),
+                i64
+            ),
+        );
     }
 }
 
