@@ -76,11 +76,12 @@ use {
         mapref::entry::Entry::{Occupied, Vacant},
         DashMap, DashSet,
     },
+    hdrhistogram::Histogram,
     log::*,
     rand::{thread_rng, Rng},
     rayon::{prelude::*, ThreadPool},
     serde::{Deserialize, Serialize},
-    solana_measure::{measure::Measure, measure_us},
+    solana_measure::{measure, measure::Measure, measure_us},
     solana_rayon_threadlimit::get_thread_count,
     solana_sdk::{
         account::{Account, AccountSharedData, ReadableAccount, WritableAccount},
@@ -1516,6 +1517,9 @@ pub struct AccountsDb {
     pub epoch_accounts_hash_manager: EpochAccountsHashManager,
 
     pub(crate) bank_progress: BankCreationFreezingProgress,
+
+    pub load_accounts_samples_ns: Mutex<Option<Vec<u64>>>,
+    pub load_accounts_last_submit: Mutex<Instant>,
 }
 
 #[derive(Debug, Default)]
@@ -2458,6 +2462,8 @@ impl AccountsDb {
             exhaustively_verify_refcounts: false,
             partitioned_epoch_rewards_config: PartitionedEpochRewardsConfig::default(),
             epoch_accounts_hash_manager: EpochAccountsHashManager::new_invalid(),
+            load_accounts_samples_ns: Mutex::new(Some(Vec::new())),
+            load_accounts_last_submit: Mutex::new(Instant::now()),
         }
     }
 
@@ -5010,7 +5016,10 @@ impl AccountsDb {
         pubkey: &Pubkey,
         load_hint: LoadHint,
     ) -> Option<(AccountSharedData, Slot)> {
-        self.do_load(ancestors, pubkey, None, load_hint, LoadZeroLamports::None)
+        let (account, measurement) =
+            measure!(self.do_load(ancestors, pubkey, None, load_hint, LoadZeroLamports::None));
+        self.record_load_accounts_measurement(measurement);
+        account
     }
 
     /// Return Ok(index_of_matching_owner) if the account owner at `offset` is one of the pubkeys in `owners`.
@@ -9459,6 +9468,100 @@ impl AccountsDb {
                 entry.accounts.capacity(),
             );
         }
+    }
+
+    pub fn record_load_accounts_measurement(&self, measurement: Measure) {
+        self.load_accounts_samples_ns
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("get samples")
+            .push(measurement.as_ns());
+    }
+
+    pub fn maybe_submit_load_accounts_stats(&self) {
+        const SUBMIT_INTERVAL: Duration = Duration::from_secs(60);
+
+        let mut last_submit = self.load_accounts_last_submit.lock().unwrap();
+        if last_submit.elapsed() >= SUBMIT_INTERVAL {
+            *last_submit = Instant::now();
+            drop(last_submit);
+            self.submit_load_accounts_stats();
+        }
+    }
+
+    pub fn submit_load_accounts_stats(&self) {
+        let mut histogram = Histogram::<u64>::new(3).expect("create histogram");
+        let samples = self
+            .load_accounts_samples_ns
+            .lock()
+            .unwrap()
+            .replace(Vec::new())
+            .expect("get samples");
+        for sample in samples {
+            histogram.record(sample).expect("record sample")
+        }
+
+        datapoint_info!(
+            "load_accounts_histogram",
+            ("num_samples", histogram.len(), i64),
+            ("load_time_ns-mean", histogram.mean(), i64),
+            (
+                "load_time_ns-p10",
+                histogram.value_at_quantile(0.10000),
+                i64
+            ),
+            (
+                "load_time_ns-p25",
+                histogram.value_at_quantile(0.25000),
+                i64
+            ),
+            (
+                "load_time_ns-p50",
+                histogram.value_at_quantile(0.50000),
+                i64
+            ),
+            (
+                "load_time_ns-p75",
+                histogram.value_at_quantile(0.75000),
+                i64
+            ),
+            (
+                "load_time_ns-p90",
+                histogram.value_at_quantile(0.90000),
+                i64
+            ),
+            (
+                "load_time_ns-p95",
+                histogram.value_at_quantile(0.95000),
+                i64
+            ),
+            (
+                "load_time_ns-p99",
+                histogram.value_at_quantile(0.99000),
+                i64
+            ),
+            (
+                "load_time_ns-p99.9",
+                histogram.value_at_quantile(0.99900),
+                i64
+            ),
+            (
+                "load_time_ns-p99.99",
+                histogram.value_at_quantile(0.99990),
+                i64
+            ),
+            (
+                "load_time_ns-p99.999",
+                histogram.value_at_quantile(0.99999),
+                i64
+            ),
+            (
+                "load_time_ns-p100",
+                histogram.value_at_quantile(1.00000),
+                i64
+            ),
+        );
     }
 }
 
