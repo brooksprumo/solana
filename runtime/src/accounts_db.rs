@@ -7285,7 +7285,11 @@ impl AccountsDb {
                 };
                 timings.calc_storage_size_quartiles(&combined_maps);
 
-                self.calculate_accounts_hash_from_storages(config, &storages, timings)
+                let mut m = Measure::start("");
+                let result = self.calculate_accounts_hash_from_storages(config, &storages, timings);
+                m.stop();
+                error!("bprumo DEBUG: calculate_accounts_hash_from_storages() {m}");
+                result
             }
             CalcAccountsHashDataSource::IndexForTests => {
                 self.calculate_accounts_hash_from_index(slot, config)
