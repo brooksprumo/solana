@@ -406,6 +406,8 @@ impl AccountsHashVerifier {
             )
             .unwrap()); // unwrap here will never fail since check_hash = false
 
+        error!("bprumo DEBUG: AHV::calc full hash(), timing total: {measure_hash_us} us");
+
         let slot = accounts_package.slot;
         let old_accounts_hash = accounts_package
             .accounts

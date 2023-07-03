@@ -7611,12 +7611,19 @@ impl AccountsDb {
         let _guard = self.active_stats.activate(ActiveStatItem::Hash);
         stats.oldest_root = storages.range().start;
 
+        let mut m = Measure::start("");
         self.mark_old_slots_as_dirty(storages, config.epoch_schedule.slots_per_epoch, &mut stats);
+        m.stop();
+        error!("bprumo DEBUG: _calc_hash(), mark_old_slots_as_dirty {m}");
+        error!("bprumo DEBUG: _calc_hash(), stats after mark old slots as dirty: {stats:?}");
 
         let slot = storages.max_slot_inclusive();
         let use_bg_thread_pool = config.use_bg_thread_pool;
         let scan_and_hash = || {
+            let mut m = Measure::start("");
             let cache_hash_data = Self::get_cache_hash_data(accounts_hash_cache_path, config, slot);
+            m.stop();
+            error!("bprumo DEBUG: _calc_hash(), get_cache_hash_data {m}");
 
             let bounds = Range {
                 start: 0,
@@ -7635,6 +7642,7 @@ impl AccountsDb {
                 dir_for_temp_cache_files: self.transient_accounts_hash_cache_path.clone(),
             };
 
+            let mut m = Measure::start("");
             // get raw data by scanning
             let cache_hash_data_files = self.scan_snapshot_stores_with_cache(
                 &cache_hash_data,
@@ -7645,6 +7653,9 @@ impl AccountsDb {
                 config,
                 accounts_hasher.filler_account_suffix.as_ref(),
             )?;
+            m.stop();
+            error!("bprumo DEBUG: _calc_hash(), scan_snapshot_stores_with_cache {m}");
+            error!("bprumo DEBUG: _calc_hash(), stats after scan_snapshot_stores_with_cache: {stats:?}");
 
             // convert mmapped cache files into slices of data
             let cache_hash_intermediates = cache_hash_data_files
@@ -7652,16 +7663,23 @@ impl AccountsDb {
                 .map(|d| d.get_cache_hash_data())
                 .collect::<Vec<_>>();
 
+            let mut m = Measure::start("");
             // rework slices of data into bins for parallel processing and to match data shape expected by 'rest_of_hash_calculation'
             let result = AccountsHasher::get_binned_data(
                 &cache_hash_intermediates,
                 PUBKEY_BINS_FOR_CALCULATING_HASHES,
                 &bounds,
             );
+            m.stop();
+            error!("bprumo DEBUG: _calc_hash(), get_binned_data {m}");
 
+            let mut m = Measure::start("");
             // turn raw data into merkle tree hashes and sum of lamports
             let (accounts_hash, capitalization) =
                 accounts_hasher.rest_of_hash_calculation(result, &mut stats);
+            m.stop();
+            error!("bprumo DEBUG: _calc_hash(), rest_of_hash_calculation {m}");
+            error!("bprumo DEBUG: _calc_hash(), stats after rest_of_hash_calculation: {stats:?}");
             let accounts_hash = match flavor {
                 CalcAccountsHashFlavor::Full => AccountsHashEnum::Full(AccountsHash(accounts_hash)),
                 CalcAccountsHashFlavor::Incremental => {

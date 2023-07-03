@@ -195,6 +195,7 @@ impl HashStats {
             + self.hash_time_total_us
             + self.collect_snapshots_us
             + self.storage_sort_us;
+        error!("bprumo DEBUG: stats total time: {total_time_us} us");
         datapoint_info!(
             "calculate_accounts_hash_from_storages",
             ("mark_time_us", self.mark_time_us, i64),
