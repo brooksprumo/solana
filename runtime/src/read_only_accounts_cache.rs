@@ -119,6 +119,13 @@ impl ReadOnlyAccountsCache {
                 entry.index = queue.insert_last(key);
             }
         };
+    }
+
+    pub(crate) fn should_evict(&self) -> bool {
+        self.data_size.load(Ordering::Relaxed) > self.max_data_size
+    }
+
+    pub(crate) fn evict_old(&self) {
         // Evict entries from the front of the queue.
         let mut num_evicts = 0;
         while self.data_size.load(Ordering::Relaxed) > self.max_data_size {

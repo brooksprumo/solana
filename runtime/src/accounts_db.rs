@@ -28,6 +28,7 @@ use {
             },
             AccountStorage, AccountStorageStatus, ShrinkInProgress,
         },
+        waitable_condvar::WaitableCondvar,
         accounts_background_service::{DroppedSlotsSender, SendDroppedBankCallback},
         accounts_cache::{AccountsCache, CachedAccount, SlotCache},
         accounts_file::{AccountsFile, AccountsFileError},
@@ -1389,7 +1390,8 @@ pub struct AccountsDb {
     write_cache_limit_bytes: Option<u64>,
 
     sender_bg_hasher: Option<Sender<CachedAccount>>,
-    read_only_accounts_cache: ReadOnlyAccountsCache,
+    read_cache_evicter_signal: Arc<WaitableCondvar>,
+    read_only_accounts_cache: Arc<ReadOnlyAccountsCache>,
 
     recycle_stores: RwLock<RecycleStores>,
 
@@ -2393,6 +2395,7 @@ impl AccountsDb {
         const ACCOUNTS_STACK_SIZE: usize = 8 * 1024 * 1024;
 
         AccountsDb {
+            read_cache_evicter_signal: Arc::default(),
             assert_stakes_cache_consistency: false,
             bank_progress: BankCreationFreezingProgress::default(),
             create_ancient_storage: CreateAncientStorage::Pack,
@@ -2406,7 +2409,7 @@ impl AccountsDb {
             storage: AccountStorage::default(),
             accounts_cache: AccountsCache::default(),
             sender_bg_hasher: None,
-            read_only_accounts_cache: ReadOnlyAccountsCache::new(MAX_READ_ONLY_CACHE_DATA_SIZE),
+            read_only_accounts_cache: Arc::new(ReadOnlyAccountsCache::new(MAX_READ_ONLY_CACHE_DATA_SIZE)),
             recycle_stores: RwLock::new(RecycleStores::default()),
             uncleaned_pubkeys: DashMap::new(),
             next_id: AtomicAppendVecId::new(0),
@@ -2573,6 +2576,7 @@ impl AccountsDb {
         };
 
         new.start_background_hasher();
+        new.start_background_read_cache_evicter();
         {
             for path in new.paths.iter() {
                 std::fs::create_dir_all(path).expect("Create directory failed.");
@@ -2824,6 +2828,13 @@ impl AccountsDb {
         }
     }
 
+    fn read_cache_evicter(condvar: Arc<WaitableCondvar>, read_cache: Arc<ReadOnlyAccountsCache>) {
+        loop {
+            if !condvar.wait_timeout(Duration::from_secs(1)) {
+                read_cache.evict_old();
+            }
+        }
+    }
     fn background_hasher(receiver: Receiver<CachedAccount>) {
         loop {
             let result = receiver.recv();
@@ -2851,6 +2862,17 @@ impl AccountsDb {
             })
             .unwrap();
         self.sender_bg_hasher = Some(sender);
+    }
+
+    fn start_background_read_cache_evicter(&mut self) {
+        let signal = self.read_cache_evicter_signal.clone();
+        let read_cache = self.read_only_accounts_cache.clone();
+        Builder::new()
+            .name("solDbRdCacheEvict".to_string())
+            .spawn(move || {
+                Self::read_cache_evicter(signal, read_cache);
+            })
+            .unwrap();
     }
 
     #[must_use]
@@ -5463,6 +5485,9 @@ impl AccountsDb {
             */
             self.read_only_accounts_cache
                 .store(*pubkey, slot, account.clone());
+            if self.read_only_accounts_cache.should_evict() {
+                self.read_cache_evicter_signal.notify_all();
+            }
         }
         Some((account, slot))
     }
