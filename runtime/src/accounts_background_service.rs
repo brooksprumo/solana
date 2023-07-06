@@ -580,10 +580,13 @@ impl AccountsBackgroundService {
                     // Grab the current root bank
                     let bank = bank_forks.read().unwrap().root_bank().clone();
 
-                    bank.rc
-                        .accounts
-                        .accounts_db
-                        .maybe_submit_load_accounts_stats();
+                    // bprumo NOTE: now submitting in Bank::load_and_execute_transactions()
+                    /*
+                     * bank.rc
+                     *     .accounts
+                     *     .accounts_db
+                     *     .maybe_submit_load_accounts_stats();
+                     */
 
                     // Purge accounts of any dead slots
                     request_handlers

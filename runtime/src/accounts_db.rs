@@ -9427,7 +9427,7 @@ impl AccountsDb {
     }
 
     pub fn maybe_submit_load_accounts_stats(&self) {
-        const SUBMIT_INTERVAL: Duration = Duration::from_secs(60);
+        const SUBMIT_INTERVAL: Duration = Duration::from_millis(40);
 
         let mut last_submit = self.load_accounts_last_submit.lock().unwrap();
         if last_submit.elapsed() >= SUBMIT_INTERVAL {
