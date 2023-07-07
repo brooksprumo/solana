@@ -28,7 +28,6 @@ use {
             },
             AccountStorage, AccountStorageStatus, ShrinkInProgress,
         },
-        waitable_condvar::WaitableCondvar,
         accounts_background_service::{DroppedSlotsSender, SendDroppedBankCallback},
         accounts_cache::{AccountsCache, CachedAccount, SlotCache},
         accounts_file::{AccountsFile, AccountsFileError},
@@ -69,6 +68,7 @@ use {
         sorted_storages::SortedStorages,
         storable_accounts::StorableAccounts,
         verify_accounts_hash_in_background::VerifyAccountsHashInBackground,
+        waitable_condvar::WaitableCondvar,
     },
     blake3::traits::digest::Digest,
     crossbeam_channel::{unbounded, Receiver, Sender},
@@ -2409,7 +2409,9 @@ impl AccountsDb {
             storage: AccountStorage::default(),
             accounts_cache: AccountsCache::default(),
             sender_bg_hasher: None,
-            read_only_accounts_cache: Arc::new(ReadOnlyAccountsCache::new(MAX_READ_ONLY_CACHE_DATA_SIZE)),
+            read_only_accounts_cache: Arc::new(ReadOnlyAccountsCache::new(
+                MAX_READ_ONLY_CACHE_DATA_SIZE,
+            )),
             recycle_stores: RwLock::new(RecycleStores::default()),
             uncleaned_pubkeys: DashMap::new(),
             next_id: AtomicAppendVecId::new(0),
@@ -5001,21 +5003,38 @@ impl AccountsDb {
         pubkey: &Pubkey,
         load_hint: LoadHint,
     ) -> Option<(AccountSharedData, Slot)> {
-        let (account, measurement) =
+        let ((account, index_measurement), measurement) =
             measure!(self.do_load(ancestors, pubkey, None, load_hint, LoadZeroLamports::None));
         self.record_load_accounts_measurement(&measurement);
 
         const SLOW_LOAD_THRESHOLD: Duration = Duration::from_millis(10);
         if measurement.as_duration() >= SLOW_LOAD_THRESHOLD {
-            let the_rest = if let Some((account, slot)) = account.as_ref() {
-                format!(", slot: {slot}, {account:?}")
+            let the_rest = if let Some((
+                account,
+                slot,
+                load_measurement,
+                storage_location,
+                load_measurement2,
+            )) = account.as_ref()
+            {
+                let load1 = if let Some(load_measurement) = load_measurement {
+                    format!(", just loading from {storage_location:?}{load_measurement}")
+                } else {
+                    "".to_string()
+                };
+                let load2 = if let Some(load_measurement2) = load_measurement2 {
+                    format!(" (retry() load{load_measurement2})")
+                } else {
+                    "".to_string()
+                };
+                format!("{load1}{load2}, slot: {slot}, {account:?}")
             } else {
                 "".to_string()
             };
-            error!("bprumo DEBUG: SLOW LOAD{measurement}, {pubkey}{the_rest}");
+            error!("bprumo DEBUG: SLOW LOAD{measurement}, just the index{index_measurement}, {pubkey}{the_rest}");
         }
 
-        account
+        account.map(|(account, slot, ..)| (account, slot))
     }
 
     /// Return Ok(index_of_matching_owner) if the account owner at `offset` is one of the pubkeys in `owners`.
@@ -5028,9 +5047,10 @@ impl AccountsDb {
         account: &Pubkey,
         owners: &[&Pubkey],
     ) -> Result<usize, MatchAccountOwnerError> {
-        let (slot, storage_location, _maybe_account_accesor) = self
-            .read_index_for_accessor_or_load_slow(ancestors, account, None, false)
-            .ok_or(MatchAccountOwnerError::UnableToLoad)?;
+        let (result, _index_measurement) =
+            self.read_index_for_accessor_or_load_slow(ancestors, account, None, false);
+        let (slot, storage_location, _maybe_account_accesor, ..) =
+            result.ok_or(MatchAccountOwnerError::UnableToLoad)?;
 
         if !storage_location.is_cached() {
             let result = self.read_only_accounts_cache.load(*account, slot);
@@ -5046,7 +5066,7 @@ impl AccountsDb {
             }
         }
 
-        let (account_accessor, _slot) = self
+        let (account_accessor, _slot, _) = self
             .retry_to_get_account_accessor(
                 slot,
                 storage_location,
@@ -5086,31 +5106,54 @@ impl AccountsDb {
         pubkey: &'a Pubkey,
         max_root: Option<Slot>,
         clone_in_lock: bool,
-    ) -> Option<(Slot, StorageLocation, Option<LoadedAccountAccessor<'a>>)> {
-        let (lock, index) = match self.accounts_index.get(pubkey, Some(ancestors), max_root) {
+    ) -> (
+        Option<(
+            Slot,
+            StorageLocation,
+            Option<LoadedAccountAccessor<'a>>,
+            Option<Measure>, /* load, cache vs append vec */
+        )>,
+        Measure, /* index */
+    ) {
+        let (result, index_measurement) =
+            measure!(self.accounts_index.get(pubkey, Some(ancestors), max_root));
+        let (lock, index) = match result {
             AccountIndexGetResult::Found(lock, index) => (lock, index),
             // we bail out pretty early for missing.
             AccountIndexGetResult::NotFound => {
-                return None;
+                return (None, index_measurement);
             }
         };
 
         let slot_list = lock.slot_list();
         let (slot, info) = slot_list[index];
         let storage_location = info.storage_location();
-        let some_from_slow_path = if clone_in_lock {
+        let (some_from_slow_path, load_measurement) = if clone_in_lock {
             // the fast path must have failed.... so take the slower approach
             // of copying potentially large Account::data inside the lock.
 
             // calling check_and_get_loaded_account is safe as long as we're guaranteed to hold
             // the lock during the time and there should be no purge thanks to alive ancestors
             // held by our caller.
-            Some(self.get_account_accessor(slot, pubkey, &storage_location))
+            Some(measure!(self.get_account_accessor(
+                slot,
+                pubkey,
+                &storage_location
+            )))
         } else {
             None
-        };
+        }
+        .unzip();
 
-        Some((slot, storage_location, some_from_slow_path))
+        (
+            Some((
+                slot,
+                storage_location,
+                some_from_slow_path,
+                load_measurement,
+            )),
+            index_measurement,
+        )
         // `lock` is dropped here rather pretty quickly with clone_in_lock = false,
         // so the entry could be raced for mutation by other subsystems,
         // before we actually provision an account data for caller's use from now on.
@@ -5127,7 +5170,7 @@ impl AccountsDb {
         pubkey: &'a Pubkey,
         max_root: Option<Slot>,
         load_hint: LoadHint,
-    ) -> Option<(LoadedAccountAccessor<'a>, Slot)> {
+    ) -> Option<(LoadedAccountAccessor<'a>, Slot, Measure)> {
         // Happy drawing time! :)
         //
         // Reader                               | Accessed data source for cached/stored
@@ -5240,11 +5283,12 @@ impl AccountsDb {
         // Failsafe for potential race conditions with other subsystems
         let mut num_acceptable_failed_iterations = 0;
         loop {
-            let account_accessor = self.get_account_accessor(slot, pubkey, &storage_location);
+            let (account_accessor, load_measurement) =
+                measure!(self.get_account_accessor(slot, pubkey, &storage_location));
             match account_accessor {
                 LoadedAccountAccessor::Cached(Some(_)) | LoadedAccountAccessor::Stored(Some(_)) => {
                     // Great! There was no race, just return :) This is the most usual situation
-                    return Some((account_accessor, slot));
+                    return Some((account_accessor, slot, load_measurement));
                 }
                 LoadedAccountAccessor::Cached(None) => {
                     num_acceptable_failed_iterations += 1;
@@ -5336,14 +5380,14 @@ impl AccountsDb {
             };
 
             // Because reading from the cache/storage failed, retry from the index read
-            let (new_slot, new_storage_location, maybe_account_accessor) = self
-                .read_index_for_accessor_or_load_slow(
-                    ancestors,
-                    pubkey,
-                    max_root,
-                    fallback_to_slow_path,
-                )?;
-            // Notice the subtle `?` at previous line, we bail out pretty early if missing.
+            let (result, _index_measurement) = self.read_index_for_accessor_or_load_slow(
+                ancestors,
+                pubkey,
+                max_root,
+                fallback_to_slow_path,
+            );
+            let (new_slot, new_storage_location, maybe_account_accessor, load_measurement) =
+                result?;
 
             if new_slot == slot && new_storage_location.is_store_id_equal(&storage_location) {
                 inc_new_counter_info!("retry_to_get_account_accessor-panic", 1);
@@ -5391,6 +5435,7 @@ impl AccountsDb {
                 return Some((
                     maybe_account_accessor.expect("must be some if clone_in_lock=true"),
                     new_slot,
+                    load_measurement.unwrap(),
                 ));
             }
 
@@ -5406,7 +5451,16 @@ impl AccountsDb {
         max_root: Option<Slot>,
         load_hint: LoadHint,
         load_zero_lamports: LoadZeroLamports,
-    ) -> Option<(AccountSharedData, Slot)> {
+    ) -> (
+        Option<(
+            AccountSharedData,
+            Slot,
+            Option<Measure>, /* load */
+            StorageLocation,
+            Option<Measure>, /* load 2 */
+        )>,
+        Measure, /* index */
+    ) {
         self.do_load_with_populate_read_cache(
             ancestors,
             pubkey,
@@ -5433,13 +5487,24 @@ impl AccountsDb {
         load_hint: LoadHint,
         load_into_read_cache_only: bool,
         load_zero_lamports: LoadZeroLamports,
-    ) -> Option<(AccountSharedData, Slot)> {
+    ) -> (
+        Option<(
+            AccountSharedData,
+            Slot,
+            Option<Measure>, /* load */
+            StorageLocation,
+            Option<Measure>, /* load 2 */
+        )>,
+        Measure, /* index */
+    ) {
         #[cfg(not(test))]
         assert!(max_root.is_none());
 
-        let (slot, storage_location, _maybe_account_accesor) =
-            self.read_index_for_accessor_or_load_slow(ancestors, pubkey, max_root, false)?;
-        // Notice the subtle `?` at previous line, we bail out pretty early if missing.
+        let (result, index_measurement) =
+            self.read_index_for_accessor_or_load_slow(ancestors, pubkey, max_root, false);
+        let Some((slot, storage_location, _maybe_account_accesor, load_measurement)) = result else {
+            return (None, index_measurement);
+        };
 
         let in_write_cache = storage_location.is_cached();
         if !load_into_read_cache_only {
@@ -5449,36 +5514,41 @@ impl AccountsDb {
                     if matches!(load_zero_lamports, LoadZeroLamports::None)
                         && account.is_zero_lamport()
                     {
-                        return None;
+                        return (None, index_measurement);
                     }
-                    return Some((account, slot));
+                    return (
+                        Some((account, slot, load_measurement, storage_location, None)),
+                        index_measurement,
+                    );
                 }
             }
         } else {
             // goal is to load into read cache
             if in_write_cache {
                 // no reason to load in read cache. already in write cache
-                return None;
+                return (None, index_measurement);
             }
             if self.read_only_accounts_cache.in_cache(pubkey, slot) {
                 // already in read cache
-                return None;
+                return (None, index_measurement);
             }
         }
 
-        let (mut account_accessor, slot) = self.retry_to_get_account_accessor(
+        let Some((mut account_accessor, slot, load_measurement2)) = self.retry_to_get_account_accessor(
             slot,
-            storage_location,
+            storage_location.clone(),
             ancestors,
             pubkey,
             max_root,
             load_hint,
-        )?;
+        ) else {
+            return (None, index_measurement);
+        };
         let loaded_account = account_accessor.check_and_get_loaded_account();
         let is_cached = loaded_account.is_cached();
         let account = loaded_account.take_account();
         if matches!(load_zero_lamports, LoadZeroLamports::None) && account.is_zero_lamport() {
-            return None;
+            return (None, index_measurement);
         }
 
         if !is_cached {
@@ -5500,7 +5570,16 @@ impl AccountsDb {
                 self.read_cache_evicter_signal.notify_all();
             }
         }
-        Some((account, slot))
+        (
+            Some((
+                account,
+                slot,
+                load_measurement,
+                storage_location,
+                Some(load_measurement2),
+            )),
+            index_measurement,
+        )
     }
 
     pub fn load_account_hash(
@@ -5510,11 +5589,12 @@ impl AccountsDb {
         max_root: Option<Slot>,
         load_hint: LoadHint,
     ) -> Option<Hash> {
-        let (slot, storage_location, _maybe_account_accesor) =
-            self.read_index_for_accessor_or_load_slow(ancestors, pubkey, max_root, false)?;
+        let (slot, storage_location, _maybe_account_accesor, ..) = self
+            .read_index_for_accessor_or_load_slow(ancestors, pubkey, max_root, false)
+            .0?;
         // Notice the subtle `?` at previous line, we bail out pretty early if missing.
 
-        let (mut account_accessor, _) = self.retry_to_get_account_accessor(
+        let (mut account_accessor, ..) = self.retry_to_get_account_accessor(
             slot,
             storage_location,
             ancestors,
