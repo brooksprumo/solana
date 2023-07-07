@@ -5003,7 +5003,18 @@ impl AccountsDb {
     ) -> Option<(AccountSharedData, Slot)> {
         let (account, measurement) =
             measure!(self.do_load(ancestors, pubkey, None, load_hint, LoadZeroLamports::None));
-        self.record_load_accounts_measurement(measurement);
+        self.record_load_accounts_measurement(&measurement);
+
+        const SLOW_LOAD_THRESHOLD: Duration = Duration::from_millis(10);
+        if measurement.as_duration() >= SLOW_LOAD_THRESHOLD {
+            let the_rest = if let Some((account, slot)) = account.as_ref() {
+                format!(", slot: {slot}, {account:?}")
+            } else {
+                "".to_string()
+            };
+            error!("bprumo DEBUG: SLOW LOAD{measurement}, {pubkey}{the_rest}");
+        }
+
         account
     }
 
@@ -9442,7 +9453,7 @@ impl AccountsDb {
         }
     }
 
-    pub fn record_load_accounts_measurement(&self, measurement: Measure) {
+    pub fn record_load_accounts_measurement(&self, measurement: &Measure) {
         self.load_accounts_samples_ns
             .lock()
             .unwrap()
