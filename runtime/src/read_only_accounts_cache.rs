@@ -1,8 +1,8 @@
 //! ReadOnlyAccountsCache used to store accounts, such as executable accounts,
 //! which can be large, loaded many times, and rarely change.
 use {
+    crate::index_list::{Index, IndexList},
     dashmap::{mapref::entry::Entry, DashMap},
-    index_list::{Index, IndexList},
     log::*,
     solana_measure::measure,
     solana_measure::measure::Measure,
@@ -77,11 +77,11 @@ impl ReadOnlyAccountsCache {
     pub(crate) fn load(&self, pubkey: Pubkey, slot: Slot) -> Option<AccountSharedData> {
         let load_ = |pubkey, slot| -> (Option<AccountSharedData>, Measure, Option<Measure>) {
             let key = (pubkey, slot);
-            let (get_mut_result, get_mut_measurement) = measure!(self.cache.get_mut(&key));
-            let mut entry = match get_mut_result {
+            let (get_result, get_measurement) = measure!(self.cache.get(&key));
+            let entry = match get_result {
                 None => {
                     self.misses.fetch_add(1, Ordering::Relaxed);
-                    return (None, get_mut_measurement, None);
+                    return (None, get_measurement, None);
                 }
                 Some(entry) => entry,
             };
@@ -91,17 +91,16 @@ impl ReadOnlyAccountsCache {
             // so that another thread cannot write to the same key.
             let (_, lru_update_measurement) = measure!({
                 let mut queue = self.queue.lock().unwrap();
-                queue.remove(entry.index);
-                entry.index = queue.insert_last(key);
+                queue.move_to_last(entry.index);
             });
             (
                 Some(entry.account.clone()),
-                get_mut_measurement,
+                get_measurement,
                 Some(lru_update_measurement),
             )
         };
 
-        let ((result, get_mut_measurement, lru_update_measurement), total_measurement) =
+        let ((result, get_measurement, lru_update_measurement), total_measurement) =
             measure!(load_(pubkey, slot));
 
         const SLOW_THRESHOLD: Duration = Duration::from_millis(9);
@@ -111,7 +110,7 @@ impl ReadOnlyAccountsCache {
             } else {
                 "no lru update".to_string()
             };
-            error!("bprumo DEBUG: SLOW READ CACHE{total_measurement}, get mut{get_mut_measurement}, {lru_update_msg}");
+            error!("bprumo DEBUG: SLOW READ CACHE{total_measurement}, get{get_measurement}, {lru_update_msg}");
         }
 
         result
