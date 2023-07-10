@@ -5007,7 +5007,9 @@ impl AccountsDb {
             (account, index_measurement, read_cache_measurement, load_account_measurement),
             measurement,
         ) = measure!(self.do_load(ancestors, pubkey, None, load_hint, LoadZeroLamports::None));
-        self.record_load_accounts_measurement(&measurement);
+        if let Some(read_cache_measurement) = read_cache_measurement.as_ref() {
+            self.record_load_accounts_measurement(&read_cache_measurement);
+        }
 
         const SLOW_LOAD_THRESHOLD: Duration = Duration::from_millis(10);
         if measurement.as_duration() >= SLOW_LOAD_THRESHOLD {
