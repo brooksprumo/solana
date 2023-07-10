@@ -3,6 +3,9 @@
 use {
     dashmap::{mapref::entry::Entry, DashMap},
     index_list::{Index, IndexList},
+    log::*,
+    solana_measure::measure,
+    solana_measure::measure::Measure,
     solana_sdk::{
         account::{AccountSharedData, ReadableAccount},
         clock::Slot,
@@ -12,6 +15,7 @@ use {
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Mutex,
     },
+    std::time::Duration,
 };
 
 const CACHE_ENTRY_SIZE: usize =
@@ -71,24 +75,46 @@ impl ReadOnlyAccountsCache {
     }
 
     pub(crate) fn load(&self, pubkey: Pubkey, slot: Slot) -> Option<AccountSharedData> {
-        let key = (pubkey, slot);
-        let mut entry = match self.cache.get_mut(&key) {
-            None => {
-                self.misses.fetch_add(1, Ordering::Relaxed);
-                return None;
-            }
-            Some(entry) => entry,
+        let load_ = |pubkey, slot| -> (Option<AccountSharedData>, Measure, Option<Measure>) {
+            let key = (pubkey, slot);
+            let (get_mut_result, get_mut_measurement) = measure!(self.cache.get_mut(&key));
+            let mut entry = match get_mut_result {
+                None => {
+                    self.misses.fetch_add(1, Ordering::Relaxed);
+                    return (None, get_mut_measurement, None);
+                }
+                Some(entry) => entry,
+            };
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            // Move the entry to the end of the queue.
+            // self.queue is modified while holding a reference to the cache entry;
+            // so that another thread cannot write to the same key.
+            let (_, lru_update_measurement) = measure!({
+                let mut queue = self.queue.lock().unwrap();
+                queue.remove(entry.index);
+                entry.index = queue.insert_last(key);
+            });
+            (
+                Some(entry.account.clone()),
+                get_mut_measurement,
+                Some(lru_update_measurement),
+            )
         };
-        self.hits.fetch_add(1, Ordering::Relaxed);
-        // Move the entry to the end of the queue.
-        // self.queue is modified while holding a reference to the cache entry;
-        // so that another thread cannot write to the same key.
-        {
-            let mut queue = self.queue.lock().unwrap();
-            queue.remove(entry.index);
-            entry.index = queue.insert_last(key);
+
+        let ((result, get_mut_measurement, lru_update_measurement), total_measurement) =
+            measure!(load_(pubkey, slot));
+
+        const SLOW_THRESHOLD: Duration = Duration::from_millis(9);
+        if total_measurement.as_duration() >= SLOW_THRESHOLD {
+            let lru_update_msg = if let Some(lru_update_measurement) = lru_update_measurement {
+                format!("lru update{lru_update_measurement}")
+            } else {
+                "no lru update".to_string()
+            };
+            error!("bprumo DEBUG: SLOW READ CACHE{total_measurement}, get mut{get_mut_measurement}, {lru_update_msg}");
         }
-        Some(entry.account.clone())
+
+        result
     }
 
     fn account_size(&self, account: &AccountSharedData) -> usize {

@@ -5011,7 +5011,7 @@ impl AccountsDb {
             self.record_load_accounts_measurement(&read_cache_measurement);
         }
 
-        const SLOW_LOAD_THRESHOLD: Duration = Duration::from_millis(10);
+        const SLOW_LOAD_THRESHOLD: Duration = Duration::from_millis(12);
         if measurement.as_duration() >= SLOW_LOAD_THRESHOLD {
             let read_cache_msg = if let Some(read_cache_measurement) = read_cache_measurement {
                 format!("read cache{read_cache_measurement}")
