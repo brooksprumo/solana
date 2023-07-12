@@ -5016,9 +5016,11 @@ impl AccountsDb {
         pubkey: &Pubkey,
         load_hint: LoadHint,
     ) -> Option<(AccountSharedData, Slot)> {
-        let (account, measurement) =
+        let ((account, index_measurement, read_cache_measurement), measurement) =
             measure!(self.do_load(ancestors, pubkey, None, load_hint, LoadZeroLamports::None));
-        self.record_load_accounts_measurement(measurement);
+        if let Some(read_cache_measurement) = read_cache_measurement {
+            self.record_load_accounts_measurement(read_cache_measurement);
+        }
         account
     }
 
@@ -5410,7 +5412,11 @@ impl AccountsDb {
         max_root: Option<Slot>,
         load_hint: LoadHint,
         load_zero_lamports: LoadZeroLamports,
-    ) -> Option<(AccountSharedData, Slot)> {
+    ) -> (
+        Option<(AccountSharedData, Slot)>,
+        Measure,         /* index */
+        Option<Measure>, /* read cache */
+    ) {
         self.do_load_with_populate_read_cache(
             ancestors,
             pubkey,
@@ -5437,52 +5443,69 @@ impl AccountsDb {
         load_hint: LoadHint,
         load_into_read_cache_only: bool,
         load_zero_lamports: LoadZeroLamports,
-    ) -> Option<(AccountSharedData, Slot)> {
+    ) -> (
+        Option<(AccountSharedData, Slot)>,
+        Measure,         /* index */
+        Option<Measure>, /* read cache */
+    ) {
         #[cfg(not(test))]
         assert!(max_root.is_none());
 
-        let (slot, storage_location, _maybe_account_accesor) =
-            self.read_index_for_accessor_or_load_slow(ancestors, pubkey, max_root, false)?;
-        // Notice the subtle `?` at previous line, we bail out pretty early if missing.
+        let (result, index_measurement) =
+            measure!(self.read_index_for_accessor_or_load_slow(ancestors, pubkey, max_root, false));
+        let Some((slot, storage_location, _maybe_account_accesor)) = result else {
+            return (None, index_measurement, None);
+        };
 
+        let mut read_cache_measurement = Measure::start("");
         let in_write_cache = storage_location.is_cached();
         if !load_into_read_cache_only {
             if !in_write_cache {
                 let result = self.read_only_accounts_cache.load(*pubkey, slot);
                 if let Some(account) = result {
+                    read_cache_measurement.stop();
                     if matches!(load_zero_lamports, LoadZeroLamports::None)
                         && account.is_zero_lamport()
                     {
-                        return None;
+                        return (None, index_measurement, Some(read_cache_measurement));
                     }
-                    return Some((account, slot));
+                    return (
+                        Some((account, slot)),
+                        index_measurement,
+                        Some(read_cache_measurement),
+                    );
                 }
             }
         } else {
             // goal is to load into read cache
             if in_write_cache {
                 // no reason to load in read cache. already in write cache
-                return None;
+                read_cache_measurement.stop();
+                return (None, index_measurement, Some(read_cache_measurement));
             }
             if self.read_only_accounts_cache.in_cache(pubkey, slot) {
                 // already in read cache
-                return None;
+                read_cache_measurement.stop();
+                return (None, index_measurement, Some(read_cache_measurement));
             }
         }
+        read_cache_measurement.stop();
 
-        let (mut account_accessor, slot) = self.retry_to_get_account_accessor(
+        let Some((mut account_accessor, slot)) = self.retry_to_get_account_accessor(
             slot,
             storage_location,
             ancestors,
             pubkey,
             max_root,
             load_hint,
-        )?;
+        ) else {
+            return (None, index_measurement, Some(read_cache_measurement));
+        } ;
         let loaded_account = account_accessor.check_and_get_loaded_account();
         let is_cached = loaded_account.is_cached();
         let account = loaded_account.take_account();
         if matches!(load_zero_lamports, LoadZeroLamports::None) && account.is_zero_lamport() {
-            return None;
+            return (None, index_measurement, Some(read_cache_measurement));
         }
 
         if !is_cached {
@@ -5504,7 +5527,11 @@ impl AccountsDb {
                 self.read_cache_evictor_signal.notify_all();
             }
         }
-        Some((account, slot))
+        (
+            Some((account, slot)),
+            index_measurement,
+            Some(read_cache_measurement),
+        )
     }
 
     pub fn load_account_hash(
@@ -8518,15 +8545,38 @@ impl AccountsDb {
                 ),
                 ("read_only_accounts_cache_eviction_us", eviction_us, i64),
                 ("read_only_accounts_cache_update_lru_us", update_lru_us, i64),
-                ("read_only_accounts_cache_load_get_mut_us", load_get_mut_us, i64),
+                (
+                    "read_only_accounts_cache_load_get_mut_us",
+                    load_get_mut_us,
+                    i64
+                ),
                 ("read_only_accounts_cache_index_same", index_same, i64),
-                ("read_only_accounts_cache_account_clone_us", account_clone_us, i64),
+                (
+                    "read_only_accounts_cache_account_clone_us",
+                    account_clone_us,
+                    i64
+                ),
                 ("read_only_accounts_cache_selector", selector, i64),
-
-                ("read_only_accounts_cache_eviction_per_account_ns", eviction_us * 1000 / read_only_cache_hits, i64),
-                ("read_only_accounts_cache_update_lru_per_account_ns", update_lru_us * 1000 / read_only_cache_hits, i64),
-                ("read_only_accounts_cache_load_get_mut_per_account_ns", load_get_mut_us * 1000 / read_only_cache_hits, i64),
-                ("read_only_accounts_cache_account_clone_per_account_ns", account_clone_us * 1000 / read_only_cache_hits, i64),
+                (
+                    "read_only_accounts_cache_eviction_per_account_ns",
+                    eviction_us * 1000 / read_only_cache_hits,
+                    i64
+                ),
+                (
+                    "read_only_accounts_cache_update_lru_per_account_ns",
+                    update_lru_us * 1000 / read_only_cache_hits,
+                    i64
+                ),
+                (
+                    "read_only_accounts_cache_load_get_mut_per_account_ns",
+                    load_get_mut_us * 1000 / read_only_cache_hits,
+                    i64
+                ),
+                (
+                    "read_only_accounts_cache_account_clone_per_account_ns",
+                    account_clone_us * 1000 / read_only_cache_hits,
+                    i64
+                ),
             );
 
             let recycle_stores = self.recycle_stores.read().unwrap();
