@@ -93,19 +93,22 @@ impl ReadOnlyAccountsCache {
     }
 
     pub(crate) fn load(&self, pubkey: Pubkey, slot: Slot) -> Option<AccountSharedData> {
-        let timestamp = solana_sdk::timing::timestamp() / 60000;
-        let selector = timestamp % 3;
-        let selector = 2; // force queue2 with read lock
-        let selector = if selector == 0 {
-            0 // master
-        } else if selector == 1 {
-            3
-            // read lock
-        } else {
-            // queue2 with read lock
-            4
-        };
-        self.selector.store(selector, Ordering::Relaxed);
+        /*
+         * let timestamp = solana_sdk::timing::timestamp() / 60000;
+         * let selector = timestamp % 3;
+         * let selector = 2; // force queue2 with read lock
+         * let selector = if selector == 0 {
+         *     0 // master
+         * } else if selector == 1 {
+         *     3
+         *     // read lock
+         * } else {
+         *     // queue2 with read lock
+         *     4
+         * };
+         * self.selector.store(selector, Ordering::Relaxed);
+         */
+        let selector = 4;
         if selector == 1 {
             // master with minor improvements to drop write lock earlier than updating hits stat
             let key = (pubkey, slot);
@@ -199,30 +202,40 @@ impl ReadOnlyAccountsCache {
             // read lock with new lru
             let key = (pubkey, slot);
             use solana_measure::measure::Measure;
-            let mut m = Measure::start("");
-            let entry = match self.cache.get(&key) {
+            let mut measure_total = Measure::start("");
+            let (entry, measure_get) = measure!(match self.cache.get(&key) {
                 None => {
                     self.misses.fetch_add(1, Ordering::Relaxed);
                     return None;
                 }
                 Some(entry) => entry,
-            };
-            m.stop();
+            });
             // Move the entry to the end of the queue.
             // self.queue is modified while holding a reference to the cache entry;
             // so that another thread cannot write to the same key.
-            let (_, update_lru_us) = measure_us!({
+            let (_, measure_update_lru) = measure!({
                 let mut queue = self.queue2.lock().unwrap();
                 queue.push(entry.index);
             });
-            let (account, account_clone_us) = measure_us!(entry.account.clone());
-            self.account_clone_us
-                .fetch_add(account_clone_us, Ordering::Relaxed);
-            drop(entry);
-            self.load_get_mut_us.fetch_add(m.as_us(), Ordering::Relaxed);
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            self.update_lru_us
-                .fetch_add(update_lru_us, Ordering::Relaxed);
+            let (account, measure_clone) = measure!(entry.account.clone());
+            let (_, measure_drop) = measure!(drop(entry));
+
+            let (_, measure_stats) = measure!({
+                self.account_clone_us
+                    .fetch_add(measure_clone.as_us(), Ordering::Relaxed);
+                self.load_get_mut_us
+                    .fetch_add(measure_get.as_us(), Ordering::Relaxed);
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                self.update_lru_us
+                    .fetch_add(measure_update_lru.as_us(), Ordering::Relaxed);
+            });
+            measure_total.stop();
+
+            const SLOW_THRESHOLD: Duration = Duration::from_millis(1);
+            if measure_total.as_duration() > SLOW_THRESHOLD {
+                error!("bprumo DEBUG: SLOW READ CACHE! load{measure_total}, get{measure_get}, update lru{measure_update_lru}, clone account{measure_clone}, drop{measure_drop}, stats{measure_stats}");
+            }
+
             Some(account)
         } else {
             // downgrade write lock to read lock
