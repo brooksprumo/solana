@@ -1,9 +1,11 @@
 //! ReadOnlyAccountsCache used to store accounts, such as executable accounts,
 //! which can be large, loaded many times, and rarely change.
 use {
+    crossbeam_channel::{bounded, Receiver, Sender},
     dashmap::{mapref::entry::Entry, DashMap},
+    log::*,
     //index_list::{Index as CrateIndex, IndexList as CrateIndexList},
-    solana_measure::measure_us,
+    solana_measure::{measure, measure_us},
     solana_sdk::{
         account::{AccountSharedData, ReadableAccount},
         clock::Slot,
@@ -13,7 +15,7 @@ use {
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Mutex,
     },
-    crossbeam_channel::{bounded, Receiver, Sender},
+    std::time::Duration,
 };
 
 const CACHE_ENTRY_SIZE: usize =
@@ -51,7 +53,6 @@ pub(crate) struct ReadOnlyAccountsCache {
     selector: AtomicU64,
     lru_sender: Sender<Index>,
     lru_receiver: Receiver<Index>,
-    
 }
 
 impl ReadOnlyAccountsCache {
@@ -59,7 +60,6 @@ impl ReadOnlyAccountsCache {
         Mutex::new(Vec::with_capacity(30_000))
     }
     pub(crate) fn new(max_data_size: usize) -> Self {
-
         // spawn a new thread to wait for the join of the validator
         let (lru_sender, lru_receiver) = bounded(100_000);
 
@@ -73,13 +73,14 @@ impl ReadOnlyAccountsCache {
             evicts: AtomicU64::default(),
             eviction_us: AtomicU64::default(),
             update_lru_us: AtomicU64::default(),
-            load_get_mut_us:  AtomicU64::default(),
+            load_get_mut_us: AtomicU64::default(),
             index_same: AtomicU64::default(),
             account_clone_us: AtomicU64::default(),
-            selector:  AtomicU64::default(),
+            selector: AtomicU64::default(),
             preallocated_empty_queue2: Self::allocate_queue2(),
             queue2: Self::allocate_queue2(),
-            lru_sender, lru_receiver,
+            lru_sender,
+            lru_receiver,
         }
     }
 
@@ -105,12 +106,10 @@ impl ReadOnlyAccountsCache {
         let selector = 5; // force channel // force queue2 with read lock
         let selector = if selector == 0 {
             0 // master
-        }
-        else if selector == 1 {
+        } else if selector == 1 {
             5
             // read lock, unbounded channel
-        }
-        else {
+        } else {
             // queue2 with read lock
             4
         };
@@ -136,16 +135,16 @@ impl ReadOnlyAccountsCache {
                 queue.remove(entry.index);
                 entry.index = queue.insert_last(key);
             });
-            let ( account, account_clone_us) = measure_us!(entry.account.clone());
+            let (account, account_clone_us) = measure_us!(entry.account.clone());
             drop(entry);
-            self.account_clone_us.fetch_add(account_clone_us, Ordering::Relaxed);
+            self.account_clone_us
+                .fetch_add(account_clone_us, Ordering::Relaxed);
             self.load_get_mut_us.fetch_add(m.as_us(), Ordering::Relaxed);
             self.hits.fetch_add(1, Ordering::Relaxed);
             self.update_lru_us
                 .fetch_add(update_lru_us, Ordering::Relaxed);
             Some(account)
-        }
-        else if selector == 0 {
+        } else if selector == 0 {
             // master
             let key = (pubkey, slot);
             use solana_measure::measure::Measure;
@@ -167,15 +166,15 @@ impl ReadOnlyAccountsCache {
                 queue.remove(entry.index);
                 entry.index = queue.insert_last(key);
             });
-            let ( account, account_clone_us) = measure_us!(entry.account.clone());
+            let (account, account_clone_us) = measure_us!(entry.account.clone());
             drop(entry);
-            self.account_clone_us.fetch_add(account_clone_us, Ordering::Relaxed);
+            self.account_clone_us
+                .fetch_add(account_clone_us, Ordering::Relaxed);
             self.load_get_mut_us.fetch_add(m.as_us(), Ordering::Relaxed);
             self.update_lru_us
                 .fetch_add(update_lru_us, Ordering::Relaxed);
             Some(account)
-        }
-        else if selector == 3 {
+        } else if selector == 3 {
             // read lock
             let key = (pubkey, slot);
             use solana_measure::measure::Measure;
@@ -195,16 +194,16 @@ impl ReadOnlyAccountsCache {
                 let mut queue = self.queue.lock().unwrap();
                 queue.move_to_last(entry.index);
             });
-            let ( account, account_clone_us) = measure_us!(entry.account.clone());
-            self.account_clone_us.fetch_add(account_clone_us, Ordering::Relaxed);
+            let (account, account_clone_us) = measure_us!(entry.account.clone());
+            self.account_clone_us
+                .fetch_add(account_clone_us, Ordering::Relaxed);
             drop(entry);
             self.load_get_mut_us.fetch_add(m.as_us(), Ordering::Relaxed);
             self.hits.fetch_add(1, Ordering::Relaxed);
             self.update_lru_us
                 .fetch_add(update_lru_us, Ordering::Relaxed);
             Some(account)
-        }
-        else if selector == 4 {
+        } else if selector == 4 {
             // read lock with new lru
             let key = (pubkey, slot);
             use solana_measure::measure::Measure;
@@ -224,16 +223,16 @@ impl ReadOnlyAccountsCache {
                 let mut queue = self.queue2.lock().unwrap();
                 queue.push(entry.index);
             });
-            let ( account, account_clone_us) = measure_us!(entry.account.clone());
-            self.account_clone_us.fetch_add(account_clone_us, Ordering::Relaxed);
+            let (account, account_clone_us) = measure_us!(entry.account.clone());
+            self.account_clone_us
+                .fetch_add(account_clone_us, Ordering::Relaxed);
             drop(entry);
             self.load_get_mut_us.fetch_add(m.as_us(), Ordering::Relaxed);
             self.hits.fetch_add(1, Ordering::Relaxed);
             self.update_lru_us
                 .fetch_add(update_lru_us, Ordering::Relaxed);
             Some(account)
-        }
-        else if selector == 5 {
+        } else if selector == 5 {
             // read lock with new lru
             let key = (pubkey, slot);
             use solana_measure::measure::Measure;
@@ -246,48 +245,58 @@ impl ReadOnlyAccountsCache {
                 Some(entry) => entry,
             };
             m.stop();
-            let ( account, account_clone_us) = measure_us!(entry.account.clone());
+            let (account, account_clone_us) = measure_us!(entry.account.clone());
             let index = entry.index;
             drop(entry);
             // Move the entry to the end of the queue.
             // self.queue is modified while holding a reference to the cache entry;
             // so that another thread cannot write to the same key.
-            let (_, update_lru_us) = measure_us!({self.lru_sender.send(index)});
-            self.account_clone_us.fetch_add(account_clone_us, Ordering::Relaxed);
+            let (_, update_lru_us) = measure_us!({ self.lru_sender.send(index) });
+            self.account_clone_us
+                .fetch_add(account_clone_us, Ordering::Relaxed);
             self.load_get_mut_us.fetch_add(m.as_us(), Ordering::Relaxed);
             self.hits.fetch_add(1, Ordering::Relaxed);
             self.update_lru_us
                 .fetch_add(update_lru_us, Ordering::Relaxed);
             Some(account)
-        }
-        else {
+        } else {
             // downgrade write lock to read lock
             let key = (pubkey, slot);
             use solana_measure::measure::Measure;
-            let mut m = Measure::start("");
-            let mut entry = match self.cache.get_mut(&key) {
+            let mut measure_total = Measure::start("");
+            let (mut entry, measure_get) = measure!(match self.cache.get_mut(&key) {
                 None => {
                     self.misses.fetch_add(1, Ordering::Relaxed);
                     return None;
                 }
                 Some(entry) => entry,
-            };
-            m.stop();
+            });
             // Move the entry to the end of the queue.
             // self.queue is modified while holding a reference to the cache entry;
             // so that another thread cannot write to the same key.
-            let (_, update_lru_us) = measure_us!({
+            let (_, measure_update_lru) = measure!({
                 let mut queue = self.queue.lock().unwrap();
                 queue.remove(entry.index);
                 entry.index = queue.insert_last(key);
             });
-            let entry = entry.downgrade();
-            self.load_get_mut_us.fetch_add(m.as_us(), Ordering::Relaxed);
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            self.update_lru_us
-                .fetch_add(update_lru_us, Ordering::Relaxed);
-            let ( account, account_clone_us) = measure_us!(entry.account.clone());
-            self.account_clone_us.fetch_add(account_clone_us, Ordering::Relaxed);
+            let (entry, measure_downgrade) = measure!(entry.downgrade());
+            let (account, measure_clone_account) = measure!(entry.account.clone());
+            let (_, measure_stats) = measure!({
+                self.load_get_mut_us
+                    .fetch_add(measure_get.as_us(), Ordering::Relaxed);
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                self.update_lru_us
+                    .fetch_add(measure_update_lru.as_us(), Ordering::Relaxed);
+                self.account_clone_us
+                    .fetch_add(measure_clone_account.as_us(), Ordering::Relaxed);
+            });
+            measure_total.stop();
+
+            const SLOW_THRESHOLD: Duration = Duration::from_millis(1);
+            if measure_total.as_duration() > SLOW_THRESHOLD {
+                error!("bprumo DEBUG: SLOW READ CACHE! load{measure_total}, get{measure_get}, update lru{measure_update_lru}, downgrade{measure_downgrade}, clone account{measure_clone_account}, stats{measure_stats}");
+            }
+
             Some(account)
         }
     }
@@ -348,13 +357,11 @@ impl ReadOnlyAccountsCache {
                 use std::time::Duration;
                 if let Ok(index) = self.lru_receiver.recv_timeout(Duration::from_micros(1)) {
                     queue.move_to_last(index);
-                }
-                else {
+                } else {
                     break;
                 }
             }
         });
-
 
         let (_, eviction_us) = measure_us!({
             while self.should_evict() {
@@ -399,8 +406,18 @@ impl ReadOnlyAccountsCache {
         let index_same: u64 = self.index_same.swap(0, Ordering::Relaxed);
         let account_clone_us = self.account_clone_us.swap(0, Ordering::Relaxed);
         let selector = self.selector.load(Ordering::Relaxed);
-        
-        (hits, misses, evicts, eviction_us, update_lru_us, load_get_mut_us, index_same, account_clone_us, selector)
+
+        (
+            hits,
+            misses,
+            evicts,
+            eviction_us,
+            update_lru_us,
+            load_get_mut_us,
+            index_same,
+            account_clone_us,
+            selector,
+        )
     }
 }
 
