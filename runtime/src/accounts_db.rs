@@ -8473,6 +8473,9 @@ impl AccountsDb {
                 account_clone_us,
                 selector,
             ) = self.read_only_accounts_cache.get_and_reset_stats();
+            if read_only_cache_hits == 0 {
+                return;
+            }
             datapoint_info!(
                 "accounts_db_store_timings",
                 (
