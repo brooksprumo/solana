@@ -105,6 +105,10 @@ lazy_static! {
     static ref PAR_THREAD_POOL: ThreadPool = rayon::ThreadPoolBuilder::new()
         .num_threads(MAX_CONCURRENT_FORKS_TO_REPLAY)
         .thread_name(|i| format!("solReplay{i:02}"))
+        .start_handler(|index| {
+            // NOTE: The first core is used for POH, so skip that one
+            core_affinity::set_for_current(core_affinity::CoreId { id: 1 + index });
+        })
         .build()
         .unwrap();
 }

@@ -5642,6 +5642,7 @@ dependencies = [
  "bs58",
  "bytes",
  "chrono",
+ "core_affinity",
  "crossbeam-channel",
  "dashmap 4.0.2",
  "eager",
