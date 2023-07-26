@@ -433,3 +433,11 @@ crossbeam-epoch = { git = "https://github.com/solana-labs/crossbeam", rev = "fd2
 # overrides in sync.
 solana-program = { path = "sdk/program" }
 solana-zk-token-sdk = { path = "zk-token-sdk" }
+
+[profile.release-lto-fat]
+inherits = "release"
+lto = "fat"
+
+[profile.release-lto-thin]
+inherits = "release"
+lto = "thin"
