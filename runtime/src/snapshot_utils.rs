@@ -1026,13 +1026,22 @@ fn deserialize_snapshot_data_files_capped<T: Sized>(
     maximum_file_size: u64,
     deserializer: impl FnOnce(&mut SnapshotStreams<std::fs::File>) -> Result<T>,
 ) -> Result<T> {
-    let (full_snapshot_file_size, mut full_snapshot_data_file_stream) =
+    let (
+        (full_snapshot_file_size, mut full_snapshot_data_file_stream),
+        measure_full_create_snapshot_data_file_stream,
+    ) = measure!(
         create_snapshot_data_file_stream(
             &snapshot_root_paths.full_snapshot_root_file_path,
             maximum_file_size,
-        )?;
+        )?,
+        "full snapshot create_snapshot_data_file_stream()"
+    );
+    error!("bprumo DEBUG: {measure_full_create_snapshot_data_file_stream}");
 
-    let (incremental_snapshot_file_size, mut incremental_snapshot_data_file_stream) =
+    let (
+        (incremental_snapshot_file_size, mut incremental_snapshot_data_file_stream),
+        measure_incr_create_snapshot_data_file_stream,
+    ) = measure!(
         if let Some(ref incremental_snapshot_root_file_path) =
             snapshot_root_paths.incremental_snapshot_root_file_path
         {
@@ -1047,7 +1056,10 @@ fn deserialize_snapshot_data_files_capped<T: Sized>(
             )
         } else {
             (None, None)
-        };
+        },
+        "incr snapshot create_snapshot_data_file_stream()"
+    );
+    error!("bprumo DEBUG: {measure_incr_create_snapshot_data_file_stream}");
 
     let mut snapshot_streams = SnapshotStreams {
         full_snapshot_stream: &mut full_snapshot_data_file_stream,

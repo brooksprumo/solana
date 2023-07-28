@@ -727,29 +727,40 @@ fn rebuild_bank_from_unarchived_snapshots(
             .map(|root_paths| root_paths.snapshot_path()),
     };
 
-    let bank = deserialize_snapshot_data_files(&snapshot_root_paths, |snapshot_streams| {
-        Ok(
-            match incremental_snapshot_version.unwrap_or(full_snapshot_version) {
-                SnapshotVersion::V1_2_0 => bank_from_streams(
-                    SerdeStyle::Newer,
-                    snapshot_streams,
-                    account_paths,
-                    storage_and_next_append_vec_id,
-                    genesis_config,
-                    runtime_config,
-                    debug_keys,
-                    additional_builtins,
-                    account_secondary_indexes,
-                    limit_load_slot_count_from_snapshot,
-                    shrink_ratio,
-                    verify_index,
-                    accounts_db_config,
-                    accounts_update_notifier,
-                    exit,
-                ),
-            }?,
-        )
-    })?;
+    let (bank, measure_deserialize_snapshot_data_files) = measure!(
+        deserialize_snapshot_data_files(&snapshot_root_paths, |snapshot_streams| {
+            Ok(
+                match incremental_snapshot_version.unwrap_or(full_snapshot_version) {
+                    SnapshotVersion::V1_2_0 => {
+                        let (bank, measure_bank_from_streams) = measure!(
+                            bank_from_streams(
+                                SerdeStyle::Newer,
+                                snapshot_streams,
+                                account_paths,
+                                storage_and_next_append_vec_id,
+                                genesis_config,
+                                runtime_config,
+                                debug_keys,
+                                additional_builtins,
+                                account_secondary_indexes,
+                                limit_load_slot_count_from_snapshot,
+                                shrink_ratio,
+                                verify_index,
+                                accounts_db_config,
+                                accounts_update_notifier,
+                                exit,
+                            ),
+                            "bank_from_streams()"
+                        );
+                        error!("bprumo DEBUG: {measure_bank_from_streams}");
+                        bank
+                    }
+                }?,
+            )
+        })?,
+        "deserialize_snapshot_data_files()"
+    );
+    error!("bprumo DEBUG: {measure_deserialize_snapshot_data_files}");
 
     // The status cache is rebuilt from the latest snapshot.  So, if there's an incremental
     // snapshot, use that.  Otherwise use the full snapshot.
@@ -767,11 +778,23 @@ fn rebuild_bank_from_unarchived_snapshots(
             },
         )
         .join(snapshot_utils::SNAPSHOT_STATUS_CACHE_FILENAME);
-    let slot_deltas = deserialize_status_cache(&status_cache_path)?;
+    let (slot_deltas, measure_deserialize_status_cache) = measure!(
+        deserialize_status_cache(&status_cache_path)?,
+        "deserialize_status_cache"
+    );
+    error!("bprumo DEBUG: {measure_deserialize_status_cache}");
 
-    verify_slot_deltas(slot_deltas.as_slice(), &bank)?;
+    let (_, measure_verify_slot_deltas) = measure!(
+        verify_slot_deltas(slot_deltas.as_slice(), &bank)?,
+        "verify_slot_deltas()"
+    );
+    error!("bprumo DEBUG: {measure_verify_slot_deltas}");
 
-    bank.status_cache.write().unwrap().append(&slot_deltas);
+    let (_, measure_append_status_cache) = measure!(
+        bank.status_cache.write().unwrap().append(&slot_deltas),
+        "append slot deltas to status cache"
+    );
+    error!("bprumo DEBUG: {measure_append_status_cache}");
 
     info!("Rebuilt bank for slot: {}", bank.slot());
     Ok(bank)

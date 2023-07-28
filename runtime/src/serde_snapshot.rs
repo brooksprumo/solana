@@ -26,6 +26,7 @@ use {
     bincode::{self, config::Options, Error},
     log::*,
     serde::{de::DeserializeOwned, Deserialize, Serialize},
+    solana_measure::measure,
     solana_measure::measure::Measure,
     solana_sdk::{
         clock::{Epoch, Slot, UnixTimestamp},
@@ -367,24 +368,33 @@ pub(crate) fn bank_from_streams<R>(
 where
     R: Read,
 {
-    let (bank_fields, accounts_db_fields) = fields_from_streams(serde_style, snapshot_streams)?;
-    reconstruct_bank_from_fields(
-        bank_fields,
-        accounts_db_fields,
-        genesis_config,
-        runtime_config,
-        account_paths,
-        storage_and_next_append_vec_id,
-        debug_keys,
-        additional_builtins,
-        account_secondary_indexes,
-        limit_load_slot_count_from_snapshot,
-        shrink_ratio,
-        verify_index,
-        accounts_db_config,
-        accounts_update_notifier,
-        exit,
-    )
+    let ((bank_fields, accounts_db_fields), measure_fields_from_streams) = measure!(
+        fields_from_streams(serde_style, snapshot_streams)?,
+        "fields_from_streams()"
+    );
+    error!("bprumo DEBUG: {measure_fields_from_streams}");
+    let (result, measure_reconstruct_bank_from_fields) = measure!(
+        reconstruct_bank_from_fields(
+            bank_fields,
+            accounts_db_fields,
+            genesis_config,
+            runtime_config,
+            account_paths,
+            storage_and_next_append_vec_id,
+            debug_keys,
+            additional_builtins,
+            account_secondary_indexes,
+            limit_load_slot_count_from_snapshot,
+            shrink_ratio,
+            verify_index,
+            accounts_db_config,
+            accounts_update_notifier,
+            exit,
+        ),
+        "reconstruct_bank_from_fields()"
+    );
+    error!("bprumo DEBUG: {measure_reconstruct_bank_from_fields}");
+    result
 }
 
 pub(crate) fn bank_to_stream<W>(
@@ -602,38 +612,46 @@ where
             .map(|bank_fields| bank_fields.capitalization),
     );
     let bank_fields = bank_fields.collapse_into();
-    let (accounts_db, reconstructed_accounts_db_info) = reconstruct_accountsdb_from_fields(
-        snapshot_accounts_db_fields,
-        account_paths,
-        storage_and_next_append_vec_id,
-        genesis_config,
-        account_secondary_indexes,
-        limit_load_slot_count_from_snapshot,
-        shrink_ratio,
-        verify_index,
-        accounts_db_config,
-        accounts_update_notifier,
-        exit,
-        bank_fields.epoch_accounts_hash,
-        capitalizations,
-        bank_fields.incremental_snapshot_persistence.as_ref(),
-    )?;
+    let ((accounts_db, reconstructed_accounts_db_info), measure_reconstruct_accountsdb_from_fields) = measure!(
+        reconstruct_accountsdb_from_fields(
+            snapshot_accounts_db_fields,
+            account_paths,
+            storage_and_next_append_vec_id,
+            genesis_config,
+            account_secondary_indexes,
+            limit_load_slot_count_from_snapshot,
+            shrink_ratio,
+            verify_index,
+            accounts_db_config,
+            accounts_update_notifier,
+            exit,
+            bank_fields.epoch_accounts_hash,
+            capitalizations,
+            bank_fields.incremental_snapshot_persistence.as_ref(),
+        )?,
+        "reconstruct_accountsdb_from_fields()"
+    );
+    error!("bprumo DEBUG: {measure_reconstruct_accountsdb_from_fields}");
 
     let bank_rc = BankRc::new(Accounts::new_empty(accounts_db), bank_fields.slot);
     let runtime_config = Arc::new(runtime_config.clone());
 
     // if limit_load_slot_count_from_snapshot is set, then we need to side-step some correctness checks beneath this call
     let debug_do_not_add_builtins = limit_load_slot_count_from_snapshot.is_some();
-    let bank = Bank::new_from_fields(
-        bank_rc,
-        genesis_config,
-        runtime_config,
-        bank_fields,
-        debug_keys,
-        additional_builtins,
-        debug_do_not_add_builtins,
-        reconstructed_accounts_db_info.accounts_data_len,
+    let (bank, measure_bank_new_from_fields) = measure!(
+        Bank::new_from_fields(
+            bank_rc,
+            genesis_config,
+            runtime_config,
+            bank_fields,
+            debug_keys,
+            additional_builtins,
+            debug_do_not_add_builtins,
+            reconstructed_accounts_db_info.accounts_data_len,
+        ),
+        "Bank::new_from_fields()"
     );
+    error!("bprumo DEBUG: {measure_bank_new_from_fields}");
 
     info!("rent_collector: {:?}", bank.rent_collector());
 
