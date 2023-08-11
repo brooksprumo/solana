@@ -9,10 +9,10 @@ use {
 };
 
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize, AbiExample)]
-struct HashAge {
-    fee_calculator: FeeCalculator,
-    hash_index: u64,
-    timestamp: u64,
+pub struct HashAge {
+    pub fee_calculator: FeeCalculator,
+    pub hash_index: u64,
+    pub timestamp: u64,
 }
 
 /// Low memory overhead, so can be cloned for every checkpoint
@@ -127,7 +127,30 @@ impl BlockhashQueue {
     pub(crate) fn get_max_age(&self) -> usize {
         self.max_age
     }
+
+    pub fn to_serde(self) -> SerdeBlockhashQueue {
+        self.into()
+    }
 }
+
+pub struct SerdeBlockhashQueue {
+    pub last_hash_index: u64,
+    pub last_hash: Option<Hash>,
+    pub ages: HashMap<Hash, HashAge>,
+    pub max_age: usize,
+}
+
+impl From<BlockhashQueue> for SerdeBlockhashQueue {
+    fn from(other: BlockhashQueue) -> SerdeBlockhashQueue {
+        SerdeBlockhashQueue {
+            last_hash_index: other.last_hash_index,
+            last_hash: other.last_hash,
+            ages: other.ages,
+            max_age: other.max_age,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[allow(deprecated)]

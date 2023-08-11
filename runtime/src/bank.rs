@@ -656,40 +656,40 @@ impl NonceInfo for NonceFull {
 // All members are made public to remain Bank's members private and to make versioned deserializer workable on this
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BankFieldsToDeserialize {
-    pub(crate) blockhash_queue: BlockhashQueue,
-    pub(crate) ancestors: AncestorsForSerialization,
-    pub(crate) hash: Hash,
-    pub(crate) parent_hash: Hash,
-    pub(crate) parent_slot: Slot,
-    pub(crate) hard_forks: HardForks,
-    pub(crate) transaction_count: u64,
-    pub(crate) tick_height: u64,
-    pub(crate) signature_count: u64,
-    pub(crate) capitalization: u64,
-    pub(crate) max_tick_height: u64,
-    pub(crate) hashes_per_tick: Option<u64>,
-    pub(crate) ticks_per_slot: u64,
-    pub(crate) ns_per_slot: u128,
-    pub(crate) genesis_creation_time: UnixTimestamp,
-    pub(crate) slots_per_year: f64,
-    pub(crate) slot: Slot,
-    pub(crate) epoch: Epoch,
-    pub(crate) block_height: u64,
-    pub(crate) collector_id: Pubkey,
-    pub(crate) collector_fees: u64,
-    pub(crate) fee_calculator: FeeCalculator,
-    pub(crate) fee_rate_governor: FeeRateGovernor,
-    pub(crate) collected_rent: u64,
-    pub(crate) rent_collector: RentCollector,
-    pub(crate) epoch_schedule: EpochSchedule,
-    pub(crate) inflation: Inflation,
-    pub(crate) stakes: Stakes<Delegation>,
-    pub(crate) epoch_stakes: HashMap<Epoch, EpochStakes>,
-    pub(crate) is_delta: bool,
-    pub(crate) accounts_data_len: u64,
-    pub(crate) incremental_snapshot_persistence: Option<BankIncrementalSnapshotPersistence>,
-    pub(crate) epoch_accounts_hash: Option<Hash>,
-    pub(crate) epoch_reward_status: EpochRewardStatus,
+    pub blockhash_queue: BlockhashQueue,
+    pub ancestors: AncestorsForSerialization,
+    pub hash: Hash,
+    pub parent_hash: Hash,
+    pub parent_slot: Slot,
+    pub hard_forks: HardForks,
+    pub transaction_count: u64,
+    pub tick_height: u64,
+    pub signature_count: u64,
+    pub capitalization: u64,
+    pub max_tick_height: u64,
+    pub hashes_per_tick: Option<u64>,
+    pub ticks_per_slot: u64,
+    pub ns_per_slot: u128,
+    pub genesis_creation_time: UnixTimestamp,
+    pub slots_per_year: f64,
+    pub slot: Slot,
+    pub epoch: Epoch,
+    pub block_height: u64,
+    pub collector_id: Pubkey,
+    pub collector_fees: u64,
+    pub fee_calculator: FeeCalculator,
+    pub fee_rate_governor: FeeRateGovernor,
+    pub collected_rent: u64,
+    pub rent_collector: RentCollector,
+    pub epoch_schedule: EpochSchedule,
+    pub inflation: Inflation,
+    pub stakes: Stakes<Delegation>,
+    pub epoch_stakes: HashMap<Epoch, EpochStakes>,
+    pub is_delta: bool,
+    pub accounts_data_len: u64,
+    pub incremental_snapshot_persistence: Option<BankIncrementalSnapshotPersistence>,
+    pub epoch_accounts_hash: Option<Hash>,
+    pub epoch_reward_status: EpochRewardStatus,
 }
 
 // Bank's common fields shared by all supported snapshot versions for serialization.
@@ -697,38 +697,38 @@ pub struct BankFieldsToDeserialize {
 // So, sync fields with BankFieldsToDeserialize!
 // all members are made public to keep Bank private and to make versioned serializer workable on this
 #[derive(Debug)]
-pub(crate) struct BankFieldsToSerialize<'a> {
-    pub(crate) blockhash_queue: &'a RwLock<BlockhashQueue>,
-    pub(crate) ancestors: &'a AncestorsForSerialization,
-    pub(crate) hash: Hash,
-    pub(crate) parent_hash: Hash,
-    pub(crate) parent_slot: Slot,
-    pub(crate) hard_forks: &'a RwLock<HardForks>,
-    pub(crate) transaction_count: u64,
-    pub(crate) tick_height: u64,
-    pub(crate) signature_count: u64,
-    pub(crate) capitalization: u64,
-    pub(crate) max_tick_height: u64,
-    pub(crate) hashes_per_tick: Option<u64>,
-    pub(crate) ticks_per_slot: u64,
-    pub(crate) ns_per_slot: u128,
-    pub(crate) genesis_creation_time: UnixTimestamp,
-    pub(crate) slots_per_year: f64,
-    pub(crate) slot: Slot,
-    pub(crate) epoch: Epoch,
-    pub(crate) block_height: u64,
-    pub(crate) collector_id: Pubkey,
-    pub(crate) collector_fees: u64,
-    pub(crate) fee_calculator: FeeCalculator,
-    pub(crate) fee_rate_governor: FeeRateGovernor,
-    pub(crate) collected_rent: u64,
-    pub(crate) rent_collector: RentCollector,
-    pub(crate) epoch_schedule: EpochSchedule,
-    pub(crate) inflation: Inflation,
-    pub(crate) stakes: &'a StakesCache,
-    pub(crate) epoch_stakes: &'a HashMap<Epoch, EpochStakes>,
-    pub(crate) is_delta: bool,
-    pub(crate) accounts_data_len: u64,
+pub struct BankFieldsToSerialize<'a> {
+    pub blockhash_queue: &'a RwLock<BlockhashQueue>,
+    pub ancestors: &'a AncestorsForSerialization,
+    pub hash: Hash,
+    pub parent_hash: Hash,
+    pub parent_slot: Slot,
+    pub hard_forks: &'a RwLock<HardForks>,
+    pub transaction_count: u64,
+    pub tick_height: u64,
+    pub signature_count: u64,
+    pub capitalization: u64,
+    pub max_tick_height: u64,
+    pub hashes_per_tick: Option<u64>,
+    pub ticks_per_slot: u64,
+    pub ns_per_slot: u128,
+    pub genesis_creation_time: UnixTimestamp,
+    pub slots_per_year: f64,
+    pub slot: Slot,
+    pub epoch: Epoch,
+    pub block_height: u64,
+    pub collector_id: Pubkey,
+    pub collector_fees: u64,
+    pub fee_calculator: FeeCalculator,
+    pub fee_rate_governor: FeeRateGovernor,
+    pub collected_rent: u64,
+    pub rent_collector: RentCollector,
+    pub epoch_schedule: EpochSchedule,
+    pub inflation: Inflation,
+    pub stakes: &'a StakesCache,
+    pub epoch_stakes: &'a HashMap<Epoch, EpochStakes>,
+    pub is_delta: bool,
+    pub accounts_data_len: u64,
 }
 
 // Can't derive PartialEq because RwLock doesn't implement PartialEq
@@ -878,16 +878,16 @@ impl AbiExample for OptionalDropCallback {
 }
 
 #[derive(AbiExample, Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct StartBlockHeightAndRewards {
+pub struct StartBlockHeightAndRewards {
     /// the block height of the slot at which rewards distribution began
-    pub(crate) start_block_height: u64,
+    pub start_block_height: u64,
     /// calculated epoch rewards pending distribution
-    pub(crate) calculated_epoch_stake_rewards: Arc<StakeRewards>,
+    pub calculated_epoch_stake_rewards: Arc<StakeRewards>,
 }
 
 /// Represent whether bank is in the reward phase or not.
 #[derive(AbiExample, AbiEnumVisitor, Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-pub(crate) enum EpochRewardStatus {
+pub enum EpochRewardStatus {
     /// this bank is in the reward phase.
     /// Contents are the start point for epoch reward calculation,
     /// i.e. parent_slot and parent_block height for the starting
@@ -1098,7 +1098,7 @@ struct VoteReward {
 }
 
 type VoteRewards = DashMap<Pubkey, VoteReward>;
-pub(crate) type StakeRewards = Vec<StakeReward>;
+pub type StakeRewards = Vec<StakeReward>;
 
 #[derive(Debug, Default)]
 pub struct NewBankOptions {
@@ -1126,7 +1126,7 @@ pub struct CommitTransactionCounts {
 }
 
 #[derive(AbiExample, Debug, Serialize, Deserialize, Clone, PartialEq)]
-pub(crate) struct StakeReward {
+pub struct StakeReward {
     stake_pubkey: Pubkey,
     stake_reward_info: RewardInfo,
     stake_account: AccountSharedData,
@@ -1996,7 +1996,7 @@ impl Bank {
     }
 
     /// Return subset of bank fields representing serializable state
-    pub(crate) fn get_fields_to_serialize<'a>(
+    pub fn get_fields_to_serialize<'a>(
         &'a self,
         ancestors: &'a HashMap<Slot, usize>,
     ) -> BankFieldsToSerialize<'a> {
@@ -7616,6 +7616,20 @@ impl Bank {
                 .saturating_sub(forward_transactions_to_leader_at_slot_offset as usize),
             &mut error_counters,
         )
+    }
+
+    pub fn collector_fees(&self) -> u64 {
+        self.collector_fees.load(Relaxed)
+    }
+    pub fn collected_rent(&self) -> u64 {
+        self.collected_rent.load(Relaxed)
+    }
+    pub fn is_delta(&self) -> bool {
+        self.is_delta.load(Relaxed)
+    }
+    pub fn blockhash_queue(&self) -> BlockhashQueue {
+        // bprumo TODO: ideally we wouldn't clone here
+        self.blockhash_queue.read().unwrap().clone()
     }
 }
 
