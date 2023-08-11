@@ -42,6 +42,8 @@ const MAX_BASE58_LEN: usize = 44;
     PartialOrd,
     Hash,
     AbiExample,
+    bytemuck::Pod,
+    bytemuck::Zeroable,
 )]
 #[repr(transparent)]
 pub struct Hash(pub(crate) [u8; HASH_BYTES]);
