@@ -20,15 +20,15 @@ pub struct HashAge {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, AbiExample)]
 pub struct BlockhashQueue {
     /// index of last hash to be registered
-    last_hash_index: u64,
+    pub last_hash_index: u64,
 
     /// last hash to be registered
-    last_hash: Option<Hash>,
+    pub last_hash: Option<Hash>,
 
-    ages: HashMap<Hash, HashAge>,
+    pub ages: HashMap<Hash, HashAge>,
 
     /// hashes older than `max_age` will be dropped from the queue
-    max_age: usize,
+    pub max_age: usize,
 }
 
 impl Default for BlockhashQueue {
