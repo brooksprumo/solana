@@ -1127,9 +1127,9 @@ pub struct CommitTransactionCounts {
 
 #[derive(AbiExample, Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct StakeReward {
-    stake_pubkey: Pubkey,
-    stake_reward_info: RewardInfo,
-    stake_account: AccountSharedData,
+    pub stake_pubkey: Pubkey,
+    pub stake_reward_info: RewardInfo,
+    pub stake_account: AccountSharedData,
 }
 
 impl StakeReward {
