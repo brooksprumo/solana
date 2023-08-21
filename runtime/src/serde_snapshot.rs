@@ -52,7 +52,7 @@ use {
     storage::SerializableStorage,
 };
 
-mod newer;
+pub mod newer;
 mod storage;
 mod tests;
 mod types;
@@ -191,7 +191,7 @@ impl<T> SnapshotAccountsDbFields<T> {
     }
 }
 
-trait TypeContext<'a>: PartialEq {
+pub trait TypeContext<'a>: PartialEq {
     type SerializableAccountStorageEntry: Serialize
         + DeserializeOwned
         + From<&'a AccountStorageEntry>
@@ -489,7 +489,7 @@ pub fn reserialize_bank_with_new_accounts_hash(
     found
 }
 
-struct SerializableBankAndStorage<'a, C> {
+pub struct SerializableBankAndStorage<'a, C> {
     bank: &'a Bank,
     snapshot_storages: &'a [Vec<Arc<AccountStorageEntry>>],
     phantom: std::marker::PhantomData<C>,
@@ -537,7 +537,7 @@ impl<'a, C> From<SerializableBankAndStorageNoExtra<'a, C>> for SerializableBankA
     }
 }
 
-struct SerializableAccountsDb<'a, C> {
+pub struct SerializableAccountsDb<'a, C> {
     accounts_db: &'a AccountsDb,
     slot: Slot,
     account_storage_entries: &'a [Vec<Arc<AccountStorageEntry>>],

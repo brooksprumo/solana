@@ -4,7 +4,7 @@ use {
 };
 
 /// The serialized AppendVecId type is fixed as usize
-pub(crate) type SerializedAppendVecId = usize;
+pub type SerializedAppendVecId = usize;
 
 // Serializable version of AccountStorageEntry for snapshot format
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -13,7 +13,7 @@ pub struct SerializableAccountStorageEntry {
     accounts_current_len: usize,
 }
 
-pub(super) trait SerializableStorage {
+pub trait SerializableStorage {
     fn id(&self) -> SerializedAppendVecId;
     fn current_len(&self) -> usize;
 }
