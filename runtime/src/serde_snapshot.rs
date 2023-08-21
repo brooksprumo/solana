@@ -75,16 +75,16 @@ const MAX_STREAM_SIZE: u64 = 32 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize, AbiExample, PartialEq, Eq)]
 pub struct AccountsDbFields<T>(
-    HashMap<Slot, Vec<T>>,
-    StoredMetaWriteVersion,
-    Slot,
-    BankHashInfo,
+    pub HashMap<Slot, Vec<T>>,
+    pub StoredMetaWriteVersion,
+    pub Slot,
+    pub BankHashInfo,
     /// all slots that were roots within the last epoch
     #[serde(deserialize_with = "default_on_eof")]
-    Vec<Slot>,
+    pub Vec<Slot>,
     /// slots that were roots within the last epoch for which we care about the hash value
     #[serde(deserialize_with = "default_on_eof")]
-    Vec<(Slot, Hash)>,
+    pub Vec<(Slot, Hash)>,
 );
 
 /// Incremental snapshots only calculate their accounts hash based on the
@@ -110,10 +110,10 @@ pub struct BankIncrementalSnapshotPersistence {
 }
 
 #[derive(Clone, Default, Debug, Serialize, Deserialize, PartialEq, Eq, AbiExample)]
-struct BankHashInfo {
-    accounts_delta_hash: SerdeAccountsDeltaHash,
-    accounts_hash: SerdeAccountsHash,
-    stats: BankHashStats,
+pub struct BankHashInfo {
+    pub accounts_delta_hash: SerdeAccountsDeltaHash,
+    pub accounts_hash: SerdeAccountsHash,
+    pub stats: BankHashStats,
 }
 
 /// Helper type to wrap BufReader streams when deserializing and reconstructing from either just a
@@ -127,8 +127,8 @@ pub struct SnapshotStreams<'a, R> {
 /// snapshot, or both a full and incremental snapshot
 #[derive(Debug)]
 pub struct SnapshotBankFields {
-    full: BankFieldsToDeserialize,
-    incremental: Option<BankFieldsToDeserialize>,
+    pub full: BankFieldsToDeserialize,
+    pub incremental: Option<BankFieldsToDeserialize>,
 }
 
 impl SnapshotBankFields {
@@ -142,8 +142,8 @@ impl SnapshotBankFields {
 /// snapshot, or both a full and incremental snapshot
 #[derive(Debug)]
 pub struct SnapshotAccountsDbFields<T> {
-    full_snapshot_accounts_db_fields: AccountsDbFields<T>,
-    incremental_snapshot_accounts_db_fields: Option<AccountsDbFields<T>>,
+    pub full_snapshot_accounts_db_fields: AccountsDbFields<T>,
+    pub incremental_snapshot_accounts_db_fields: Option<AccountsDbFields<T>>,
 }
 
 impl<T> SnapshotAccountsDbFields<T> {
