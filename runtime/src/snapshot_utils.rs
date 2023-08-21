@@ -297,7 +297,7 @@ struct UnpackedSnapshotsDirAndVersion {
 
 /// Helper type for passing around account storage map and next append vec id
 /// for reconstructing accounts from a snapshot
-pub(crate) struct StorageAndNextAppendVecId {
+pub struct StorageAndNextAppendVecId {
     pub storage: AccountStorageMap,
     pub next_append_vec_id: AtomicAppendVecId,
 }
