@@ -9,8 +9,8 @@ pub type SerializedAppendVecId = usize;
 // Serializable version of AccountStorageEntry for snapshot format
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SerializableAccountStorageEntry {
-    id: SerializedAppendVecId,
-    accounts_current_len: usize,
+    pub id: SerializedAppendVecId,
+    pub accounts_current_len: usize,
 }
 
 pub trait SerializableStorage {

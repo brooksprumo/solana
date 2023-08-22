@@ -53,10 +53,10 @@ use {
 };
 
 pub mod newer;
-mod storage;
-mod tests;
-mod types;
-mod utils;
+pub mod storage;
+pub mod tests;
+pub mod types;
+pub mod utils;
 
 // a number of test cases in accounts_db use this
 #[cfg(test)]
