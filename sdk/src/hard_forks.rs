@@ -10,7 +10,7 @@ use {
 
 #[derive(Default, Clone, Debug, Deserialize, Serialize, AbiExample, PartialEq, Eq)]
 pub struct HardForks {
-    hard_forks: Vec<(Slot, usize)>,
+    pub hard_forks: Vec<(Slot, usize)>,
 }
 impl HardForks {
     // Register a fork to occur at all slots >= `slot` with a parent slot < `slot`
