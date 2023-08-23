@@ -1056,7 +1056,7 @@ impl AccountStorageEntry {
         }
     }
 
-    pub(crate) fn new_existing(
+    pub fn new_existing(
         slot: Slot,
         id: AppendVecId,
         accounts: AccountsFile,
