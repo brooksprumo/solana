@@ -17,10 +17,10 @@ pub struct NodeVoteAccounts {
 #[derive(Clone, Debug, Serialize, Deserialize, AbiExample, PartialEq)]
 pub struct EpochStakes {
     #[serde(with = "crate::stakes::serde_stakes_enum_compat")]
-    stakes: Arc<StakesEnum>,
-    total_stake: u64,
-    node_id_to_vote_accounts: Arc<NodeIdToVoteAccounts>,
-    epoch_authorized_voters: Arc<EpochAuthorizedVoters>,
+    pub stakes: Arc<StakesEnum>,
+    pub total_stake: u64,
+    pub node_id_to_vote_accounts: Arc<NodeIdToVoteAccounts>,
+    pub epoch_authorized_voters: Arc<EpochAuthorizedVoters>,
 }
 
 impl EpochStakes {

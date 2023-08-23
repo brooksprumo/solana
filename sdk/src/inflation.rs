@@ -19,7 +19,7 @@ pub struct Inflation {
     pub foundation_term: f64,
 
     /// DEPRECATED, this field is currently unused
-    __unused: f64,
+    pub __unused: f64,
 }
 
 const DEFAULT_INITIAL: f64 = 0.08;
