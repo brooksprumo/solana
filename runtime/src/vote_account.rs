@@ -53,7 +53,7 @@ pub struct VoteAccounts {
 }
 
 impl VoteAccount {
-    pub(crate) fn account(&self) -> &AccountSharedData {
+    pub fn account(&self) -> &AccountSharedData {
         &self.0.account
     }
 
