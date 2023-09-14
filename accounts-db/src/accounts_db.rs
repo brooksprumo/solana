@@ -1587,7 +1587,7 @@ pub struct AccountsDb {
 
     /// A histogram for how long it takes to load accounts
     #[cfg(feature = "load-accounts-histogram")]
-    pub load_accounts_histogram: Mutex<load_accounts_histogram::LoadAccountsHistogram>,
+    pub load_accounts_histogram: load_accounts_histogram::LoadAccountsHistogram,
 }
 
 #[derive(Debug, Default)]
@@ -2536,9 +2536,7 @@ impl AccountsDb {
             partitioned_epoch_rewards_config: PartitionedEpochRewardsConfig::default(),
             epoch_accounts_hash_manager: EpochAccountsHashManager::new_invalid(),
             #[cfg(feature = "load-accounts-histogram")]
-            load_accounts_histogram: Mutex::new(
-                load_accounts_histogram::LoadAccountsHistogram::new(),
-            ),
+            load_accounts_histogram: load_accounts_histogram::LoadAccountsHistogram::new(),
         }
     }
 
@@ -9579,15 +9577,13 @@ impl AccountsDb {
     pub fn record_load_accounts_measurement(&self, _measurement: Measure) {
         #[cfg(feature = "load-accounts-histogram")]
         self.load_accounts_histogram
-            .lock()
-            .unwrap()
             .record(_measurement.as_duration());
     }
 
     /// Submits the stats from the histogram for loading accounts
     pub fn maybe_submit_load_accounts_stats(&self) {
         #[cfg(feature = "load-accounts-histogram")]
-        self.load_accounts_histogram.lock().unwrap().maybe_submit()
+        self.load_accounts_histogram.maybe_submit()
     }
 }
 
