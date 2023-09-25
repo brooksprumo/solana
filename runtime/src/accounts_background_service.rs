@@ -659,8 +659,7 @@ impl AccountsBackgroundService {
                     // snapshot requests.  This is because startup verification and snapshot
                     // request handling can both kick off accounts hash calculations in background
                     // threads, and these must not happen concurrently.
-                    let snapshot_handle_result = bank
-                        .is_startup_verification_complete()
+                    let snapshot_handle_result = (bank.is_startup_verification_complete() && bank.rc.accounts.accounts_db.ancient_packer_thread.lock().unwrap().is_none())
                         .then(|| {
                             request_handlers.handle_snapshot_requests(
                                 test_hash_calculation,
