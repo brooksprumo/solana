@@ -7954,7 +7954,8 @@ impl Bank {
         self.rc
             .accounts
             .accounts_db
-            .shrink_candidate_slots(self.epoch_schedule())
+            .clone()
+            .shrink_candidate_slots_arc(self.epoch_schedule())
     }
 
     pub fn no_overflow_rent_distribution_enabled(&self) -> bool {
