@@ -106,7 +106,7 @@ use {
             atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
             Arc, Condvar, Mutex, RwLock,
         },
-        thread::{sleep, Builder},
+        thread::{self, sleep, Builder},
         time::{Duration, Instant},
     },
     tempfile::TempDir,
@@ -1582,6 +1582,8 @@ pub struct AccountsDb {
     /// Some time later (to allow for slow calculation time), the bank hash at a slot calculated using 'M' includes the full accounts hash.
     /// Thus, the state of all accounts on a validator is known to be correct at least once per epoch.
     pub epoch_accounts_hash_manager: EpochAccountsHashManager,
+
+    pub ancient_packer_thread: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 #[derive(Debug, Default)]
@@ -2527,6 +2529,7 @@ impl AccountsDb {
             exhaustively_verify_refcounts: false,
             partitioned_epoch_rewards_config: PartitionedEpochRewardsConfig::default(),
             epoch_accounts_hash_manager: EpochAccountsHashManager::new_invalid(),
+            ancient_packer_thread: Mutex::new(None),
         }
     }
 
@@ -4735,6 +4738,109 @@ impl AccountsDb {
 
         let mut uncleaned_pubkeys = self.uncleaned_pubkeys.entry(slot).or_default();
         uncleaned_pubkeys.extend(pubkeys);
+    }
+
+    pub fn shrink_candidate_slots_arc(self: Arc<Self>, epoch_schedule: &EpochSchedule) -> usize {
+        let oldest_non_ancient_slot = self.get_oldest_non_ancient_slot(epoch_schedule);
+        if !self.shrink_candidate_slots.lock().unwrap().is_empty() {
+            let mut ancient_packer_thread = self.ancient_packer_thread.lock().unwrap();
+
+            // check if the previous run of the packer is done
+            let should_join = ancient_packer_thread
+                .as_ref()
+                .map(|thread| thread.is_finished())
+                .unwrap_or(false);
+            if should_join {
+                ancient_packer_thread.take().unwrap().join().unwrap();
+            }
+
+            // if the packer is not running, start it
+            if ancient_packer_thread.is_none() {
+                let self2 = self.clone();
+                *ancient_packer_thread = Some(
+                    thread::Builder::new()
+                        .name("solAncientPacker".to_string())
+                        .spawn(move || {
+                            info!("bprumo DEBUG: ancient append vec packer STARTED (oldest non ancient slot: {oldest_non_ancient_slot})");
+                            // this can affect 'shrink_candidate_slots', so don't 'take' it until after this completes
+                            self2.shrink_ancient_slots(oldest_non_ancient_slot);
+                            info!("bprumo DEBUG: ancient append vec packer STOPPED (oldest non ancient slot: {oldest_non_ancient_slot})");
+                        })
+                        .expect("spawn ancient packer thread"),
+                );
+            }
+        }
+
+        let shrink_candidates_slots =
+            std::mem::take(&mut *self.shrink_candidate_slots.lock().unwrap());
+
+        let (shrink_slots, shrink_slots_next_batch) = {
+            if let AccountShrinkThreshold::TotalSpace { shrink_ratio } = self.shrink_ratio {
+                let (shrink_slots, shrink_slots_next_batch) = self
+                    .select_candidates_by_total_usage(
+                        &shrink_candidates_slots,
+                        shrink_ratio,
+                        self.ancient_append_vec_offset
+                            .map(|_| oldest_non_ancient_slot),
+                    );
+                (shrink_slots, Some(shrink_slots_next_batch))
+            } else {
+                (
+                    // lookup storage for each slot
+                    shrink_candidates_slots
+                        .into_iter()
+                        .filter_map(|slot| {
+                            self.storage
+                                .get_slot_storage_entry(slot)
+                                .map(|storage| (slot, storage))
+                        })
+                        .collect(),
+                    None,
+                )
+            }
+        };
+
+        if shrink_slots.is_empty()
+            && shrink_slots_next_batch
+                .as_ref()
+                .map(|s| s.is_empty())
+                .unwrap_or(true)
+        {
+            return 0;
+        }
+
+        let _guard = self.active_stats.activate(ActiveStatItem::Shrink);
+
+        let mut measure_shrink_all_candidates = Measure::start("shrink_all_candidate_slots-ms");
+        let num_candidates = shrink_slots.len();
+        let shrink_candidates_count = shrink_slots.len();
+        self.thread_pool_clean.install(|| {
+            shrink_slots
+                .into_par_iter()
+                .for_each(|(slot, slot_shrink_candidate)| {
+                    let mut measure = Measure::start("shrink_candidate_slots-ms");
+                    self.do_shrink_slot_store(slot, &slot_shrink_candidate);
+                    measure.stop();
+                    inc_new_counter_info!("shrink_candidate_slots-ms", measure.as_ms() as usize);
+                });
+        });
+        measure_shrink_all_candidates.stop();
+        inc_new_counter_info!(
+            "shrink_all_candidate_slots-ms",
+            measure_shrink_all_candidates.as_ms() as usize
+        );
+        inc_new_counter_info!("shrink_all_candidate_slots-count", shrink_candidates_count);
+        let mut pended_counts: usize = 0;
+        if let Some(shrink_slots_next_batch) = shrink_slots_next_batch {
+            let mut shrink_slots = self.shrink_candidate_slots.lock().unwrap();
+            pended_counts += shrink_slots_next_batch.len();
+            for slot in shrink_slots_next_batch {
+                shrink_slots.insert(slot);
+            }
+        }
+        inc_new_counter_info!("shrink_pended_stores-count", pended_counts);
+
+        num_candidates
     }
 
     pub fn shrink_candidate_slots(&self, epoch_schedule: &EpochSchedule) -> usize {
