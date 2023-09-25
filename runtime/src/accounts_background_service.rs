@@ -327,7 +327,7 @@ impl SnapshotRequestHandler {
             .ancient_packer_thread
             .lock()
             .unwrap()
-            .is_none()
+            .is_some()
         {
             info!("bprumo DEBUG: skipping snapshot request; ancient append vec packer is running");
             return Ok(snapshot_root_bank.block_height());
