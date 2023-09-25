@@ -305,7 +305,7 @@ impl SnapshotRequestHandler {
         accounts_package_kind: AccountsPackageKind,
         exit: &AtomicBool,
     ) -> Result<u64, SnapshotError> {
-        debug!(
+        info!(
             "handling snapshot request: {:?}, {:?}",
             snapshot_request, accounts_package_kind
         );
@@ -319,6 +319,20 @@ impl SnapshotRequestHandler {
 
         // we should not rely on the state of this validator until startup verification is complete
         assert!(snapshot_root_bank.is_startup_verification_complete());
+
+        if snapshot_root_bank
+            .rc
+            .accounts
+            .accounts_db
+            .ancient_packer_thread
+            .lock()
+            .unwrap()
+            .is_none()
+        {
+            info!("bprumo DEBUG: skipping snapshot request; ancient append vec packer is running");
+            return Ok(snapshot_root_bank.block_height());
+        }
+        info!("bprumo DEBUG: taking snapshot...");
 
         if accounts_package_kind == AccountsPackageKind::Snapshot(SnapshotKind::FullSnapshot) {
             *last_full_snapshot_slot = Some(snapshot_root_bank.slot());
@@ -659,7 +673,7 @@ impl AccountsBackgroundService {
                     // snapshot requests.  This is because startup verification and snapshot
                     // request handling can both kick off accounts hash calculations in background
                     // threads, and these must not happen concurrently.
-                    let snapshot_handle_result = (bank.is_startup_verification_complete() && bank.rc.accounts.accounts_db.ancient_packer_thread.lock().unwrap().is_none())
+                    let snapshot_handle_result = bank.is_startup_verification_complete()
                         .then(|| {
                             request_handlers.handle_snapshot_requests(
                                 test_hash_calculation,
