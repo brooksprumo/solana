@@ -7877,7 +7877,7 @@ impl CollectRentInPartitionInfo {
 }
 
 /// Struct to collect stats when scanning all accounts in `get_total_accounts_stats()`
-#[derive(Debug, Default, Copy, Clone, Serialize)]
+#[derive(Debug, Default, Clone, Serialize)]
 pub struct TotalAccountsStats {
     /// Total number of accounts
     pub num_accounts: usize,
@@ -7897,6 +7897,8 @@ pub struct TotalAccountsStats {
     pub num_rent_paying_accounts_without_data: usize,
     /// Total amount of lamports in rent paying accounts
     pub lamports_in_rent_paying_accounts: u64,
+
+    pub rent_epochs: HashMap<Epoch, /*count*/ usize>,
 }
 
 impl TotalAccountsStats {
@@ -7926,6 +7928,8 @@ impl TotalAccountsStats {
                 self.num_rent_paying_accounts_without_data += 1;
             }
         }
+
+        *self.rent_epochs.entry(account.rent_epoch()).or_default() += 1;
     }
 }
 
