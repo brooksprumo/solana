@@ -9162,13 +9162,13 @@ impl AccountsDb {
             timings.accounts_data_len_dedup_time_us = accounts_data_len_dedup_timer.as_us();
 
             if pass == 0 {
-                let uncleaned_roots = uncleaned_roots.into_inner().unwrap();
+                //let uncleaned_roots = uncleaned_roots.into_inner().unwrap();
                 // Need to add these last, otherwise older updates will be cleaned
                 for root in &slots {
                     self.accounts_index.add_root(*root);
                 }
-                self.accounts_index
-                    .add_uncleaned_roots(uncleaned_roots.into_iter());
+                //self.accounts_index
+                //    .add_uncleaned_roots(uncleaned_roots.into_iter());
 
                 self.set_storage_count_and_alive_bytes(storage_info, &mut timings);
             }
