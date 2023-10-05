@@ -7968,7 +7968,25 @@ impl Bank {
         self.rc
             .accounts
             .accounts_db
+            .clone()
             .shrink_candidate_slots(self.epoch_schedule())
+    }
+
+    pub fn shrink_candidate_slots_arc(
+        &self,
+        exit: Arc<AtomicBool>,
+        pruned_banks_receiver: &crossbeam_channel::Receiver<(Slot, BankId)>,
+    ) -> usize {
+        self.rc
+            .accounts
+            .accounts_db
+            .clone()
+            .shrink_candidate_slots_arc(
+                self.epoch_schedule(),
+                exit,
+                pruned_banks_receiver,
+                self.slot(),
+            )
     }
 
     pub fn no_overflow_rent_distribution_enabled(&self) -> bool {

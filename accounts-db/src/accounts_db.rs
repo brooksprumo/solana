@@ -106,7 +106,7 @@ use {
             atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
             Arc, Condvar, Mutex, RwLock,
         },
-        thread::{sleep, Builder},
+        thread::{self, sleep, Builder},
         time::{Duration, Instant},
     },
     tempfile::TempDir,
@@ -4552,6 +4552,86 @@ impl AccountsDb {
         }
     }
 
+    fn shrink_ancient_slots_arc(
+        self: Arc<Self>,
+        oldest_non_ancient_slot: Slot,
+        exit: Arc<AtomicBool>,
+        pruned_banks_receiver: &Receiver<(Slot, BankId)>,
+        flush_root: Slot,
+    ) {
+        if self.ancient_append_vec_offset.is_none() {
+            return;
+        }
+
+        assert_eq!(self.create_ancient_storage, CreateAncientStorage::Pack);
+
+        info!("bprumo DEBUG: shrinking ancient slots...");
+        let start = Instant::now();
+        let local_exit = Arc::new(AtomicBool::new(false));
+        rayon::join(
+            || {
+                let can_randomly_shrink = true;
+                let sorted_slots = self.get_sorted_potential_ancient_slots(oldest_non_ancient_slot);
+                self.combine_ancient_slots_packed(sorted_slots, can_randomly_shrink);
+                local_exit.store(true, Ordering::Relaxed);
+            },
+            || loop {
+                info!("bprumo DEBUG: flush accounts cache while shrinking ancient slots, flush root: {flush_root}, duration: {:?}", start.elapsed());
+                if local_exit.load(Ordering::Relaxed) || exit.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                self.do_handle_pruned_banks_request(pruned_banks_receiver);
+                self.flush_accounts_cache(false, Some(flush_root));
+
+                std::thread::sleep(Duration::from_secs(1));
+            },
+        );
+        info!(
+            "bprumo DEBUG: shrinking ancient slots... Done, and took {:?}",
+            start.elapsed()
+        );
+    }
+
+    pub fn do_handle_pruned_banks_request(
+        &self,
+        pruned_banks_receiver: &Receiver<(Slot, BankId)>,
+    ) -> usize {
+        let mut banks_to_purge: Vec<_> = pruned_banks_receiver.try_iter().collect();
+        // We need a stable sort to ensure we purge banks—with the same slot—in the same order
+        // they were sent into the channel.
+        banks_to_purge.sort_by_key(|(slot, _id)| *slot);
+        let num_banks_to_purge = banks_to_purge.len();
+
+        // Group the banks into slices with the same slot
+        let grouped_banks_to_purge: Vec<_> =
+            GroupBy::new(banks_to_purge.as_slice(), |a, b| a.0 == b.0).collect();
+
+        // Log whenever we need to handle banks with the same slot.  Purposely do this *before* we
+        // call `purge_slot()` to ensure we get the datapoint (in case there's an assert/panic).
+        let num_banks_with_same_slot =
+            num_banks_to_purge.saturating_sub(grouped_banks_to_purge.len());
+        if num_banks_with_same_slot > 0 {
+            datapoint_info!(
+                "pruned_banks_request_handler",
+                ("num_pruned_banks", num_banks_to_purge, i64),
+                ("num_banks_with_same_slot", num_banks_with_same_slot, i64),
+            );
+        }
+
+        // Purge all the slots in parallel
+        // Banks for the same slot are purged sequentially
+        self.thread_pool_clean.install(|| {
+            grouped_banks_to_purge.into_par_iter().for_each(|group| {
+                group.iter().for_each(|(slot, bank_id)| {
+                    self.purge_slot(*slot, *bank_id, true);
+                })
+            });
+        });
+
+        num_banks_to_purge
+    }
+
     /// 'accounts' that exist in the current slot we are combining into a different ancient slot
     /// 'existing_ancient_pubkeys': pubkeys that exist currently in the ancient append vec slot
     /// returns the pubkeys that are in 'accounts' that are already in 'existing_ancient_pubkeys'
@@ -4883,6 +4963,96 @@ impl AccountsDb {
 
         let mut uncleaned_pubkeys = self.uncleaned_pubkeys.entry(slot).or_default();
         uncleaned_pubkeys.extend(pubkeys);
+    }
+
+    pub fn shrink_candidate_slots_arc(
+        self: Arc<Self>,
+        epoch_schedule: &EpochSchedule,
+        exit: Arc<AtomicBool>,
+        pruned_banks_receiver: &Receiver<(Slot, BankId)>,
+        flush_root: Slot,
+    ) -> usize {
+        let oldest_non_ancient_slot = self.get_oldest_non_ancient_slot(epoch_schedule);
+        if !self.shrink_candidate_slots.lock().unwrap().is_empty() {
+            // this can affect 'shrink_candidate_slots', so don't 'take' it until after this completes
+            self.clone().shrink_ancient_slots_arc(
+                oldest_non_ancient_slot,
+                exit,
+                pruned_banks_receiver,
+                flush_root,
+            );
+        }
+
+        let shrink_candidates_slots =
+            std::mem::take(&mut *self.shrink_candidate_slots.lock().unwrap());
+
+        let (shrink_slots, shrink_slots_next_batch) = {
+            if let AccountShrinkThreshold::TotalSpace { shrink_ratio } = self.shrink_ratio {
+                let (shrink_slots, shrink_slots_next_batch) = self
+                    .select_candidates_by_total_usage(
+                        &shrink_candidates_slots,
+                        shrink_ratio,
+                        self.ancient_append_vec_offset
+                            .map(|_| oldest_non_ancient_slot),
+                    );
+                (shrink_slots, Some(shrink_slots_next_batch))
+            } else {
+                (
+                    // lookup storage for each slot
+                    shrink_candidates_slots
+                        .into_iter()
+                        .filter_map(|slot| {
+                            self.storage
+                                .get_slot_storage_entry(slot)
+                                .map(|storage| (slot, storage))
+                        })
+                        .collect(),
+                    None,
+                )
+            }
+        };
+
+        if shrink_slots.is_empty()
+            && shrink_slots_next_batch
+                .as_ref()
+                .map(|s| s.is_empty())
+                .unwrap_or(true)
+        {
+            return 0;
+        }
+
+        let _guard = self.active_stats.activate(ActiveStatItem::Shrink);
+
+        let mut measure_shrink_all_candidates = Measure::start("shrink_all_candidate_slots-ms");
+        let num_candidates = shrink_slots.len();
+        let shrink_candidates_count = shrink_slots.len();
+        self.thread_pool_clean.install(|| {
+            shrink_slots
+                .into_par_iter()
+                .for_each(|(slot, slot_shrink_candidate)| {
+                    let mut measure = Measure::start("shrink_candidate_slots-ms");
+                    self.do_shrink_slot_store(slot, &slot_shrink_candidate);
+                    measure.stop();
+                    inc_new_counter_info!("shrink_candidate_slots-ms", measure.as_ms() as usize);
+                });
+        });
+        measure_shrink_all_candidates.stop();
+        inc_new_counter_info!(
+            "shrink_all_candidate_slots-ms",
+            measure_shrink_all_candidates.as_ms() as usize
+        );
+        inc_new_counter_info!("shrink_all_candidate_slots-count", shrink_candidates_count);
+        let mut pended_counts: usize = 0;
+        if let Some(shrink_slots_next_batch) = shrink_slots_next_batch {
+            let mut shrink_slots = self.shrink_candidate_slots.lock().unwrap();
+            pended_counts += shrink_slots_next_batch.len();
+            for slot in shrink_slots_next_batch {
+                shrink_slots.insert(slot);
+            }
+        }
+        inc_new_counter_info!("shrink_pended_stores-count", pended_counts);
+
+        num_candidates
     }
 
     pub fn shrink_candidate_slots(&self, epoch_schedule: &EpochSchedule) -> usize {
@@ -10154,6 +10324,56 @@ pub mod test_utils {
             let amount = thread_rng().gen_range(0..10);
             let account = AccountSharedData::new(amount, 0, AccountSharedData::default().owner());
             accounts.store_slow_uncached(slot, pubkey, &account);
+        }
+    }
+}
+
+/// An iterator over a slice producing non-overlapping runs
+/// of elements using a predicate to separate them.
+///
+/// This can be used to extract sorted subslices.
+///
+/// (`Vec::group_by()`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.group_by)
+/// is currently a nightly-only experimental API.  Once the API is stablized, use it instead.
+///
+/// tracking issue: https://github.com/rust-lang/rust/issues/80552
+/// rust-lang PR: https://github.com/rust-lang/rust/pull/79895/
+/// implementation permalink: https://github.com/Kerollmops/rust/blob/8b53be660444d736bb6a6e1c6ba42c8180c968e7/library/core/src/slice/iter.rs#L2972-L3023
+struct GroupBy<'a, T: 'a, P> {
+    slice: &'a [T],
+    predicate: P,
+}
+impl<'a, T: 'a, P> GroupBy<'a, T, P>
+where
+    P: FnMut(&T, &T) -> bool,
+{
+    fn new(slice: &'a [T], predicate: P) -> Self {
+        GroupBy { slice, predicate }
+    }
+}
+impl<'a, T: 'a, P> Iterator for GroupBy<'a, T, P>
+where
+    P: FnMut(&T, &T) -> bool,
+{
+    type Item = &'a [T];
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.slice.is_empty() {
+            None
+        } else {
+            let mut len = 1;
+            let mut iter = self.slice.windows(2);
+            while let Some([l, r]) = iter.next() {
+                if (self.predicate)(l, r) {
+                    len += 1
+                } else {
+                    break;
+                }
+            }
+            let (head, tail) = self.slice.split_at(len);
+            self.slice = tail;
+            Some(head)
         }
     }
 }
