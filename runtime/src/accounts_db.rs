@@ -3235,11 +3235,16 @@ impl AccountsDb {
                                 if !useless {
                                     useful += 1;
                                 }
-                                if useless {
-                                    AccountsIndexScanResult::OnlyKeepInMemoryIfDirty
-                                } else {
-                                    AccountsIndexScanResult::KeepInMemory
-                                }
+                                // bprumo NOTE: only keep in memory if dirty, no matter what
+                                // bprumo TODO: maybe this can be gated if the initial verification has completed? Is that sufficient?
+                                /*
+                                 * if useless {
+                                 *     AccountsIndexScanResult::OnlyKeepInMemoryIfDirty
+                                 * } else {
+                                 *     AccountsIndexScanResult::KeepInMemory
+                                 * }
+                                 */
+                                AccountsIndexScanResult::OnlyKeepInMemoryIfDirty
                             },
                             None,
                             false,
