@@ -141,6 +141,9 @@ const MAX_ITEMS_PER_CHUNK: Slot = 2_500;
 // This allows us to split up accounts index accesses across multiple threads.
 const SHRINK_COLLECT_CHUNK_SIZE: usize = 50;
 
+static mut PREVIOUS_PACK: Option<Instant> = None;
+const PACK_INTERVAL: Duration = Duration::from_secs(10);
+
 /// temporary enum during feature activation of
 /// ignore slot when calculating an account hash #28420
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -4420,6 +4423,12 @@ impl AccountsDb {
             return;
         }
 
+        if let Some(previous_pack) = unsafe { PREVIOUS_PACK } {
+            if Instant::now().duration_since(previous_pack) < PACK_INTERVAL {
+                return;
+            }
+        }
+
         assert_eq!(self.create_ancient_storage, CreateAncientStorage::Pack);
 
         info!("bprumo DEBUG: shrinking ancient slots...");
@@ -4448,6 +4457,10 @@ impl AccountsDb {
             "bprumo DEBUG: shrinking ancient slots... Done, and took {:?}",
             start.elapsed()
         );
+
+        unsafe {
+            PREVIOUS_PACK = Some(Instant::now());
+        }
     }
 
     pub fn do_handle_pruned_banks_request(
