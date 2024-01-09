@@ -44,8 +44,10 @@ impl ProgramTiming {
 pub enum ExecuteTimingType {
     CheckUs,
     LoadUs,
+    LoadBytes,
     ExecuteUs,
     StoreUs,
+    StoreBytes,
     UpdateStakesCacheUs,
     NumExecuteBatches,
     CollectLogsUs,
@@ -102,6 +104,13 @@ eager_macro_rules! { $eager_1
                 i64
             ),
             (
+                "load_bytes",
+                *$self
+                    .metrics
+                    .index(ExecuteTimingType::LoadBytes),
+                i64
+            ),
+            (
                 "execute_us",
                 *$self
                     .metrics
@@ -121,6 +130,14 @@ eager_macro_rules! { $eager_1
 
                     .metrics
                     .index(ExecuteTimingType::StoreUs),
+                i64
+            ),
+            (
+                "store_bytes",
+                *$self
+
+                    .metrics
+                    .index(ExecuteTimingType::StoreBytes),
                 i64
             ),
             (
