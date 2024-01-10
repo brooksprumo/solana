@@ -3672,6 +3672,15 @@ impl Bank {
             self.freeze_started.store(true, Relaxed);
             *hash = self.hash_internal_state();
             self.rc.accounts.accounts_db.mark_slot_frozen(self.slot());
+
+            info!(
+                "bprumo DEBUG: Bank::freeze(), slot: {}, accounts data size: {}, delta on-chain: {}, delta off-chain: {}, initial: {}",
+                self.slot,
+                self.load_accounts_data_size(),
+                self.load_accounts_data_size_delta_on_chain(),
+                self.load_accounts_data_size_delta_off_chain(),
+                self.accounts_data_size_initial,
+            );
         }
     }
 
