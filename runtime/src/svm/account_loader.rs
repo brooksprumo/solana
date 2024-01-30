@@ -39,10 +39,12 @@ use {
 };
 
 /// Supplemental information gathered during load_accounts()
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct LoadedAccountsInfo {
+    /// The number of accounts loaded
+    pub count: u64,
     /// The sum of accounts data loaded, in bytes
-    pub loaded_bytes: u64,
+    pub data_bytes: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -61,7 +63,7 @@ pub(crate) fn load_accounts(
     loaded_programs: &LoadedProgramsForTxBatch,
     should_collect_rent: bool,
 ) -> (Vec<TransactionLoadResult>, LoadedAccountsInfo) {
-    let mut loaded_bytes = 0;
+    let mut loaded_accounts_info = LoadedAccountsInfo::default();
     let loaded_transaction_results = txs
         .iter()
         .zip(lock_results)
@@ -102,7 +104,6 @@ pub(crate) fn load_accounts(
                         Ok(loaded_transaction) => loaded_transaction,
                         Err(e) => return (Err(e), None),
                     };
-                loaded_bytes += loaded_transaction_accounts_info.loaded_bytes;
 
                 // Update nonce with fee-subtracted accounts
                 let nonce = if let Some(nonce) = nonce {
@@ -119,23 +120,22 @@ pub(crate) fn load_accounts(
                     None
                 };
 
+                loaded_accounts_info.count += loaded_transaction.accounts.len() as u64;
+                loaded_accounts_info.data_bytes += loaded_transaction_accounts_info.data_bytes;
                 (Ok(loaded_transaction), nonce)
             }
             (_, (Err(e), _nonce, _lamports_per_signature)) => (Err(e.clone()), None),
         })
         .collect();
 
-    (
-        loaded_transaction_results,
-        LoadedAccountsInfo { loaded_bytes },
-    )
+    (loaded_transaction_results, loaded_accounts_info)
 }
 
 /// Supplemental information gathered during load_transaction_accounts()
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct LoadedTransactionAccountsInfo {
     /// The sum of accounts data loaded, in bytes
-    pub loaded_bytes: u64,
+    pub data_bytes: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -176,7 +176,7 @@ fn load_transaction_accounts(
     let requested_loaded_accounts_data_size_limit =
         get_requested_loaded_accounts_data_size_limit(tx)?;
     let mut accumulated_accounts_data_size: usize = 0;
-    let mut loaded_bytes = 0;
+    let mut loaded_transaction_accounts_info = LoadedTransactionAccountsInfo::default();
 
     let instruction_accounts = message
         .instructions()
@@ -260,7 +260,7 @@ fn load_transaction_accounts(
                     requested_loaded_accounts_data_size_limit,
                     error_counters,
                 )?;
-                loaded_bytes += account_size as u64;
+                loaded_transaction_accounts_info.data_bytes += account_size as u64;
 
                 if !validated_fee_payer && message.is_non_loader_key(i) {
                     if i != 0 {
@@ -366,7 +366,8 @@ fn load_transaction_accounts(
                         requested_loaded_accounts_data_size_limit,
                         error_counters,
                     )?;
-                    loaded_bytes += owner_account.data().len() as u64;
+                    loaded_transaction_accounts_info.data_bytes +=
+                        owner_account.data().len() as u64;
                     accounts.push((*owner_id, owner_account));
                 } else {
                     error_counters.account_not_found += 1;
@@ -386,7 +387,7 @@ fn load_transaction_accounts(
             rent: tx_rent,
             rent_debits,
         },
-        LoadedTransactionAccountsInfo { loaded_bytes },
+        loaded_transaction_accounts_info,
     ))
 }
 

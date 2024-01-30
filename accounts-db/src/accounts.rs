@@ -647,7 +647,7 @@ impl Accounts {
     }
 
     /// Store the accounts into the DB
-    /// Return the number of bytes stored.
+    /// Return the number of bytes stored. // bprumo TODO: doc fix
     // allow(clippy) needed for various gating flags
     #[allow(clippy::too_many_arguments)]
     pub fn store_cached(
@@ -659,7 +659,7 @@ impl Accounts {
         rent_collector: &RentCollector,
         durable_nonce: &DurableNonce,
         lamports_per_signature: u64,
-    ) -> u64 {
+    ) -> StoredAccountsInfo {
         let (accounts_to_store, transactions) = self.collect_accounts_to_store(
             txs,
             res,
@@ -670,10 +670,13 @@ impl Accounts {
         );
         self.accounts_db
             .store_cached_inline_update_index((slot, &accounts_to_store[..]), Some(&transactions));
-        accounts_to_store
-            .iter()
-            .map(|(_, account)| account.data().len() as u64)
-            .sum()
+        StoredAccountsInfo {
+            count: accounts_to_store.len() as u64,
+            data_bytes: accounts_to_store
+                .iter()
+                .map(|(_, account)| account.data().len() as u64)
+                .sum(),
+        }
     }
 
     pub fn store_accounts_cached<'a, T: ReadableAccount + Sync + ZeroLamport + 'a>(
@@ -759,6 +762,15 @@ impl Accounts {
         }
         (accounts, transactions)
     }
+}
+
+// bprumo  TODO: doc
+#[derive(Debug, Default)]
+pub struct StoredAccountsInfo {
+    /// number of accounts
+    pub count: u64,
+    /// data bytes stored
+    pub data_bytes: u64,
 }
 
 fn prepare_if_nonce_account(
