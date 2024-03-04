@@ -115,7 +115,7 @@ use {
 };
 
 const PAGE_SIZE: u64 = 4 * 1024;
-pub(crate) const MAX_RECYCLE_STORES: usize = 1000;
+pub(crate) const MAX_RECYCLE_STORES: usize = 0;
 // when the accounts write cache exceeds this many bytes, we will flush it
 // this can be specified on the command line, too (--accounts-db-cache-limit-mb)
 const WRITE_CACHE_LIMIT_BYTES_DEFAULT: u64 = 15_000_000_000;
