@@ -103,6 +103,7 @@ impl AccountsFile {
         }
     }
 
+    // bprumo TODO: make false?
     pub fn is_recyclable(&self) -> bool {
         match self {
             Self::AppendVec(_) => true,

@@ -1006,8 +1006,10 @@ struct CleanKeyTimings {
 /// Persistent storage structure holding the accounts
 #[derive(Debug)]
 pub struct AccountStorageEntry {
+    // bprumo TODO: make non-atomic
     pub(crate) id: AtomicAppendVecId,
 
+    // bprumo TODO: make non-atomic
     pub(crate) slot: AtomicU64,
 
     /// storage holding the accounts
@@ -1084,7 +1086,9 @@ impl AccountStorageEntry {
         *count_and_status = (count, status);
     }
 
-    pub fn recycle(&self, slot: Slot, id: AppendVecId) {
+    // bprumo TODO: remove me?
+    // bprumo NOTE: called by Self::try_recycle_store()
+    fn recycle(&self, slot: Slot, id: AppendVecId) {
         let mut count_and_status = self.count_and_status.lock_write();
         self.accounts.reset();
         *count_and_status = (0, AccountStorageStatus::Available);
@@ -1377,6 +1381,7 @@ pub struct AccountsDb {
     sender_bg_hasher: Option<Sender<CachedAccount>>,
     read_only_accounts_cache: ReadOnlyAccountsCache,
 
+    // bprumo TODO: remove me
     recycle_stores: RwLock<RecycleStores>,
 
     /// distribute the accounts across storage lists
@@ -2425,6 +2430,7 @@ impl AccountsDb {
                 MAX_READ_ONLY_CACHE_DATA_SIZE,
                 READ_ONLY_CACHE_MS_TO_SKIP_LRU_UPDATE,
             ),
+            // bprumo TODO: remove me
             recycle_stores: RwLock::new(RecycleStores::default()),
             uncleaned_pubkeys: DashMap::new(),
             next_id: AtomicAppendVecId::new(0),
@@ -4148,6 +4154,7 @@ impl AccountsDb {
         dead_storages
     }
 
+    // bprumo NOTE: called by Self::remove_old_stores_shrink() and SnapshotMinimizer::minimize_accounts_db()
     pub fn drop_or_recycle_stores(
         &self,
         dead_storages: Vec<Arc<AccountStorageEntry>>,
@@ -4179,6 +4186,7 @@ impl AccountsDb {
 
     /// return a store that can contain 'aligned_total' bytes
     pub fn get_store_for_shrink(&self, slot: Slot, aligned_total: u64) -> ShrinkInProgress<'_> {
+        // bprumo TODO: just create store, don't try to get a recycle
         let shrunken_store = self
             .try_recycle_store(slot, aligned_total, aligned_total + 1024)
             .unwrap_or_else(|| {
@@ -5524,6 +5532,7 @@ impl AccountsDb {
         }
     }
 
+    // bprumo NOTE: called by Self::write_accounts_to_storage()
     fn try_recycle_and_insert_store(
         &self,
         slot: Slot,
@@ -5535,6 +5544,8 @@ impl AccountsDb {
         Some(store)
     }
 
+    // bprumo TODO: remove me? or test by returning None
+    // bprumo NOTE: called by Self::get_store_for_shrink(), Self::try_recycle_and_insert_store(), and Self::find_storage_candidate()
     fn try_recycle_store(
         &self,
         slot: Slot,
@@ -5730,6 +5741,7 @@ impl AccountsDb {
         self.purge_slots(std::iter::once(&slot));
     }
 
+    // bprumo TODO: remove me?
     fn recycle_slot_stores(
         &self,
         total_removed_storage_entries: usize,
