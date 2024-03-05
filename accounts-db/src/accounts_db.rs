@@ -115,6 +115,7 @@ use {
 };
 
 const PAGE_SIZE: u64 = 4 * 1024;
+// bprumo TODO: remove me
 pub(crate) const MAX_RECYCLE_STORES: usize = 0;
 // when the accounts write cache exceeds this many bytes, we will flush it
 // this can be specified on the command line, too (--accounts-db-cache-limit-mb)
@@ -1273,12 +1274,14 @@ impl StoreAccountsTiming {
     }
 }
 
+// bprumo TODO: remove me
 #[derive(Debug, Default)]
 struct RecycleStores {
     entries: Vec<(Instant, Arc<AccountStorageEntry>)>,
     total_bytes: u64,
 }
 
+// bprumo TODO: remove me
 // 30 min should be enough to be certain there won't be any prospective recycle uses for given
 // store entry
 // That's because it already processed ~2500 slots and ~25 passes of AccountsBackgroundService
@@ -1512,7 +1515,8 @@ pub struct AccountsStats {
     pub stakes_cache_check_and_store_us: AtomicU64,
     store_num_accounts: AtomicU64,
     store_total_data: AtomicU64,
-    recycle_store_count: AtomicU64,
+    // bprumo TODO: remove me
+    //recycle_store_count: AtomicU64,
     create_store_count: AtomicU64,
     store_get_slot_store: AtomicU64,
     store_find_existing: AtomicU64,
@@ -1535,7 +1539,8 @@ pub struct PurgeStats {
     total_removed_storage_entries: AtomicUsize,
     total_removed_cached_bytes: AtomicU64,
     total_removed_stored_bytes: AtomicU64,
-    recycle_stores_write_elapsed: AtomicU64,
+    // bprumo TODO: remove me
+    //recycle_stores_write_elapsed: AtomicU64,
     scan_storages_elapsed: AtomicU64,
     purge_accounts_index_elapsed: AtomicU64,
     handle_reclaims_elapsed: AtomicU64,
@@ -1597,11 +1602,13 @@ impl PurgeStats {
                     self.total_removed_stored_bytes.swap(0, Ordering::Relaxed) as i64,
                     i64
                 ),
-                (
-                    "recycle_stores_write_elapsed",
-                    self.recycle_stores_write_elapsed.swap(0, Ordering::Relaxed) as i64,
-                    i64
-                ),
+                /*
+                 * (
+                 *     "recycle_stores_write_elapsed",
+                 *     self.recycle_stores_write_elapsed.swap(0, Ordering::Relaxed) as i64,
+                 *     i64
+                 * ),
+                 */
                 (
                     "scan_storages_elapsed",
                     self.scan_storages_elapsed.swap(0, Ordering::Relaxed) as i64,
@@ -1978,7 +1985,8 @@ pub struct ShrinkStats {
     unpackable_slots_count: AtomicU64,
     newest_alive_packed_count: AtomicU64,
     drop_storage_entries_elapsed: AtomicU64,
-    recycle_stores_write_elapsed: AtomicU64,
+    // bprumo TODO: remove me
+    // recycle_stores_write_elapsed: AtomicU64,
     accounts_removed: AtomicUsize,
     bytes_removed: AtomicU64,
     bytes_written: AtomicU64,
@@ -2044,11 +2052,13 @@ impl ShrinkStats {
                     self.drop_storage_entries_elapsed.swap(0, Ordering::Relaxed) as i64,
                     i64
                 ),
-                (
-                    "recycle_stores_write_time",
-                    self.recycle_stores_write_elapsed.swap(0, Ordering::Relaxed) as i64,
-                    i64
-                ),
+                /*
+                 * (
+                 *     "recycle_stores_write_time",
+                 *     self.recycle_stores_write_elapsed.swap(0, Ordering::Relaxed) as i64,
+                 *     i64
+                 * ),
+                 */
                 (
                     "accounts_removed",
                     self.accounts_removed.swap(0, Ordering::Relaxed) as i64,
@@ -2175,13 +2185,15 @@ impl ShrinkAncientStats {
                     .swap(0, Ordering::Relaxed) as i64,
                 i64
             ),
-            (
-                "recycle_stores_write_time",
-                self.shrink_stats
-                    .recycle_stores_write_elapsed
-                    .swap(0, Ordering::Relaxed) as i64,
-                i64
-            ),
+            /*
+             * (
+             *     "recycle_stores_write_time",
+             *     self.shrink_stats
+             *         .recycle_stores_write_elapsed
+             *         .swap(0, Ordering::Relaxed) as i64,
+             *     i64
+             * ),
+             */
             (
                 "accounts_removed",
                 self.shrink_stats
@@ -4155,6 +4167,7 @@ impl AccountsDb {
         dead_storages
     }
 
+    // bprumo TODO: rename
     // bprumo NOTE: called by Self::remove_old_stores_shrink() and SnapshotMinimizer::minimize_accounts_db()
     pub fn drop_or_recycle_stores(
         &self,
@@ -5922,9 +5935,11 @@ impl AccountsDb {
         purge_stats
             .total_removed_stored_bytes
             .fetch_add(total_removed_stored_bytes, Ordering::Relaxed);
-        purge_stats
-            .recycle_stores_write_elapsed
-            .fetch_add(recycle_stores_write_elapsed, Ordering::Relaxed);
+        /*
+         * purge_stats
+         *     .recycle_stores_write_elapsed
+         *     .fetch_add(recycle_stores_write_elapsed, Ordering::Relaxed);
+         */
     }
 
     fn purge_slot_cache(&self, purged_slot: Slot, slot_cache: SlotCache) {
@@ -8626,11 +8641,13 @@ impl AccountsDb {
             //let recycle_stores = self.recycle_stores.read().unwrap();
             datapoint_info!(
                 "accounts_db_store_timings2",
-                (
-                    "recycle_store_count",
-                    self.stats.recycle_store_count.swap(0, Ordering::Relaxed),
-                    i64
-                ),
+                /*
+                 * (
+                 *     "recycle_store_count",
+                 *     self.stats.recycle_store_count.swap(0, Ordering::Relaxed),
+                 *     i64
+                 * ),
+                 */
                 /*
                  * (
                  *     "current_recycle_store_count",
@@ -13609,76 +13626,74 @@ pub mod tests {
     }
 
     // bprumo TODO: fix or remove
-    /*
-     *     #[test]
-     *     fn test_store_reuse() {
-     *         solana_logger::setup();
-     *         let accounts = AccountsDb {
-     *             file_size: 4096,
-     *             ..AccountsDb::new_single_for_tests()
-     *         };
-     *
-     *         let size = 100;
-     *         let num_accounts: usize = 100;
-     *         let mut keys = Vec::new();
-     *         for i in 0..num_accounts {
-     *             let account = AccountSharedData::new((i + 1) as u64, size, &Pubkey::default());
-     *             let pubkey = solana_sdk::pubkey::new_rand();
-     *             accounts.store_cached((0 as Slot, &[(&pubkey, &account)][..]), None);
-     *             keys.push(pubkey);
-     *         }
-     *         // get delta hash to feed these accounts to clean
-     *         accounts.calculate_accounts_delta_hash(0);
-     *         accounts.add_root(0);
-     *         // we have to flush just slot 0
-     *         // if we slot 0 and 1 together, then they are cleaned and slot 0 doesn't contain the accounts
-     *         // this test wants to clean and then allow us to shrink
-     *         accounts.flush_accounts_cache(true, None);
-     *
-     *         for (i, key) in keys[1..].iter().enumerate() {
-     *             let account =
-     *                 AccountSharedData::new((1 + i + num_accounts) as u64, size, &Pubkey::default());
-     *             accounts.store_cached((1 as Slot, &[(key, &account)][..]), None);
-     *         }
-     *         accounts.calculate_accounts_delta_hash(1);
-     *         accounts.add_root(1);
-     *         accounts.flush_accounts_cache(true, None);
-     *         accounts.clean_accounts_for_tests();
-     *         accounts.shrink_all_slots(false, None, &EpochSchedule::default());
-     *
-     *         // Clean again to flush the dirty stores
-     *         // and allow them to be recycled in the next step
-     *         accounts.clean_accounts_for_tests();
-     *         accounts.print_accounts_stats("post-shrink");
-     *         let num_stores = accounts.recycle_stores.read().unwrap().entry_count();
-     *         assert!(num_stores > 0);
-     *
-     *         let mut account_refs = Vec::new();
-     *         let num_to_store = 20;
-     *         for (i, key) in keys[..num_to_store].iter().enumerate() {
-     *             let account = AccountSharedData::new(
-     *                 (1 + i + 2 * num_accounts) as u64,
-     *                 i + 20,
-     *                 &Pubkey::default(),
-     *             );
-     *             accounts.store_uncached(2, &[(key, &account)]);
-     *             account_refs.push(account);
-     *         }
-     *         assert!(accounts.recycle_stores.read().unwrap().entry_count() < num_stores);
-     *
-     *         accounts.print_accounts_stats("post-store");
-     *
-     *         let mut ancestors = Ancestors::default();
-     *         ancestors.insert(1, 0);
-     *         ancestors.insert(2, 1);
-     *         for (key, account_ref) in keys[..num_to_store].iter().zip(account_refs) {
-     *             assert_eq!(
-     *                 accounts.load_without_fixed_root(&ancestors, key).unwrap().0,
-     *                 account_ref
-     *             );
-     *         }
-     *     }
-     */
+    #[test]
+    fn test_store_reuse() {
+        solana_logger::setup();
+        let accounts = AccountsDb {
+            file_size: 4096,
+            ..AccountsDb::new_single_for_tests()
+        };
+
+        let size = 100;
+        let num_accounts: usize = 100;
+        let mut keys = Vec::new();
+        for i in 0..num_accounts {
+            let account = AccountSharedData::new((i + 1) as u64, size, &Pubkey::default());
+            let pubkey = solana_sdk::pubkey::new_rand();
+            accounts.store_cached((0 as Slot, &[(&pubkey, &account)][..]), None);
+            keys.push(pubkey);
+        }
+        // get delta hash to feed these accounts to clean
+        accounts.calculate_accounts_delta_hash(0);
+        accounts.add_root(0);
+        // we have to flush just slot 0
+        // if we slot 0 and 1 together, then they are cleaned and slot 0 doesn't contain the accounts
+        // this test wants to clean and then allow us to shrink
+        accounts.flush_accounts_cache(true, None);
+
+        for (i, key) in keys[1..].iter().enumerate() {
+            let account =
+                AccountSharedData::new((1 + i + num_accounts) as u64, size, &Pubkey::default());
+            accounts.store_cached((1 as Slot, &[(key, &account)][..]), None);
+        }
+        accounts.calculate_accounts_delta_hash(1);
+        accounts.add_root(1);
+        accounts.flush_accounts_cache(true, None);
+        accounts.clean_accounts_for_tests();
+        accounts.shrink_all_slots(false, None, &EpochSchedule::default());
+
+        // Clean again to flush the dirty stores
+        // and allow them to be recycled in the next step
+        accounts.clean_accounts_for_tests();
+        accounts.print_accounts_stats("post-shrink");
+        let num_stores = accounts.recycle_stores.read().unwrap().entry_count();
+        assert!(num_stores > 0);
+
+        let mut account_refs = Vec::new();
+        let num_to_store = 20;
+        for (i, key) in keys[..num_to_store].iter().enumerate() {
+            let account = AccountSharedData::new(
+                (1 + i + 2 * num_accounts) as u64,
+                i + 20,
+                &Pubkey::default(),
+            );
+            accounts.store_uncached(2, &[(key, &account)]);
+            account_refs.push(account);
+        }
+        assert!(accounts.recycle_stores.read().unwrap().entry_count() < num_stores);
+
+        accounts.print_accounts_stats("post-store");
+
+        let mut ancestors = Ancestors::default();
+        ancestors.insert(1, 0);
+        ancestors.insert(2, 1);
+        for (key, account_ref) in keys[..num_to_store].iter().zip(account_refs) {
+            assert_eq!(
+                accounts.load_without_fixed_root(&ancestors, key).unwrap().0,
+                account_ref
+            );
+        }
+    }
 
     #[test]
     #[should_panic(expected = "We've run out of storage ids!")]
@@ -14933,6 +14948,7 @@ pub mod tests {
         assert!(!db.storage.is_empty_entry(1));
     }
 
+    // bprumo TODO: fix or remove
     #[test]
     fn test_recycle_stores_expiration() {
         solana_logger::setup();

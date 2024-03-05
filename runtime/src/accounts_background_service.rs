@@ -44,6 +44,7 @@ const CLEAN_INTERVAL_BLOCKS: u64 = 100;
 // this would drop MAX_RECYCLE_STORES mmaps at once in the worst case...
 // (Anyway, the dropping part is outside the AccountsDb::recycle_stores lock
 // and dropped in this AccountsBackgroundServe, so this shouldn't matter much)
+// bprumo TODO: remove me
 const RECYCLE_STORE_EXPIRATION_INTERVAL_SECS: u64 =
     solana_accounts_db::accounts_db::EXPIRATION_TTL_SECONDS / 3;
 
