@@ -1008,10 +1008,10 @@ struct CleanKeyTimings {
 #[derive(Debug)]
 pub struct AccountStorageEntry {
     // bprumo TODO: make non-atomic
-    pub(crate) id: AtomicAppendVecId,
+    pub(crate) id: AppendVecId,
 
     // bprumo TODO: make non-atomic
-    pub(crate) slot: AtomicU64,
+    pub(crate) slot: Slot,
 
     /// storage holding the accounts
     pub accounts: AccountsFile,
@@ -1041,8 +1041,8 @@ impl AccountStorageEntry {
         let accounts = AccountsFile::AppendVec(AppendVec::new(&path, true, file_size as usize));
 
         Self {
-            id: AtomicAppendVecId::new(id),
-            slot: AtomicU64::new(slot),
+            id,
+            slot,
             accounts,
             count_and_status: SeqLock::new((0, AccountStorageStatus::Available)),
             approx_store_count: AtomicUsize::new(0),
@@ -1057,8 +1057,8 @@ impl AccountStorageEntry {
         num_accounts: usize,
     ) -> Self {
         Self {
-            id: AtomicAppendVecId::new(id),
-            slot: AtomicU64::new(slot),
+            id,
+            slot,
             accounts,
             count_and_status: SeqLock::new((0, AccountStorageStatus::Available)),
             approx_store_count: AtomicUsize::new(num_accounts),
@@ -1130,11 +1130,11 @@ impl AccountStorageEntry {
     }
 
     pub fn slot(&self) -> Slot {
-        self.slot.load(Ordering::Acquire)
+        self.slot
     }
 
     pub fn append_vec_id(&self) -> AppendVecId {
-        self.id.load(Ordering::Acquire)
+        self.id
     }
 
     pub fn flush(&self) -> Result<(), AccountsFileError> {
