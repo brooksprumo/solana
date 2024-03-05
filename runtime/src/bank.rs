@@ -5869,9 +5869,12 @@ impl Bank {
     }
 
     // bprumo TODO: remove me?
-    pub fn expire_old_recycle_stores(&self) {
-        self.rc.accounts.accounts_db.expire_old_recycle_stores()
-    }
+    // bprumo NOTE: called by ABS::expire_old_recycle_stores()
+    /*
+     * pub fn expire_old_recycle_stores(&self) {
+     *     self.rc.accounts.accounts_db.expire_old_recycle_stores()
+     * }
+     */
 
     /// Technically this issues (or even burns!) new lamports,
     /// so be extra careful for its usage

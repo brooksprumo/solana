@@ -1088,15 +1088,17 @@ impl AccountStorageEntry {
 
     // bprumo TODO: remove me?
     // bprumo NOTE: called by Self::try_recycle_store()
-    fn recycle(&self, slot: Slot, id: AppendVecId) {
-        let mut count_and_status = self.count_and_status.lock_write();
-        self.accounts.reset();
-        *count_and_status = (0, AccountStorageStatus::Available);
-        self.slot.store(slot, Ordering::Release);
-        self.id.store(id, Ordering::Release);
-        self.approx_store_count.store(0, Ordering::Relaxed);
-        self.alive_bytes.store(0, Ordering::Release);
-    }
+    /*
+     * fn recycle(&self, slot: Slot, id: AppendVecId) {
+     *     let mut count_and_status = self.count_and_status.lock_write();
+     *     self.accounts.reset();
+     *     *count_and_status = (0, AccountStorageStatus::Available);
+     *     self.slot.store(slot, Ordering::Release);
+     *     self.id.store(id, Ordering::Release);
+     *     self.approx_store_count.store(0, Ordering::Relaxed);
+     *     self.alive_bytes.store(0, Ordering::Release);
+     * }
+     */
 
     pub fn status(&self) -> AccountStorageStatus {
         self.count_and_status.read().1
@@ -1382,8 +1384,7 @@ pub struct AccountsDb {
     read_only_accounts_cache: ReadOnlyAccountsCache,
 
     // bprumo TODO: remove me
-    recycle_stores: RwLock<RecycleStores>,
-
+    //recycle_stores: RwLock<RecycleStores>,
     /// distribute the accounts across storage lists
     pub next_id: AtomicAppendVecId,
 
@@ -2431,7 +2432,7 @@ impl AccountsDb {
                 READ_ONLY_CACHE_MS_TO_SKIP_LRU_UPDATE,
             ),
             // bprumo TODO: remove me
-            recycle_stores: RwLock::new(RecycleStores::default()),
+            //recycle_stores: RwLock::new(RecycleStores::default()),
             uncleaned_pubkeys: DashMap::new(),
             next_id: AtomicAppendVecId::new(0),
             shrink_candidate_slots: Mutex::new(ShrinkCandidates::default()),
@@ -4158,40 +4159,58 @@ impl AccountsDb {
     pub fn drop_or_recycle_stores(
         &self,
         dead_storages: Vec<Arc<AccountStorageEntry>>,
-        stats: &ShrinkStats,
+        shrink_stats: &ShrinkStats,
     ) {
-        let mut recycle_stores_write_elapsed = Measure::start("recycle_stores_write_time");
-        let mut recycle_stores = self.recycle_stores.write().unwrap();
-        recycle_stores_write_elapsed.stop();
+        self.stats
+            .dropped_stores
+            .fetch_add(dead_storages.len() as u64, Ordering::Relaxed);
 
-        let mut drop_storage_entries_elapsed = Measure::start("drop_storage_entries_elapsed");
-        if recycle_stores.entry_count() < MAX_RECYCLE_STORES {
-            recycle_stores.add_entries(dead_storages);
-            drop(recycle_stores);
-        } else {
-            self.stats
-                .dropped_stores
-                .fetch_add(dead_storages.len() as u64, Ordering::Relaxed);
-            drop(recycle_stores);
-            drop(dead_storages);
-        }
-        drop_storage_entries_elapsed.stop();
-        stats
+        let (_, drop_storage_entries_elapsed) = measure_us!(drop(dead_storages));
+
+        shrink_stats
             .drop_storage_entries_elapsed
-            .fetch_add(drop_storage_entries_elapsed.as_us(), Ordering::Relaxed);
-        stats
-            .recycle_stores_write_elapsed
-            .fetch_add(recycle_stores_write_elapsed.as_us(), Ordering::Relaxed);
+            .fetch_add(drop_storage_entries_elapsed, Ordering::Relaxed);
+
+        // bprumo TODO: remove old below
+
+        /*
+         *         let mut recycle_stores_write_elapsed = Measure::start("recycle_stores_write_time");
+         *         let mut recycle_stores = self.recycle_stores.write().unwrap();
+         *         recycle_stores_write_elapsed.stop();
+         *
+         *         let mut drop_storage_entries_elapsed = Measure::start("drop_storage_entries_elapsed");
+         *         if recycle_stores.entry_count() < MAX_RECYCLE_STORES {
+         *             recycle_stores.add_entries(dead_storages);
+         *             drop(recycle_stores);
+         *         } else {
+         *             self.stats
+         *                 .dropped_stores
+         *                 .fetch_add(dead_storages.len() as u64, Ordering::Relaxed);
+         *             drop(recycle_stores);
+         *             drop(dead_storages);
+         *         }
+         *         drop_storage_entries_elapsed.stop();
+         *         stats
+         *             .drop_storage_entries_elapsed
+         *             .fetch_add(drop_storage_entries_elapsed.as_us(), Ordering::Relaxed);
+         *         stats
+         *             .recycle_stores_write_elapsed
+         *             .fetch_add(recycle_stores_write_elapsed.as_us(), Ordering::Relaxed);
+         */
     }
 
     /// return a store that can contain 'aligned_total' bytes
     pub fn get_store_for_shrink(&self, slot: Slot, aligned_total: u64) -> ShrinkInProgress<'_> {
-        // bprumo TODO: just create store, don't try to get a recycle
-        let shrunken_store = self
-            .try_recycle_store(slot, aligned_total, aligned_total + 1024)
-            .unwrap_or_else(|| {
-                self.create_store(slot, aligned_total, "shrink", self.shrink_paths.as_slice())
-            });
+        /*
+         * let shrunken_store = self
+         *     .try_recycle_store(slot, aligned_total, aligned_total + 1024)
+         *     .unwrap_or_else(|| {
+         *         self.create_store(slot, aligned_total, "shrink", self.shrink_paths.as_slice())
+         *     });
+         */
+        // bprumo TODO: remove old above
+        let shrunken_store =
+            self.create_store(slot, aligned_total, "shrink", self.shrink_paths.as_slice());
         self.storage.shrinking_in_progress(slot, shrunken_store)
     }
 
@@ -5532,72 +5551,77 @@ impl AccountsDb {
         }
     }
 
+    // bprumo TODO: remove me
     // bprumo NOTE: called by Self::write_accounts_to_storage()
-    fn try_recycle_and_insert_store(
-        &self,
-        slot: Slot,
-        min_size: u64,
-        max_size: u64,
-    ) -> Option<Arc<AccountStorageEntry>> {
-        let store = self.try_recycle_store(slot, min_size, max_size)?;
-        self.insert_store(slot, store.clone());
-        Some(store)
-    }
+    /*
+     * fn try_recycle_and_insert_store(
+     *     &self,
+     *     slot: Slot,
+     *     min_size: u64,
+     *     max_size: u64,
+     * ) -> Option<Arc<AccountStorageEntry>> {
+     *     let store = self.try_recycle_store(slot, min_size, max_size)?;
+     *     self.insert_store(slot, store.clone());
+     *     Some(store)
+     * }
+     */
 
-    // bprumo TODO: remove me? or test by returning None
+    // bprumo TODO: remove me
     // bprumo NOTE: called by Self::get_store_for_shrink(), Self::try_recycle_and_insert_store(), and Self::find_storage_candidate()
-    fn try_recycle_store(
-        &self,
-        slot: Slot,
-        min_size: u64,
-        max_size: u64,
-    ) -> Option<Arc<AccountStorageEntry>> {
-        let mut max = 0;
-        let mut min = std::u64::MAX;
-        let mut avail = 0;
-        let mut recycle_stores = self.recycle_stores.write().unwrap();
-        for (i, (_recycled_time, store)) in recycle_stores.iter().enumerate() {
-            if Arc::strong_count(store) == 1 {
-                max = std::cmp::max(store.accounts.capacity(), max);
-                min = std::cmp::min(store.accounts.capacity(), min);
-                avail += 1;
-
-                if store.accounts.is_recyclable()
-                    && store.accounts.capacity() >= min_size
-                    && store.accounts.capacity() < max_size
-                {
-                    let ret = recycle_stores.remove_entry(i);
-                    drop(recycle_stores);
-                    let old_id = ret.append_vec_id();
-                    ret.recycle(slot, self.next_id());
-                    // This info shows the appendvec change history.  It helps debugging
-                    // the appendvec data corrupution issues related to recycling.
-                    debug!(
-                        "recycling store: old slot {}, old_id: {}, new slot {}, new id{}, path {:?} ",
-                        slot,
-                        old_id,
-                        ret.slot(),
-                        ret.append_vec_id(),
-                        ret.get_path(),
-                    );
-                    self.stats
-                        .recycle_store_count
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Some(ret);
-                }
-            }
-        }
-        debug!(
-            "no recycle stores max: {} min: {} len: {} looking: {}, {} avail: {}",
-            max,
-            min,
-            recycle_stores.entry_count(),
-            min_size,
-            max_size,
-            avail,
-        );
-        None
-    }
+    /*
+     *     fn try_recycle_store(
+     *         &self,
+     *         slot: Slot,
+     *         min_size: u64,
+     *         max_size: u64,
+     *     ) -> Option<Arc<AccountStorageEntry>> {
+     *         let mut max = 0;
+     *         let mut min = std::u64::MAX;
+     *         let mut avail = 0;
+     *         let mut recycle_stores = self.recycle_stores.write().unwrap();
+     *         for (i, (_recycled_time, store)) in recycle_stores.iter().enumerate() {
+     *             if Arc::strong_count(store) == 1 {
+     *                 max = std::cmp::max(store.accounts.capacity(), max);
+     *                 min = std::cmp::min(store.accounts.capacity(), min);
+     *                 avail += 1;
+     *
+     *                 if store.accounts.is_recyclable()
+     *                     && store.accounts.capacity() >= min_size
+     *                     && store.accounts.capacity() < max_size
+     *                 {
+     *                     let ret = recycle_stores.remove_entry(i);
+     *                     drop(recycle_stores);
+     *                     let old_id = ret.append_vec_id();
+     *                     ret.recycle(slot, self.next_id());
+     *                     // This info shows the appendvec change history.  It helps debugging
+     *                     // the appendvec data corrupution issues related to recycling.
+     *                     debug!(
+     *                         "recycling store: old slot {}, old_id: {}, new slot {}, new id{}, path {:?} ",
+     *                         slot,
+     *                         old_id,
+     *                         ret.slot(),
+     *                         ret.append_vec_id(),
+     *                         ret.get_path(),
+     *                     );
+     *                     self.stats
+     *                         .recycle_store_count
+     *                         .fetch_add(1, Ordering::Relaxed);
+     *                     return Some(ret);
+     *                 }
+     *             }
+     *         }
+     *         debug!(
+     *             "no recycle stores max: {} min: {} len: {} looking: {}, {} avail: {}",
+     *             max,
+     *             min,
+     *             recycle_stores.entry_count(),
+     *             min_size,
+     *             max_size,
+     *             avail,
+     *         );
+     *         None
+     *     }
+     */
 
     fn find_storage_candidate(&self, slot: Slot, size: usize) -> Arc<AccountStorageEntry> {
         let mut get_slot_stores = Measure::start("get_slot_stores");
@@ -5623,11 +5647,15 @@ impl AccountsDb {
             .store_find_existing
             .fetch_add(find_existing.as_us(), Ordering::Relaxed);
 
-        let store = if let Some(store) = self.try_recycle_store(slot, size as u64, std::u64::MAX) {
-            store
-        } else {
-            self.create_store(slot, self.file_size, "store", &self.paths)
-        };
+        /*
+         * let store = if let Some(store) = self.try_recycle_store(slot, size as u64, std::u64::MAX) {
+         *     store
+         * } else {
+         *     self.create_store(slot, self.file_size, "store", &self.paths)
+         * };
+         */
+        // bprumo TODO: remove old above
+        let store = self.create_store(slot, self.file_size, "store", &self.paths);
 
         // try_available is like taking a lock on the store,
         // preventing other threads from using it.
@@ -5741,27 +5769,37 @@ impl AccountsDb {
         self.purge_slots(std::iter::once(&slot));
     }
 
-    // bprumo TODO: remove me?
+    // bprumo TODO: remove me? or minimally remove the return value
+    // bprumo NOTE: called by Self::purge_dead_slots_from_storage()
     fn recycle_slot_stores(
         &self,
         total_removed_storage_entries: usize,
         slot_stores: &[Arc<AccountStorageEntry>],
     ) -> u64 {
-        let mut recycle_stores_write_elapsed = Measure::start("recycle_stores_write_elapsed");
-        let mut recycle_stores = self.recycle_stores.write().unwrap();
-        recycle_stores_write_elapsed.stop();
+        self.stats
+            .dropped_stores
+            .fetch_add(total_removed_storage_entries as u64, Ordering::Relaxed);
+        0
 
-        for (recycled_count, store) in slot_stores.iter().enumerate() {
-            if recycle_stores.entry_count() > MAX_RECYCLE_STORES {
-                let dropped_count = total_removed_storage_entries - recycled_count;
-                self.stats
-                    .dropped_stores
-                    .fetch_add(dropped_count as u64, Ordering::Relaxed);
-                return recycle_stores_write_elapsed.as_us();
-            }
-            recycle_stores.add_entry(Arc::clone(store));
-        }
-        recycle_stores_write_elapsed.as_us()
+        // bprumo TODO: remove old below
+
+        /*
+         *         let mut recycle_stores_write_elapsed = Measure::start("recycle_stores_write_elapsed");
+         *         let mut recycle_stores = self.recycle_stores.write().unwrap();
+         *         recycle_stores_write_elapsed.stop();
+         *
+         *         for (recycled_count, store) in slot_stores.iter().enumerate() {
+         *             if recycle_stores.entry_count() > MAX_RECYCLE_STORES {
+         *                 let dropped_count = total_removed_storage_entries - recycled_count;
+         *                 self.stats
+         *                     .dropped_stores
+         *                     .fetch_add(dropped_count as u64, Ordering::Relaxed);
+         *                 return recycle_stores_write_elapsed.as_us();
+         *             }
+         *             recycle_stores.add_entry(Arc::clone(store));
+         *         }
+         *         recycle_stores_write_elapsed.as_us()
+         */
     }
 
     /// Purges every slot in `removed_slots` from both the cache and storage. This includes
@@ -6208,12 +6246,12 @@ impl AccountsDb {
                         accounts_and_meta_to_store.len()
                     );
                     let special_store_size = std::cmp::max(data_len * 2, self.file_size);
-                    if self
-                        .try_recycle_and_insert_store(slot, special_store_size, std::u64::MAX)
-                        .is_none()
-                    {
-                        self.create_and_insert_store(slot, special_store_size, "large create");
-                    }
+                    //if self
+                    //    .try_recycle_and_insert_store(slot, special_store_size, std::u64::MAX)
+                    //    .is_none()
+                    //{
+                    self.create_and_insert_store(slot, special_store_size, "large create");
+                    //}
                 }
                 continue;
             }
@@ -6249,24 +6287,28 @@ impl AccountsDb {
         self.accounts_cache.report_size();
     }
 
-    pub fn expire_old_recycle_stores(&self) {
-        let mut recycle_stores_write_elapsed = Measure::start("recycle_stores_write_time");
-        let recycle_stores = self.recycle_stores.write().unwrap().expire_old_entries();
-        recycle_stores_write_elapsed.stop();
-
-        let mut drop_storage_entries_elapsed = Measure::start("drop_storage_entries_elapsed");
-        drop(recycle_stores);
-        drop_storage_entries_elapsed.stop();
-
-        self.clean_accounts_stats
-            .purge_stats
-            .drop_storage_entries_elapsed
-            .fetch_add(drop_storage_entries_elapsed.as_us(), Ordering::Relaxed);
-        self.clean_accounts_stats
-            .purge_stats
-            .recycle_stores_write_elapsed
-            .fetch_add(recycle_stores_write_elapsed.as_us(), Ordering::Relaxed);
-    }
+    // bprumo TODO: remove me
+    // bprumo NOTE: called by Bank::expire_old_recycle_stores()
+    /*
+     *     pub fn expire_old_recycle_stores(&self) {
+     *         let mut recycle_stores_write_elapsed = Measure::start("recycle_stores_write_time");
+     *         let recycle_stores = self.recycle_stores.write().unwrap().expire_old_entries();
+     *         recycle_stores_write_elapsed.stop();
+     *
+     *         let mut drop_storage_entries_elapsed = Measure::start("drop_storage_entries_elapsed");
+     *         drop(recycle_stores);
+     *         drop_storage_entries_elapsed.stop();
+     *
+     *         self.clean_accounts_stats
+     *             .purge_stats
+     *             .drop_storage_entries_elapsed
+     *             .fetch_add(drop_storage_entries_elapsed.as_us(), Ordering::Relaxed);
+     *         self.clean_accounts_stats
+     *             .purge_stats
+     *             .recycle_stores_write_elapsed
+     *             .fetch_add(recycle_stores_write_elapsed.as_us(), Ordering::Relaxed);
+     *     }
+     */
 
     // These functions/fields are only usable from a dev context (i.e. tests and benches)
     #[cfg(feature = "dev-context-only-utils")]
@@ -6791,11 +6833,13 @@ impl AccountsDb {
         datapoint_info!(
             "accounts_db-stores",
             ("total_count", total_count, i64),
-            (
-                "recycle_count",
-                self.recycle_stores.read().unwrap().entry_count() as u64,
-                i64
-            ),
+            /*
+             * (
+             *     "recycle_count",
+             *     self.recycle_stores.read().unwrap().entry_count() as u64,
+             *     i64
+             * ),
+             */
             ("total_bytes", total_bytes, i64),
             ("total_alive_bytes", total_alive_bytes, i64),
             ("total_alive_ratio", total_alive_ratio, f64),
@@ -8579,7 +8623,7 @@ impl AccountsDb {
                 ),
             );
 
-            let recycle_stores = self.recycle_stores.read().unwrap();
+            //let recycle_stores = self.recycle_stores.read().unwrap();
             datapoint_info!(
                 "accounts_db_store_timings2",
                 (
@@ -8587,16 +8631,18 @@ impl AccountsDb {
                     self.stats.recycle_store_count.swap(0, Ordering::Relaxed),
                     i64
                 ),
-                (
-                    "current_recycle_store_count",
-                    recycle_stores.entry_count(),
-                    i64
-                ),
-                (
-                    "current_recycle_store_bytes",
-                    recycle_stores.total_bytes(),
-                    i64
-                ),
+                /*
+                 * (
+                 *     "current_recycle_store_count",
+                 *     recycle_stores.entry_count(),
+                 *     i64
+                 * ),
+                 * (
+                 *     "current_recycle_store_bytes",
+                 *     recycle_stores.total_bytes(),
+                 *     i64
+                 * ),
+                 */
                 (
                     "create_store_count",
                     self.stats.create_store_count.swap(0, Ordering::Relaxed),
@@ -9408,20 +9454,23 @@ impl AccountsDb {
     pub fn print_accounts_stats(&self, label: &str) {
         self.print_index(label);
         self.print_count_and_status(label);
-        info!("recycle_stores:");
-        let recycle_stores = self.recycle_stores.read().unwrap();
-        for (recycled_time, entry) in recycle_stores.iter() {
-            info!(
-                "  slot: {} id: {} count_and_status: {:?} approx_store_count: {} len: {} capacity: {} (recycled: {:?})",
-                entry.slot(),
-                entry.append_vec_id(),
-                entry.count_and_status.read(),
-                entry.approx_store_count.load(Ordering::Relaxed),
-                entry.accounts.len(),
-                entry.accounts.capacity(),
-                recycled_time,
-            );
-        }
+        // bprumo TODO: remove me
+        /*
+         * info!("recycle_stores:");
+         * let recycle_stores = self.recycle_stores.read().unwrap();
+         * for (recycled_time, entry) in recycle_stores.iter() {
+         *     info!(
+         *         "  slot: {} id: {} count_and_status: {:?} approx_store_count: {} len: {} capacity: {} (recycled: {:?})",
+         *         entry.slot(),
+         *         entry.append_vec_id(),
+         *         entry.count_and_status.read(),
+         *         entry.approx_store_count.load(Ordering::Relaxed),
+         *         entry.accounts.len(),
+         *         entry.accounts.capacity(),
+         *         recycled_time,
+         *     );
+         * }
+         */
     }
 
     fn print_index(&self, label: &str) {
@@ -13559,74 +13608,77 @@ pub mod tests {
         assert_eq!(accounts.accounts_index.ref_count_from_storage(&pubkey1), 0);
     }
 
-    #[test]
-    fn test_store_reuse() {
-        solana_logger::setup();
-        let accounts = AccountsDb {
-            file_size: 4096,
-            ..AccountsDb::new_single_for_tests()
-        };
-
-        let size = 100;
-        let num_accounts: usize = 100;
-        let mut keys = Vec::new();
-        for i in 0..num_accounts {
-            let account = AccountSharedData::new((i + 1) as u64, size, &Pubkey::default());
-            let pubkey = solana_sdk::pubkey::new_rand();
-            accounts.store_cached((0 as Slot, &[(&pubkey, &account)][..]), None);
-            keys.push(pubkey);
-        }
-        // get delta hash to feed these accounts to clean
-        accounts.calculate_accounts_delta_hash(0);
-        accounts.add_root(0);
-        // we have to flush just slot 0
-        // if we slot 0 and 1 together, then they are cleaned and slot 0 doesn't contain the accounts
-        // this test wants to clean and then allow us to shrink
-        accounts.flush_accounts_cache(true, None);
-
-        for (i, key) in keys[1..].iter().enumerate() {
-            let account =
-                AccountSharedData::new((1 + i + num_accounts) as u64, size, &Pubkey::default());
-            accounts.store_cached((1 as Slot, &[(key, &account)][..]), None);
-        }
-        accounts.calculate_accounts_delta_hash(1);
-        accounts.add_root(1);
-        accounts.flush_accounts_cache(true, None);
-        accounts.clean_accounts_for_tests();
-        accounts.shrink_all_slots(false, None, &EpochSchedule::default());
-
-        // Clean again to flush the dirty stores
-        // and allow them to be recycled in the next step
-        accounts.clean_accounts_for_tests();
-        accounts.print_accounts_stats("post-shrink");
-        let num_stores = accounts.recycle_stores.read().unwrap().entry_count();
-        assert!(num_stores > 0);
-
-        let mut account_refs = Vec::new();
-        let num_to_store = 20;
-        for (i, key) in keys[..num_to_store].iter().enumerate() {
-            let account = AccountSharedData::new(
-                (1 + i + 2 * num_accounts) as u64,
-                i + 20,
-                &Pubkey::default(),
-            );
-            accounts.store_uncached(2, &[(key, &account)]);
-            account_refs.push(account);
-        }
-        assert!(accounts.recycle_stores.read().unwrap().entry_count() < num_stores);
-
-        accounts.print_accounts_stats("post-store");
-
-        let mut ancestors = Ancestors::default();
-        ancestors.insert(1, 0);
-        ancestors.insert(2, 1);
-        for (key, account_ref) in keys[..num_to_store].iter().zip(account_refs) {
-            assert_eq!(
-                accounts.load_without_fixed_root(&ancestors, key).unwrap().0,
-                account_ref
-            );
-        }
-    }
+    // bprumo TODO: fix or remove
+    /*
+     *     #[test]
+     *     fn test_store_reuse() {
+     *         solana_logger::setup();
+     *         let accounts = AccountsDb {
+     *             file_size: 4096,
+     *             ..AccountsDb::new_single_for_tests()
+     *         };
+     *
+     *         let size = 100;
+     *         let num_accounts: usize = 100;
+     *         let mut keys = Vec::new();
+     *         for i in 0..num_accounts {
+     *             let account = AccountSharedData::new((i + 1) as u64, size, &Pubkey::default());
+     *             let pubkey = solana_sdk::pubkey::new_rand();
+     *             accounts.store_cached((0 as Slot, &[(&pubkey, &account)][..]), None);
+     *             keys.push(pubkey);
+     *         }
+     *         // get delta hash to feed these accounts to clean
+     *         accounts.calculate_accounts_delta_hash(0);
+     *         accounts.add_root(0);
+     *         // we have to flush just slot 0
+     *         // if we slot 0 and 1 together, then they are cleaned and slot 0 doesn't contain the accounts
+     *         // this test wants to clean and then allow us to shrink
+     *         accounts.flush_accounts_cache(true, None);
+     *
+     *         for (i, key) in keys[1..].iter().enumerate() {
+     *             let account =
+     *                 AccountSharedData::new((1 + i + num_accounts) as u64, size, &Pubkey::default());
+     *             accounts.store_cached((1 as Slot, &[(key, &account)][..]), None);
+     *         }
+     *         accounts.calculate_accounts_delta_hash(1);
+     *         accounts.add_root(1);
+     *         accounts.flush_accounts_cache(true, None);
+     *         accounts.clean_accounts_for_tests();
+     *         accounts.shrink_all_slots(false, None, &EpochSchedule::default());
+     *
+     *         // Clean again to flush the dirty stores
+     *         // and allow them to be recycled in the next step
+     *         accounts.clean_accounts_for_tests();
+     *         accounts.print_accounts_stats("post-shrink");
+     *         let num_stores = accounts.recycle_stores.read().unwrap().entry_count();
+     *         assert!(num_stores > 0);
+     *
+     *         let mut account_refs = Vec::new();
+     *         let num_to_store = 20;
+     *         for (i, key) in keys[..num_to_store].iter().enumerate() {
+     *             let account = AccountSharedData::new(
+     *                 (1 + i + 2 * num_accounts) as u64,
+     *                 i + 20,
+     *                 &Pubkey::default(),
+     *             );
+     *             accounts.store_uncached(2, &[(key, &account)]);
+     *             account_refs.push(account);
+     *         }
+     *         assert!(accounts.recycle_stores.read().unwrap().entry_count() < num_stores);
+     *
+     *         accounts.print_accounts_stats("post-store");
+     *
+     *         let mut ancestors = Ancestors::default();
+     *         ancestors.insert(1, 0);
+     *         ancestors.insert(2, 1);
+     *         for (key, account_ref) in keys[..num_to_store].iter().zip(account_refs) {
+     *             assert_eq!(
+     *                 accounts.load_without_fixed_root(&ancestors, key).unwrap().0,
+     *                 account_ref
+     *             );
+     *         }
+     *     }
+     */
 
     #[test]
     #[should_panic(expected = "We've run out of storage ids!")]

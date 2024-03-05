@@ -631,7 +631,8 @@ impl AccountsBackgroundService {
                             &mut total_remove_slots_time,
                         );
 
-                    Self::expire_old_recycle_stores(&bank, &mut last_expiration_check_time);
+                    // bprumo TODO: remove me
+                    //Self::expire_old_recycle_stores(&bank, &mut last_expiration_check_time);
 
                     let non_snapshot_time = last_snapshot_end_time
                         .map(|last_snapshot_end_time: Instant| {
@@ -761,15 +762,17 @@ impl AccountsBackgroundService {
     }
 
     // bprumo TODO: remove me?
-    fn expire_old_recycle_stores(bank: &Bank, last_expiration_check_time: &mut Instant) {
-        let now = Instant::now();
-        if now.duration_since(*last_expiration_check_time).as_secs()
-            > RECYCLE_STORE_EXPIRATION_INTERVAL_SECS
-        {
-            bank.expire_old_recycle_stores();
-            *last_expiration_check_time = now;
-        }
-    }
+    /*
+     * fn expire_old_recycle_stores(bank: &Bank, last_expiration_check_time: &mut Instant) {
+     *     let now = Instant::now();
+     *     if now.duration_since(*last_expiration_check_time).as_secs()
+     *         > RECYCLE_STORE_EXPIRATION_INTERVAL_SECS
+     *     {
+     *         bank.expire_old_recycle_stores();
+     *         *last_expiration_check_time = now;
+     *     }
+     * }
+     */
 }
 
 /// Get the AccountsPackageKind from a given SnapshotRequest
