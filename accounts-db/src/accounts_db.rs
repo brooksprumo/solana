@@ -1275,76 +1275,10 @@ impl StoreAccountsTiming {
 }
 
 // bprumo TODO: remove me
-#[derive(Debug, Default)]
-struct RecycleStores {
-    entries: Vec<(Instant, Arc<AccountStorageEntry>)>,
-    total_bytes: u64,
-}
-
-// bprumo TODO: remove me
 // 30 min should be enough to be certain there won't be any prospective recycle uses for given
 // store entry
 // That's because it already processed ~2500 slots and ~25 passes of AccountsBackgroundService
 pub const EXPIRATION_TTL_SECONDS: u64 = 1800;
-
-impl RecycleStores {
-    fn add_entry(&mut self, new_entry: Arc<AccountStorageEntry>) {
-        self.total_bytes += new_entry.capacity();
-        self.entries.push((Instant::now(), new_entry))
-    }
-
-    fn iter(&self) -> std::slice::Iter<(Instant, Arc<AccountStorageEntry>)> {
-        self.entries.iter()
-    }
-
-    fn add_entries(&mut self, new_entries: Vec<Arc<AccountStorageEntry>>) {
-        let now = Instant::now();
-        for new_entry in new_entries {
-            self.total_bytes += new_entry.capacity();
-            self.entries.push((now, new_entry));
-        }
-    }
-
-    fn expire_old_entries(&mut self) -> Vec<Arc<AccountStorageEntry>> {
-        let mut expired = vec![];
-        let now = Instant::now();
-        let mut expired_bytes = 0;
-        self.entries.retain(|(recycled_time, entry)| {
-            if now.duration_since(*recycled_time).as_secs() > EXPIRATION_TTL_SECONDS {
-                if Arc::strong_count(entry) >= 2 {
-                    warn!(
-                        "Expiring still in-use recycled StorageEntry anyway...: id: {} slot: {}",
-                        entry.append_vec_id(),
-                        entry.slot(),
-                    );
-                }
-                expired_bytes += entry.capacity();
-                expired.push(entry.clone());
-                false
-            } else {
-                true
-            }
-        });
-
-        self.total_bytes -= expired_bytes;
-
-        expired
-    }
-
-    fn remove_entry(&mut self, index: usize) -> Arc<AccountStorageEntry> {
-        let (_added_time, removed_entry) = self.entries.swap_remove(index);
-        self.total_bytes -= removed_entry.capacity();
-        removed_entry
-    }
-
-    fn entry_count(&self) -> usize {
-        self.entries.len()
-    }
-
-    fn total_bytes(&self) -> u64 {
-        self.total_bytes
-    }
-}
 
 /// Removing unrooted slots in Accounts Background Service needs to be synchronized with flushing
 /// slots from the Accounts Cache.  This keeps track of those slots and the Mutex + Condvar for
