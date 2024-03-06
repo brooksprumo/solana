@@ -3880,7 +3880,6 @@ impl AccountsDb {
         let (_, drop_storage_entries_elapsed) = measure_us!(drop(dead_storages));
         time.stop();
 
-        // bprumo TODO: is this is right datapoint? all the others use `stats`
         self.stats
             .dropped_stores
             .fetch_add(dead_storages_len as u64, Ordering::Relaxed);
@@ -5638,7 +5637,6 @@ impl AccountsDb {
             .safety_checks_elapsed
             .fetch_add(safety_checks_elapsed.as_us(), Ordering::Relaxed);
 
-        let mut total_removed_storage_entries = 0;
         let mut total_removed_stored_bytes = 0;
         let mut all_removed_slot_storages = vec![];
 
@@ -5646,26 +5644,19 @@ impl AccountsDb {
         for remove_slot in removed_slots {
             // Remove the storage entries and collect some metrics
             if let Some(store) = self.storage.remove(remove_slot, false) {
-                {
-                    total_removed_storage_entries += 1;
-                    total_removed_stored_bytes += store.accounts.capacity();
-                }
+                total_removed_stored_bytes += store.accounts.capacity();
                 all_removed_slot_storages.push(store);
             }
         }
         remove_storage_entries_elapsed.stop();
         let num_stored_slots_removed = all_removed_slot_storages.len();
 
-        // bprumo TODO: remove me? why count the dropped stores in two different stats/datapoints?
-        self.stats
-            .dropped_stores
-            .fetch_add(total_removed_storage_entries as u64, Ordering::Relaxed);
-
-        let mut drop_storage_entries_elapsed = Measure::start("drop_storage_entries_elapsed");
         // Backing mmaps for removed storages entries explicitly dropped here outside
         // of any locks
+        let mut drop_storage_entries_elapsed = Measure::start("drop_storage_entries_elapsed");
         drop(all_removed_slot_storages);
         drop_storage_entries_elapsed.stop();
+
         purge_stats
             .remove_storage_entries_elapsed
             .fetch_add(remove_storage_entries_elapsed.as_us(), Ordering::Relaxed);
@@ -5677,10 +5668,13 @@ impl AccountsDb {
             .fetch_add(num_stored_slots_removed, Ordering::Relaxed);
         purge_stats
             .total_removed_storage_entries
-            .fetch_add(total_removed_storage_entries, Ordering::Relaxed);
+            .fetch_add(num_stored_slots_removed, Ordering::Relaxed);
         purge_stats
             .total_removed_stored_bytes
             .fetch_add(total_removed_stored_bytes, Ordering::Relaxed);
+        self.stats
+            .dropped_stores
+            .fetch_add(num_stored_slots_removed as u64, Ordering::Relaxed);
     }
 
     fn purge_slot_cache(&self, purged_slot: Slot, slot_cache: SlotCache) {
