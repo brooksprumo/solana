@@ -985,7 +985,7 @@ pub mod tests {
                     create_db_with_storages_and_index, create_storages_and_update_index,
                     get_all_accounts, remove_account_for_tests, CAN_RANDOMLY_SHRINK_FALSE,
                 },
-                ShrinkCollectRefs, MAX_RECYCLE_STORES,
+                ShrinkCollectRefs,
             },
             accounts_index::UpsertReclaim,
             append_vec::{aligned_stored_size, AppendVec, AppendVecStoredAccountMeta},
@@ -3021,6 +3021,7 @@ pub mod tests {
         db.combine_ancient_slots_packed_internal(sorted_slots, tuning, &mut stats_sub);
     }
 
+    // bprumo TODO: fix test
     #[test]
     fn test_shrink_packed_ancient() {
         // bprumo TODO: remove me
