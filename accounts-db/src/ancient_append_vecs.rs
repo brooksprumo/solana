@@ -3023,6 +3023,8 @@ pub mod tests {
 
     #[test]
     fn test_shrink_packed_ancient() {
+        // bprumo TODO: remove me
+        const MAX_RECYCLE_STORES: usize = 1000;
         solana_logger::setup();
 
         // When we pack ancient append vecs, the packed append vecs are recycled first if possible. This means they aren't dropped directly.
