@@ -500,6 +500,9 @@ pub enum HardLinkStoragesToSnapshotError {
 
     #[error("failed to hard link storage from '{1}' to '{2}': {0}")]
     HardLinkStorage(#[source] IoError, PathBuf, PathBuf),
+
+    #[error("failed to drain io_uring hard linker: {0}")]
+    DrainRingHardLinker(#[source] IoError),
 }
 
 /// Errors that can happen in `get_snapshot_accounts_hardlink_dir()`
@@ -1227,23 +1230,73 @@ pub fn hard_link_storages_to_snapshot(
         )
     })?;
 
-    let mut account_paths: HashSet<PathBuf> = HashSet::new();
-    for storage in snapshot_storages {
-        let storage_path = storage.accounts.get_path();
-        let snapshot_hardlink_dir = get_snapshot_accounts_hardlink_dir(
-            &storage_path,
-            bank_slot,
-            &mut account_paths,
-            &accounts_hardlinks_dir,
-        )?;
-        // The appendvec could be recycled, so its filename may not be consistent to the slot and id.
-        // Use the storage slot and id to compose a consistent file name for the hard-link file.
-        let hardlink_filename = AppendVec::file_name(storage.slot(), storage.append_vec_id());
-        let hard_link_path = snapshot_hardlink_dir.join(hardlink_filename);
-        fs::hard_link(&storage_path, &hard_link_path).map_err(|err| {
-            HardLinkStoragesToSnapshotError::HardLinkStorage(err, storage_path, hard_link_path)
-        })?;
+    #[cfg(target_os = "linux")]
+    {
+        use solana_accounts_db::ring::{io_uring_supported, ring_hard_linker::RingHardLinker};
+
+        let mut ring_hard_linker = io_uring_supported()
+            .then(|| RingHardLinker::new().ok())
+            .flatten();
+
+        error!(
+            "bprumo DEBUG: hard_link storages(), os is linux, using io uring? {}",
+            ring_hard_linker.is_some()
+        );
+
+        let mut account_paths: HashSet<PathBuf> = HashSet::new();
+        for storage in snapshot_storages {
+            let storage_path = storage.accounts.get_path();
+            let snapshot_hardlink_dir = get_snapshot_accounts_hardlink_dir(
+                &storage_path,
+                bank_slot,
+                &mut account_paths,
+                &accounts_hardlinks_dir,
+            )?;
+            // The appendvec could be recycled, so its filename may not be consistent to the slot and id.
+            // Use the storage slot and id to compose a consistent file name for the hard-link file.
+            let hardlink_filename = AppendVec::file_name(storage.slot(), storage.append_vec_id());
+            let hard_link_path = snapshot_hardlink_dir.join(hardlink_filename);
+
+            if let Some(ring_hard_linker) = &mut ring_hard_linker {
+                ring_hard_linker.submit(&storage_path, &hard_link_path)
+            } else {
+                fs::hard_link(&storage_path, &hard_link_path)
+            }
+            .map_err(|err| {
+                HardLinkStoragesToSnapshotError::HardLinkStorage(err, storage_path, hard_link_path)
+            })?;
+        }
+
+        if let Some(ring_hard_linker) = &mut ring_hard_linker {
+            ring_hard_linker
+                .drain()
+                .map_err(HardLinkStoragesToSnapshotError::DrainRingHardLinker)?;
+        }
     }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        error!("bprumo DEBUG: hard_link storages(), os is *not* linux, using io uring? NO");
+
+        let mut account_paths: HashSet<PathBuf> = HashSet::new();
+        for storage in snapshot_storages {
+            let storage_path = storage.accounts.get_path();
+            let snapshot_hardlink_dir = get_snapshot_accounts_hardlink_dir(
+                &storage_path,
+                bank_slot,
+                &mut account_paths,
+                &accounts_hardlinks_dir,
+            )?;
+            // The appendvec could be recycled, so its filename may not be consistent to the slot and id.
+            // Use the storage slot and id to compose a consistent file name for the hard-link file.
+            let hardlink_filename = AppendVec::file_name(storage.slot(), storage.append_vec_id());
+            let hard_link_path = snapshot_hardlink_dir.join(hardlink_filename);
+            fs::hard_link(&storage_path, &hard_link_path).map_err(|err| {
+                HardLinkStoragesToSnapshotError::HardLinkStorage(err, storage_path, hard_link_path)
+            })?;
+        }
+    }
+
     Ok(())
 }
 

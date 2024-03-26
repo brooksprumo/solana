@@ -4,6 +4,7 @@
 mod ring;
 pub use ring::*;
 pub mod ring_dir_remover;
+pub mod ring_hard_linker;
 
 use {
     io_uring::IoUring,
