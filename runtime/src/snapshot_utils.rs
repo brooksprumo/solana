@@ -25,7 +25,7 @@ use {
         shared_buffer_reader::{SharedBuffer, SharedBufferReader},
         utils::{move_and_async_delete_path, ACCOUNTS_RUN_DIR, ACCOUNTS_SNAPSHOT_DIR},
     },
-    solana_measure::{measure, measure::Measure},
+    solana_measure::{measure, measure::Measure, measure_us},
     solana_sdk::{clock::Slot, hash::Hash},
     std::{
         cmp::Ordering,
@@ -1182,26 +1182,44 @@ pub fn hard_link_storages_to_snapshot(
         )
     })?;
 
+    let mut flush_elapsed = 0;
+    let mut mkdir_elapsed = 0;
+    let mut link_elapsed = 0;
+
     let mut account_paths: HashSet<PathBuf> = HashSet::new();
     for storage in snapshot_storages {
-        storage
+        let (_, measure_flush) = measure_us!(storage
             .flush()
-            .map_err(HardLinkStoragesToSnapshotError::FlushStorage)?;
+            .map_err(HardLinkStoragesToSnapshotError::FlushStorage)?);
+        flush_elapsed += measure_flush;
+
         let storage_path = storage.accounts.get_path();
-        let snapshot_hardlink_dir = get_snapshot_accounts_hardlink_dir(
-            &storage_path,
-            bank_slot,
-            &mut account_paths,
-            &accounts_hardlinks_dir,
-        )?;
+        let (snapshot_hardlink_dir, measure_mkdir) =
+            measure_us!(get_snapshot_accounts_hardlink_dir(
+                &storage_path,
+                bank_slot,
+                &mut account_paths,
+                &accounts_hardlinks_dir,
+            )?);
+        mkdir_elapsed += measure_mkdir;
+
         // The appendvec could be recycled, so its filename may not be consistent to the slot and id.
         // Use the storage slot and id to compose a consistent file name for the hard-link file.
         let hardlink_filename = AppendVec::file_name(storage.slot(), storage.append_vec_id());
         let hard_link_path = snapshot_hardlink_dir.join(hardlink_filename);
-        fs::hard_link(&storage_path, &hard_link_path).map_err(|err| {
-            HardLinkStoragesToSnapshotError::HardLinkStorage(err, storage_path, hard_link_path)
-        })?;
+        let (_, measure_hard_link) = measure_us!(fs::hard_link(&storage_path, &hard_link_path)
+            .map_err(|err| {
+                HardLinkStoragesToSnapshotError::HardLinkStorage(err, storage_path, hard_link_path)
+            })?);
+        link_elapsed += measure_hard_link;
     }
+
+    datapoint_info!(
+        "snapshot-hard_link_storages_to_snapshot",
+        ("flush_us", flush_elapsed, i64),
+        ("mkdir_us", mkdir_elapsed, i64),
+        ("link_us", link_elapsed, i64),
+    );
     Ok(())
 }
 
