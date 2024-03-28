@@ -1824,14 +1824,15 @@ impl Bank {
         // from Stakes<Delegation> by reading the full account state from
         // accounts-db. Note that it is crucial that these accounts are loaded
         // at the right slot and match precisely with serialized Delegations.
-        let stakes = Stakes::new(&fields.stakes, |pubkey| {
+        let (stakes, measure_stakes) = measure!(Stakes::new(&fields.stakes, |pubkey| {
             let (account, _slot) = bank_rc.accounts.load_with_fixed_root(&ancestors, pubkey)?;
             Some(account)
         })
         .expect(
             "Stakes cache is inconsistent with accounts-db. This can indicate \
             a corrupted snapshot or bugs in cached accounts or accounts-db.",
-        );
+        ));
+        error!("bprumo DEBUG: stakes: {measure_stakes}");
         let stakes_accounts_load_duration = now.elapsed();
         let mut bank = Self {
             skipped_rewrites: Mutex::default(),
