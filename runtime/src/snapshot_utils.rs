@@ -1245,6 +1245,7 @@ pub fn hard_link_storages_to_snapshot(
             ring_hard_linker.is_some()
         );
 
+        let mut get_hard_link_dir_ns = 0;
         let mut file_descriptors_to_keep_open = HashMap::new();
         let mut account_paths: HashSet<PathBuf> = HashSet::new();
         let (_, measure_submit) = measure!({
@@ -1258,12 +1259,15 @@ pub fn hard_link_storages_to_snapshot(
                     storage_path.file_name().unwrap().to_str().unwrap(), // bprumo TODO: fix unwrap
                 );
 
-                let snapshot_hardlink_dir = get_snapshot_accounts_hardlink_dir(
-                    &storage_path,
-                    bank_slot,
-                    &mut account_paths,
-                    &accounts_hardlinks_dir,
-                )?;
+                let (snapshot_hardlink_dir, measure_get_hard_link_dir) =
+                    measure!(get_snapshot_accounts_hardlink_dir(
+                        &storage_path,
+                        bank_slot,
+                        &mut account_paths,
+                        &accounts_hardlinks_dir,
+                    )?);
+                get_hard_link_dir_ns += measure_get_hard_link_dir.as_ns();
+
                 let hard_link_path = snapshot_hardlink_dir.join(&storage_file_name); // bprumo TODO: move into else branch
 
                 let storage_dir = storage_path.parent().unwrap().to_path_buf(); // bprumo TODO: doc that storage *must* minimally have a `run/` subdirectory, so parent will always be Some
@@ -1313,7 +1317,7 @@ pub fn hard_link_storages_to_snapshot(
         });
 
         drop(file_descriptors_to_keep_open);
-        error!("bprumo DEBUG: hard_link_storages() submitting ops{measure_submit}, draining{measure_drain}");
+        error!("bprumo DEBUG: hard_link_storages() getting hard link dir: {get_hard_link_dir_ns} ns, submitting ops{measure_submit}, draining{measure_drain}");
     }
 
     #[cfg(not(target_os = "linux"))]
