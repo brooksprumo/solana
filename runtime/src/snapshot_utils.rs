@@ -34,6 +34,7 @@ use {
         fmt, fs,
         io::{BufReader, BufWriter, Error as IoError, Read, Result as IoResult, Seek, Write},
         num::NonZeroUsize,
+        os::fd::OwnedFd,
         path::{Path, PathBuf},
         process::ExitStatus,
         str::FromStr,
@@ -1233,6 +1234,7 @@ pub fn hard_link_storages_to_snapshot(
     #[cfg(target_os = "linux")]
     {
         use solana_accounts_db::ring::{io_uring_supported, ring_hard_linker::RingHardLinker};
+        use std::os::fd::AsRawFd;
 
         let mut ring_hard_linker = io_uring_supported()
             .then(|| RingHardLinker::new().ok())
@@ -1243,22 +1245,51 @@ pub fn hard_link_storages_to_snapshot(
             ring_hard_linker.is_some()
         );
 
+        let mut file_descriptors_to_keep_open = HashMap::new();
         let mut account_paths: HashSet<PathBuf> = HashSet::new();
         for storage in snapshot_storages {
+            let storage_file_name =
+                AccountsFile::file_name(storage.slot(), storage.append_vec_id());
             let storage_path = storage.accounts.get_path();
+            // ensure the file name is what we expect (bprumo TODO: can probably remove this?)
+            assert_eq!(
+                &storage_file_name,
+                storage_path.file_name().unwrap().to_str().unwrap(), // bprumo TODO: fix unwrap
+            );
+
             let snapshot_hardlink_dir = get_snapshot_accounts_hardlink_dir(
                 &storage_path,
                 bank_slot,
                 &mut account_paths,
                 &accounts_hardlinks_dir,
             )?;
-            // The appendvec could be recycled, so its filename may not be consistent to the slot and id.
-            // Use the storage slot and id to compose a consistent file name for the hard-link file.
-            let hardlink_filename = AppendVec::file_name(storage.slot(), storage.append_vec_id());
-            let hard_link_path = snapshot_hardlink_dir.join(hardlink_filename);
+            let hard_link_path = snapshot_hardlink_dir.join(&storage_file_name); // bprumo TODO: move into else branch
+
+            let storage_dir = storage_path.parent().unwrap().to_path_buf(); // bprumo TODO: doc that storage *must* minimally have a `run/` subdirectory, so parent will always be Some
+            let storage_dir_fd = file_descriptors_to_keep_open
+                .entry(storage_dir)
+                .or_insert_with_key(|dir| {
+                    // bprumo TODO: fix the unwrap; replace with real error
+                    OwnedFd::from(fs::File::open(dir).unwrap())
+                })
+                .as_raw_fd();
+
+            let hard_link_dir_fd = file_descriptors_to_keep_open
+                .entry(snapshot_hardlink_dir)
+                .or_insert_with_key(|dir| {
+                    // bprumo TODO: fix the unwrap; replace with real error
+                    OwnedFd::from(fs::File::open(dir).unwrap())
+                })
+                .as_raw_fd();
 
             if let Some(ring_hard_linker) = &mut ring_hard_linker {
-                ring_hard_linker.submit(&storage_path, &hard_link_path)
+                //ring_hard_linker.submit(&storage_path, &hard_link_path)
+                ring_hard_linker.submit(
+                    storage_dir_fd,
+                    &storage_file_name,
+                    hard_link_dir_fd,
+                    &storage_file_name,
+                )
             } else {
                 fs::hard_link(&storage_path, &hard_link_path)
             }
@@ -1272,6 +1303,7 @@ pub fn hard_link_storages_to_snapshot(
                 .drain()
                 .map_err(HardLinkStoragesToSnapshotError::DrainRingHardLinker)?;
         }
+        drop(file_descriptors_to_keep_open);
     }
 
     #[cfg(not(target_os = "linux"))]

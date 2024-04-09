@@ -25,12 +25,11 @@ impl RingHardLinker {
     pub fn new() -> io::Result<Self> {
         const SUBMISSION_QUEUE_POLL_IDLE: Duration = Duration::from_secs(1);
         let ring = IoUring::builder()
-            .setup_sqpoll(SUBMISSION_QUEUE_POLL_IDLE.as_millis() as u32)
+            .setup_sqpoll(SUBMISSION_QUEUE_POLL_IDLE.as_millis() as u32) // <-- bprumo TODO: alessandro says to try removing this
             // .setup_coop_taskrun() <-- bprumo TODO: try this too
             .build(1024)?; // bprumo TODO: bench/doc 1024
 
-        // bprumo TODO: bench/doc 12
-        ring.submitter().register_iowq_max_workers(&mut [12, 0])?;
+        ring.submitter().register_iowq_max_workers(&mut [12, 0])?; // bprumo TODO: bench/doc 12
         Ok(Self::with_ring(ring))
     }
 
@@ -47,8 +46,19 @@ impl RingHardLinker {
     }
 
     /// bprumo TODO: doc
-    pub fn submit(&mut self, original: impl AsRef<Path>, link: impl AsRef<Path>) -> io::Result<()> {
-        let op = Op::HardLink(HardLinkOp::new(original, link)?);
+    pub fn submit(
+        &mut self,
+        original_dir_fd: impl AsRawFd,
+        original_path: impl AsRef<Path>,
+        link_dir_fd: impl AsRawFd,
+        link_path: impl AsRef<Path>,
+    ) -> io::Result<()> {
+        let op = Op::HardLink(HardLinkOp::new(
+            original_dir_fd,
+            original_path,
+            link_dir_fd,
+            link_path,
+        )?);
         // bprumo TODO: SAFETY: doc
         unsafe { self.ring.push(op)? };
         Ok(())
@@ -70,7 +80,23 @@ struct HardLinkOp {
 
 impl HardLinkOp {
     /// bprumo TODO: doc
-    fn new(old: impl AsRef<Path>, new: impl AsRef<Path>) -> io::Result<Self> {
+    fn new(
+        old_dir_fd: impl AsRawFd,
+        old_path: impl AsRef<Path>,
+        new_dir_fd: impl AsRawFd,
+        new_path: impl AsRef<Path>,
+    ) -> io::Result<Self> {
+        Ok(HardLinkOp {
+            old_dir_fd: old_dir_fd.as_raw_fd(),
+            old_path: CString::new(old_path.as_ref().as_os_str().as_encoded_bytes())?,
+            new_dir_fd: new_dir_fd.as_raw_fd(),
+            new_path: CString::new(new_path.as_ref().as_os_str().as_encoded_bytes())?,
+        })
+    }
+
+    /// bprumo TODO: doc
+    /// bprumo TODO: remove me?
+    fn with_absolute_paths(old: impl AsRef<Path>, new: impl AsRef<Path>) -> io::Result<Self> {
         let old = old.as_ref();
         let new = new.as_ref();
         if !old.is_absolute() || !new.is_absolute() {
@@ -81,21 +107,16 @@ impl HardLinkOp {
             )));
         }
 
-        Ok(HardLinkOp {
-            old_dir_fd: -1,
-            old_path: CString::new(old.as_os_str().as_encoded_bytes())?,
-            new_dir_fd: -1,
-            new_path: CString::new(new.as_os_str().as_encoded_bytes())?,
-        })
+        Self::new(-1, old, -1, new)
     }
 
     /// bprumo TODO: doc
     fn entry(&mut self) -> squeue::Entry {
         opcode::LinkAt::new(
             types::Fd(self.old_dir_fd),
-            self.old_path.as_ptr() as _,
+            self.old_path.as_ptr().cast(),
             types::Fd(self.new_dir_fd),
-            self.new_path.as_ptr() as _,
+            self.new_path.as_ptr().cast(),
         )
         .build()
     }
