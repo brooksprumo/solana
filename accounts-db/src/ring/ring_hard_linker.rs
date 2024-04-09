@@ -26,8 +26,13 @@ impl RingHardLinker {
         const SUBMISSION_QUEUE_POLL_IDLE: Duration = Duration::from_secs(1);
         let ring = IoUring::builder()
             //.setup_sqpoll(SUBMISSION_QUEUE_POLL_IDLE.as_millis() as u32) // <-- bprumo TODO: alessandro says to try removing this
-            .setup_coop_taskrun()
-            .build(1024)?; // bprumo TODO: bench/doc 1024
+            //.setup_coop_taskrun()
+            .build(1024); // bprumo TODO: bench/doc 1024
+        if let Err(err) = ring {
+            log::error!("bprumo DEBUG: error building io uring! {err}");
+            return Err(err);
+        }
+        let ring = ring.unwrap();
 
         let previous = ring.submitter().register_iowq_max_workers(&mut [12, 0])?; // bprumo TODO: bench/doc 12
         log::error!("bprumo DEBUG: original ring iowq max workers: {previous:?}");
