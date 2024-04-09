@@ -1247,63 +1247,73 @@ pub fn hard_link_storages_to_snapshot(
 
         let mut file_descriptors_to_keep_open = HashMap::new();
         let mut account_paths: HashSet<PathBuf> = HashSet::new();
-        for storage in snapshot_storages {
-            let storage_file_name =
-                AccountsFile::file_name(storage.slot(), storage.append_vec_id());
-            let storage_path = storage.accounts.get_path();
-            // ensure the file name is what we expect (bprumo TODO: can probably remove this?)
-            assert_eq!(
-                &storage_file_name,
-                storage_path.file_name().unwrap().to_str().unwrap(), // bprumo TODO: fix unwrap
-            );
-
-            let snapshot_hardlink_dir = get_snapshot_accounts_hardlink_dir(
-                &storage_path,
-                bank_slot,
-                &mut account_paths,
-                &accounts_hardlinks_dir,
-            )?;
-            let hard_link_path = snapshot_hardlink_dir.join(&storage_file_name); // bprumo TODO: move into else branch
-
-            let storage_dir = storage_path.parent().unwrap().to_path_buf(); // bprumo TODO: doc that storage *must* minimally have a `run/` subdirectory, so parent will always be Some
-            let storage_dir_fd = file_descriptors_to_keep_open
-                .entry(storage_dir)
-                .or_insert_with_key(|dir| {
-                    // bprumo TODO: fix the unwrap; replace with real error
-                    OwnedFd::from(fs::File::open(dir).unwrap())
-                })
-                .as_raw_fd();
-
-            let hard_link_dir_fd = file_descriptors_to_keep_open
-                .entry(snapshot_hardlink_dir)
-                .or_insert_with_key(|dir| {
-                    // bprumo TODO: fix the unwrap; replace with real error
-                    OwnedFd::from(fs::File::open(dir).unwrap())
-                })
-                .as_raw_fd();
-
-            if let Some(ring_hard_linker) = &mut ring_hard_linker {
-                //ring_hard_linker.submit(&storage_path, &hard_link_path)
-                ring_hard_linker.submit(
-                    storage_dir_fd,
+        let (_, measure_submit) = measure!({
+            for storage in snapshot_storages {
+                let storage_file_name =
+                    AccountsFile::file_name(storage.slot(), storage.append_vec_id());
+                let storage_path = storage.accounts.get_path();
+                // ensure the file name is what we expect (bprumo TODO: can probably remove this?)
+                assert_eq!(
                     &storage_file_name,
-                    hard_link_dir_fd,
-                    &storage_file_name,
-                )
-            } else {
-                fs::hard_link(&storage_path, &hard_link_path)
+                    storage_path.file_name().unwrap().to_str().unwrap(), // bprumo TODO: fix unwrap
+                );
+
+                let snapshot_hardlink_dir = get_snapshot_accounts_hardlink_dir(
+                    &storage_path,
+                    bank_slot,
+                    &mut account_paths,
+                    &accounts_hardlinks_dir,
+                )?;
+                let hard_link_path = snapshot_hardlink_dir.join(&storage_file_name); // bprumo TODO: move into else branch
+
+                let storage_dir = storage_path.parent().unwrap().to_path_buf(); // bprumo TODO: doc that storage *must* minimally have a `run/` subdirectory, so parent will always be Some
+                let storage_dir_fd = file_descriptors_to_keep_open
+                    .entry(storage_dir)
+                    .or_insert_with_key(|dir| {
+                        // bprumo TODO: fix the unwrap; replace with real error
+                        OwnedFd::from(fs::File::open(dir).unwrap())
+                    })
+                    .as_raw_fd();
+
+                let hard_link_dir_fd = file_descriptors_to_keep_open
+                    .entry(snapshot_hardlink_dir)
+                    .or_insert_with_key(|dir| {
+                        // bprumo TODO: fix the unwrap; replace with real error
+                        OwnedFd::from(fs::File::open(dir).unwrap())
+                    })
+                    .as_raw_fd();
+
+                if let Some(ring_hard_linker) = &mut ring_hard_linker {
+                    //ring_hard_linker.submit(&storage_path, &hard_link_path)
+                    ring_hard_linker.submit(
+                        storage_dir_fd,
+                        &storage_file_name,
+                        hard_link_dir_fd,
+                        &storage_file_name,
+                    )
+                } else {
+                    fs::hard_link(&storage_path, &hard_link_path)
+                }
+                .map_err(|err| {
+                    HardLinkStoragesToSnapshotError::HardLinkStorage(
+                        err,
+                        storage_path,
+                        hard_link_path,
+                    )
+                })?;
             }
-            .map_err(|err| {
-                HardLinkStoragesToSnapshotError::HardLinkStorage(err, storage_path, hard_link_path)
-            })?;
-        }
+        });
 
-        if let Some(ring_hard_linker) = &mut ring_hard_linker {
-            ring_hard_linker
-                .drain()
-                .map_err(HardLinkStoragesToSnapshotError::DrainRingHardLinker)?;
-        }
+        let (_, measure_drain) = measure!({
+            if let Some(ring_hard_linker) = &mut ring_hard_linker {
+                ring_hard_linker
+                    .drain()
+                    .map_err(HardLinkStoragesToSnapshotError::DrainRingHardLinker)?;
+            }
+        });
+
         drop(file_descriptors_to_keep_open);
+        error!("bprumo DEBUG: hard_link_storages() submitting ops{measure_submit}, draining{measure_drain}");
     }
 
     #[cfg(not(target_os = "linux"))]
