@@ -191,34 +191,19 @@ impl<'storage> StoredAccountMeta<'storage> {
 
 impl<'storage> ReadableAccount for StoredAccountMeta<'storage> {
     fn lamports(&self) -> u64 {
-        match self {
-            Self::AppendVec(av) => av.lamports(),
-            Self::Hot(hot) => hot.lamports(),
-        }
+        self.lamports()
     }
     fn data(&self) -> &[u8] {
-        match self {
-            Self::AppendVec(av) => av.data(),
-            Self::Hot(hot) => hot.data(),
-        }
+        self.data()
     }
     fn owner(&self) -> &Pubkey {
-        match self {
-            Self::AppendVec(av) => av.owner(),
-            Self::Hot(hot) => hot.owner(),
-        }
+        self.owner()
     }
     fn executable(&self) -> bool {
-        match self {
-            Self::AppendVec(av) => av.executable(),
-            Self::Hot(hot) => hot.executable(),
-        }
+        self.executable()
     }
     fn rent_epoch(&self) -> Epoch {
-        match self {
-            Self::AppendVec(av) => av.rent_epoch(),
-            Self::Hot(hot) => hot.rent_epoch(),
-        }
+        self.rent_epoch()
     }
 }
 
