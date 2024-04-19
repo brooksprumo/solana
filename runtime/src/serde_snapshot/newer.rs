@@ -331,6 +331,11 @@ impl<'a> TypeContext<'a> for Context {
     {
         let mut bank_fields: BankFieldsToDeserialize =
             deserialize_from::<_, DeserializableVersionedBank>(&mut stream)?.into();
+        error!(
+            "brooks DEBUG: bank fields, slot: {}, epoch: {}, epoch stakes: {:#?}",
+            bank_fields.slot, bank_fields.epoch, bank_fields.epoch_stakes
+        );
+        panic!("brooks DEBUG: done");
         let accounts_db_fields = Self::deserialize_accounts_db_fields(stream)?;
         // Process extra fields
         let lamports_per_signature = ignore_eof_error(deserialize_from(&mut stream))?;
