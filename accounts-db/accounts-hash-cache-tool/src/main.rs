@@ -100,6 +100,23 @@ fn main() {
                         ),
                 ),
         )
+        .subcommand(
+            SubCommand::with_name("brooks")
+                .arg(
+                    Arg::with_name("path1")
+                        .index(1)
+                        .takes_value(true)
+                        .value_name("PATH1")
+                        .help("failed index file"),
+                )
+                .arg(
+                    Arg::with_name("path2")
+                        .index(2)
+                        .takes_value(true)
+                        .value_name("PATH2")
+                        .help("accounts hash cache dir"),
+                ),
+        )
         .get_matches();
 
     let subcommand = matches.subcommand();
@@ -118,6 +135,7 @@ fn main() {
                 _ => unreachable!(),
             }
         }
+        ("brooks", Some(submatches)) => cmd_brooks(&matches, submatches),
         _ => unreachable!(),
     }
     .unwrap_or_else(|err| {
@@ -594,4 +612,199 @@ impl Drop for ElapsedOnDrop {
         let elapsed = self.start.elapsed();
         println!("{}{elapsed:?}", self.message);
     }
+}
+
+fn cmd_brooks(
+    _app_matches: &ArgMatches<'_>,
+    subcommand_matches: &ArgMatches<'_>,
+) -> Result<(), String> {
+    use solana_accounts_db::accounts_hash::AccountHash;
+    use solana_program::{clock::Slot, hash::Hash, pubkey::Pubkey};
+    use std::{io::BufRead as _, str::FromStr as _};
+
+    let path1 = value_t_or_exit!(subcommand_matches, "path1", String);
+    let path2 = value_t_or_exit!(subcommand_matches, "path2", String);
+
+    let failed_index_file_path = Path::new(&path1);
+    let accounts_hash_cache_dir_path = Path::new(&path2);
+
+    // brooks TODO:
+    // - go through the cache files and build up a map of pubkey => (hash, lamports, slot)
+    //     - note: maybe have two maps? one for the newest entry, and one for the older/duplicates?
+    //       this way we can see if something got shadowed or not.
+    // - stream through the index file and compare with the cache entry
+    // - the index will only have one entry per pubkey, so as we go through the index file, REMOVE
+    //   the matching entry from the cache map
+    // - keep track of any entries in the index MISSING from the cache map, and vice-versa
+    // - obviously, track any entries where the hash or lamports are different
+
+    eprintln!("brooks DEBUG: parsing and sorting cache files...");
+    let cache_files = get_cache_files_in(accounts_hash_cache_dir_path)
+        .map_err(|err| format!("failed to get cache files: {err}"))?;
+
+    // iterate oldest to newest
+    // add entries to 'newest' map
+    // if there was already an entry, it is older, so add it to the 'older' map
+    // at the end, 'newest' will be correct, and the last element of each 'older' vec is the relative newest
+    eprintln!("brooks DEBUG: scanning cache files...");
+    let mut cache_newest = HashMap::<_, (_, _, _)>::default();
+    let mut cache_older = HashMap::<_, Vec<_>>::default();
+    for (i, cache_file) in cache_files.iter().enumerate() {
+        eprintln!(
+            "brooks DEBUG: scanning file {} of {}, '{}'...",
+            i + 1,
+            cache_files.len(),
+            cache_file.path.display(),
+        );
+        let (reader, header) = open_file(&cache_file.path, false).map_err(|err| {
+            format!(
+                "failed to open accounts hash cache file '{}': {err}",
+                cache_file.path.display(),
+            )
+        })?;
+        scan_file(reader, header.count, |entry| {
+            let old_value = cache_newest.insert(
+                entry.pubkey,
+                (
+                    entry.hash,
+                    entry.lamports,
+                    cache_file.parsed.slot_range_start..cache_file.parsed.slot_range_end,
+                ),
+            );
+            if let Some(old_value) = old_value {
+                cache_older.entry(entry.pubkey).or_default().push(old_value);
+            }
+        })?;
+    }
+
+    // stream through the index file and compare with the cache entries
+
+    let file = File::open(failed_index_file_path).unwrap();
+    let mut reader = BufReader::new(file);
+
+    #[derive(Debug, Copy, Clone)]
+    struct FailedIndexFileEntry {
+        pubkey: Pubkey,
+        lamports: u64,
+        hash: AccountHash,
+        _slot: Slot,
+    }
+
+    eprintln!("brooks DEBUG: scanning index file...");
+    let mut mismatches = Vec::new();
+    let mut missing_from_cache_newest = Vec::new();
+    let mut found_in_cache_older = Vec::new();
+    let mut count = Saturating(0);
+    let mut line = String::with_capacity(1024); // big enough for one line, hopefully
+    loop {
+        line.clear();
+        let num_bytes = match reader.read_line(&mut line) {
+            Ok(num_bytes) => num_bytes,
+            Err(err) => {
+                eprintln!("Failed to read from the index file: {err}");
+                break;
+            }
+        };
+        if num_bytes == 0 {
+            // we've hit the end of the file
+            break;
+        }
+
+        let get_entry = || {
+            let mut line_iter = line.split_whitespace();
+            let pubkey_str = line_iter.next()?;
+            let lamports_str = line_iter.next()?;
+            let hash_str = line_iter.next()?;
+            let slot_str = line_iter.next()?;
+
+            Some(FailedIndexFileEntry {
+                pubkey: Pubkey::from_str(pubkey_str).ok()?,
+                lamports: u64::from_str(lamports_str).ok()?,
+                hash: AccountHash(Hash::from_str(hash_str).ok()?),
+                _slot: Slot::from_str(slot_str).ok()?,
+            })
+        };
+        let Some(entry) = get_entry() else {
+            eprintln!("failed to parse line {count}: '{line}'! continuing...");
+            continue;
+        };
+
+        // check if this pubkey is in the 'newest', and has the same values
+
+        if let Some(cache_value) = cache_newest.remove(&entry.pubkey) {
+            // this pubkey *was* found in the cache
+
+            if cache_value.0 == entry.hash && cache_value.1 == entry.lamports {
+                // match! nothing more to do
+            } else {
+                // mismatch! check if there's a match in 'oldest'??
+                eprintln!("brooks DEBUG: mismatch! index: {entry:?}, cache: {cache_value:?}");
+                let older_cache_values = cache_older.get(&entry.pubkey);
+                if let Some(older_cache_values) = older_cache_values {
+                    for older_cache_value in older_cache_values {
+                        if older_cache_value.0 == entry.hash
+                            && older_cache_value.1 == entry.lamports
+                        {
+                            // match in older cache values!
+                            // this means the cache picked the wrong version of the account to use??
+                            found_in_cache_older.push(entry);
+                        } else {
+                            // no match; this is what we "expect" (ish?)
+                        }
+                    }
+                }
+                mismatches.push((entry, cache_value));
+            }
+        } else {
+            // not in the newest
+            // assert not in oldest
+            eprintln!("brooks DEBUG: missing! index: {entry:?}");
+            assert!(!cache_older.contains_key(&entry.pubkey));
+            missing_from_cache_newest.push(entry);
+        }
+
+        count += 1;
+    }
+
+    // at the end, print out what's left
+    // - anything still in cache_newest *was not in the index*! weird!
+    // - found in cache older: picked the wrong version of the account to use?? weird!
+    // - missing from cache newest: cache didn't have the account at all?? bad!
+    // - mismatches: most likely? also bad!
+
+    println!("Done! Total index entries: {count}");
+
+    println!("Entries found in cache_older: {}", cache_older.len());
+    for (i, older_cache_entries) in cache_older.iter().enumerate() {
+        println!(
+            "{i}: len {}, {older_cache_entries:?}",
+            older_cache_entries.1.len(),
+        );
+    }
+
+    println!(
+        "Entries still remaining in cache_newest: {}",
+        cache_newest.len(),
+    );
+    for (i, cache_entry) in cache_newest.iter().enumerate() {
+        println!("{i}: {cache_entry:?}");
+    }
+
+    println!(
+        "Entries missing from cache_newest: {}",
+        missing_from_cache_newest.len(),
+    );
+    for (i, missing_entry) in missing_from_cache_newest.into_iter().enumerate() {
+        println!("{i}: {missing_entry:?}")
+    }
+
+    println!("Mismatched entries: {}", mismatches.len());
+    for (i, mismatched_entry) in mismatches.into_iter().enumerate() {
+        println!(
+            "{i}: index entry: {:?}, cache entry: {:?}",
+            mismatched_entry.0, mismatched_entry.1,
+        );
+    }
+
+    Ok(())
 }
