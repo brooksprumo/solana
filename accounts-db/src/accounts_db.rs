@@ -7301,7 +7301,7 @@ impl AccountsDb {
                 ancestors: Some(ancestors),
                 epoch_schedule,
                 rent_collector,
-                store_detailed_debug_info_on_failure: false,
+                store_detailed_debug_info_on_failure: true,
             },
             expected_capitalization,
         );
