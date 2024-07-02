@@ -683,11 +683,18 @@ fn cmd_brooks(
     let mut count = Saturating(0);
     let mut line = String::with_capacity(1024); // big enough for one line, hopefully
     loop {
-        line.truncate(0);
-        let Ok(_num_bytes) = reader.read_line(&mut line) else {
-            // we've (probably) hit the expected end of the file
-            break;
+        line.clear();
+        let num_bytes = match reader.read_line(&mut line) {
+            Ok(num_bytes) => num_bytes,
+            Err(err) => {
+                eprintln!("Failed to read from the index file: {err}");
+                break;
+            }
         };
+        if num_bytes == 0 {
+            // we've hit the end of the file
+            break;
+        }
 
         let get_entry = || {
             let mut line_iter = line.split_whitespace();
