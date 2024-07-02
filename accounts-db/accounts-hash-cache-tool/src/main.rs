@@ -689,17 +689,23 @@ fn cmd_brooks(
             break;
         };
 
-        let mut line_iter = line.split_whitespace();
-        let pubkey_str = line_iter.next().unwrap();
-        let lamports_str = line_iter.next().unwrap();
-        let hash_str = line_iter.next().unwrap();
-        let slot_str = line_iter.next().unwrap();
+        let get_entry = || {
+            let mut line_iter = line.split_whitespace();
+            let pubkey_str = line_iter.next()?;
+            let lamports_str = line_iter.next()?;
+            let hash_str = line_iter.next()?;
+            let slot_str = line_iter.next()?;
 
-        let entry = FailedIndexFileEntry {
-            pubkey: Pubkey::from_str(pubkey_str).unwrap(),
-            lamports: u64::from_str(lamports_str).unwrap(),
-            hash: AccountHash(Hash::from_str(hash_str).unwrap()),
-            slot: Slot::from_str(slot_str).unwrap(),
+            Some(FailedIndexFileEntry {
+                pubkey: Pubkey::from_str(pubkey_str).ok()?,
+                lamports: u64::from_str(lamports_str).ok()?,
+                hash: AccountHash(Hash::from_str(hash_str).ok()?),
+                slot: Slot::from_str(slot_str).ok()?,
+            })
+        };
+        let Some(entry) = get_entry() else {
+            eprintln!("failed to parse line {count}: '{line}'! continuing...");
+            continue;
         };
 
         // brooks TODO: no error, so do the comparisons
