@@ -613,9 +613,9 @@ fn cmd_brooks(
         let parsed_files = parse_files(&files)?;
         let mut combined: Vec<_> = iter::zip(files, parsed_files).collect();
         combined.sort_unstable_by(|a, b| {
-            b.1.slot_range_start
-                .cmp(&a.1.slot_range_start)
-                .then_with(|| b.1.slot_range_end.cmp(&a.1.slot_range_end))
+            a.1.slot_range_start
+                .cmp(&b.1.slot_range_start)
+                .then_with(|| a.1.slot_range_end.cmp(&b.1.slot_range_end))
         });
         Ok::<_, String>(combined)
     };
