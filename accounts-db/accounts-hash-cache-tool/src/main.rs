@@ -12,7 +12,7 @@ use {
         cmp::Ordering,
         collections::HashMap,
         fs::{self, File},
-        io::{self, BufReader, Read},
+        io::{self, BufRead as _, BufReader, Read},
         iter,
         mem::size_of,
         num::Saturating,
@@ -630,7 +630,13 @@ fn cmd_brooks(
     eprintln!("brooks DEBUG: scanning cache files...");
     let mut cache_newest = HashMap::<_, (_, _, _)>::default();
     let mut cache_older = HashMap::<_, Vec<_>>::default();
-    for cache_file in &cache_files {
+    for (i, cache_file) in cache_files.iter().enumerate() {
+        eprintln!(
+            "brooks DEBUG: scanning file {} of {}, '{}'...",
+            i + 1,
+            cache_files.len(),
+            cache_file.0 .0.display(),
+        );
         let (reader, header) = open_file(&cache_file.0 .0, false).map_err(|err| {
             format!(
                 "failed to open accounts hash cache file '{}': {err}",
@@ -658,7 +664,8 @@ fn cmd_brooks(
     let mut reader = BufReader::new(file);
 
     use solana_accounts_db::accounts_hash::AccountHash;
-    use solana_program::{clock::Slot, pubkey::Pubkey};
+    use solana_program::{clock::Slot, hash::Hash, pubkey::Pubkey};
+    use std::str::FromStr as _;
 
     #[repr(C)]
     #[derive(Debug, Copy, Clone, Pod, Zeroable)]
@@ -674,19 +681,26 @@ fn cmd_brooks(
     let mut missing_from_cache_newest = Vec::new();
     let mut found_in_cache_older = Vec::new();
     let mut count = Saturating(0);
-    let mut entry = FailedIndexFileEntry::zeroed();
+    let mut line = String::with_capacity(1024); // big enough for one line, hopefully
     loop {
-        let result = reader.read_exact(bytemuck::bytes_of_mut(&mut entry));
-        if let Err(err) = result {
-            if err.kind() == io::ErrorKind::UnexpectedEof {
-                // we've (probably) hit the expected end of the file
-                break;
-            } else {
-                return Err(format!(
-                    "failed to read failed index file entry {count}: {err}"
-                ));
-            }
-        }
+        line.truncate(0);
+        let Ok(_num_bytes) = reader.read_line(&mut line) else {
+            // we've (probably) hit the expected end of the file
+            break;
+        };
+
+        let mut line_iter = line.split_whitespace();
+        let pubkey_str = line_iter.next().unwrap();
+        let lamports_str = line_iter.next().unwrap();
+        let hash_str = line_iter.next().unwrap();
+        let slot_str = line_iter.next().unwrap();
+
+        let entry = FailedIndexFileEntry {
+            pubkey: Pubkey::from_str(pubkey_str).unwrap(),
+            lamports: u64::from_str(lamports_str).unwrap(),
+            hash: AccountHash(Hash::from_str(hash_str).unwrap()),
+            slot: Slot::from_str(slot_str).unwrap(),
+        };
 
         // brooks TODO: no error, so do the comparisons
         // check if this pubkey is in the 'newest', and has the same values
