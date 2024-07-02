@@ -708,10 +708,7 @@ fn cmd_brooks(
         if let Some(cache_value) = cache_newest.remove(&entry.pubkey) {
             // this pubkey *was* found in the cache
 
-            if cache_value.0 == entry.hash
-                && cache_value.1 == entry.lamports
-                && cache_value.2.contains(&entry.slot)
-            {
+            if cache_value.0 == entry.hash && cache_value.1 == entry.lamports {
                 // match! nothing more to do
             } else {
                 // mismatch! check if there's a match in 'oldest'??
@@ -721,7 +718,6 @@ fn cmd_brooks(
                     for older_cache_value in older_cache_values {
                         if older_cache_value.0 == entry.hash
                             && older_cache_value.1 == entry.lamports
-                            && older_cache_value.2.contains(&entry.slot)
                         {
                             // match in older cache values!
                             // this means the cache picked the wrong version of the account to use??
