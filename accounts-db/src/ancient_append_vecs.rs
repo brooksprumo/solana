@@ -98,7 +98,7 @@ impl AncientSlotInfos {
             let capacity = storage.accounts.capacity();
             let should_shrink = if capacity > 0 {
                 let alive_ratio = alive_bytes * 100 / capacity;
-                alive_ratio < 90
+                alive_ratio < 50
                     || if can_randomly_shrink && thread_rng().gen_range(0..10000) == 0 {
                         was_randomly_shrunk = true;
                         true
@@ -328,7 +328,7 @@ impl AccountsDb {
             percent_of_alive_shrunk_data: 55,
             ideal_storage_size: NonZeroU64::new(get_ancient_append_vec_capacity()).unwrap(),
             can_randomly_shrink,
-            max_resulting_storages: NonZeroU64::new(10).unwrap(),
+            max_resulting_storages: NonZeroU64::new(10 * 16).unwrap(),
         };
 
         let _guard = self.active_stats.activate(ActiveStatItem::SquashAncient);
@@ -374,10 +374,16 @@ impl AccountsDb {
             .len()
             .saturating_sub(required_ideal_packed);
 
-        let highest_slot = target_slots_sorted[i_last];
+        let lowest_target_slot = target_slots_sorted[i_last];
         many_refs_newest
             .iter()
-            .all(|many| many.slot <= highest_slot)
+            .all(|many| {
+                {// if !(many.slot >= lowest_target_slot) {
+                    log::error!("should move? many.slot: {}, lowest_target_slot: {}, highest_target_slot: {:?}, required ideal: {}", many.slot, lowest_target_slot, target_slots_sorted.last(), required_ideal_packed);
+                }
+                // many.slot >= lowest_target_slot
+                many.slot <= lowest_target_slot
+            })
     }
 
     fn combine_ancient_slots_packed_internal(
@@ -422,6 +428,13 @@ impl AccountsDb {
         many_refs_newest.sort_unstable_by(|a, b| b.slot.cmp(&a.slot));
         metrics.newest_alive_packed_count += many_refs_newest.len();
 
+        log::error!(
+            "ancient pack: highest available slot: {:?}, lowest required slot: {:?}, target slots: {:?}, many_refs_newest: {:?}",
+            accounts_to_combine.target_slots_sorted.last(),
+            many_refs_newest.last().map(|accounts| accounts.slot),
+            accounts_to_combine.target_slots_sorted,
+            many_refs_newest.iter().map(|accounts| accounts.slot).collect::<Vec<_>>(),
+        );
         if !Self::many_ref_accounts_can_be_moved(
             &many_refs_newest,
             &accounts_to_combine.target_slots_sorted,
@@ -440,10 +453,11 @@ impl AccountsDb {
         // pack the accounts with 1 ref or refs > 1 but the slot we're packing is the highest alive slot for the pubkey.
         // Note the `chain` below combining the 2 types of refs.
         let pack = PackedAncientStorage::pack(
-            many_refs_newest.iter().chain(
+            many_refs_newest.iter().rev().chain(
                 accounts_to_combine
                     .accounts_to_combine
                     .iter()
+                    .rev()
                     .map(|shrink_collect| &shrink_collect.alive_accounts.one_ref),
             ),
             tuning.ideal_storage_size,
@@ -604,6 +618,7 @@ impl AccountsDb {
                 Ordering::Relaxed,
             );
 
+        log::error!("write_one_packed_storages");
         self.thread_pool_clean.install(|| {
             packer.par_iter().for_each(|(target_slot, pack)| {
                 let mut write_ancient_accounts_local = WriteAncientAccounts::default();
@@ -624,6 +639,7 @@ impl AccountsDb {
 
         let mut write_ancient_accounts = write_ancient_accounts.into_inner().unwrap();
 
+        log::error!("write_ancient_accounts_to_same_slot_multiple_refs");
         // write new storages where contents were unable to move because ref_count > 1
         self.write_ancient_accounts_to_same_slot_multiple_refs(
             accounts_to_combine.accounts_keep_slots.values(),
@@ -739,6 +755,14 @@ impl AccountsDb {
             last_slot = Some(info.slot);
 
             let many_refs_old_alive = &mut shrink_collect.alive_accounts.many_refs_old_alive;
+            log::error!(
+                "many_ref_slots: {many_ref_slots:?}, has many ref: {}",
+                !shrink_collect
+                    .alive_accounts
+                    .many_refs_this_is_newest_alive
+                    .accounts
+                    .is_empty()
+            );
             if many_ref_slots == IncludeManyRefSlots::Skip
                 && !shrink_collect
                     .alive_accounts
@@ -754,10 +778,12 @@ impl AccountsDb {
                 }
 
                 if (target_slots_sorted.len() as u64) >= required_packed_slots {
-                    // we have prepared to pack enough normal target slots, that form now on we can safely pack
+                    // we have prepared to pack enough normal target slots, that from now on we can safely pack
                     // any 'many ref' slots.
+                    log::error!("NOT skipping many ref slot: {}, target slots len: {}, required packed slots: {}", shrink_collect.slot, target_slots_sorted.len(), shrink_collect.slot);
                     many_ref_slots = IncludeManyRefSlots::Include;
                 } else {
+                    log::error!("skipping many ref slot: {}", shrink_collect.slot);
                     // Skip this because too few valid slots have been processed so far.
                     // There are 'many ref newest' accounts in this slot. They must be packed into slots that are >= the current slot value.
                     // We require `min_resulting_packed_slots` target slots. If we have not encountered enough slots already without `many ref newest` accounts, then keep trying.
@@ -1094,7 +1120,7 @@ pub const fn get_ancient_append_vec_capacity() -> u64 {
     // combined into large ancient append vec. Too small size of ancient append vec will result in too many ancient append vec
     // memory mapped files. Too big size will make it difficult to clean and shrink them. Hence, we choose approximately
     // 128MB for the ancient append vec size.
-    const RESULT: u64 = 128 * 1024 * 1024;
+    const RESULT: u64 = 128 * 1024 * 1024 / 16;
 
     use crate::append_vec::MAXIMUM_APPEND_VEC_FILE_SIZE;
     const _: () = assert!(
