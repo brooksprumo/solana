@@ -721,7 +721,10 @@ fn cmd_brooks(
         if let Some(cache_value) = cache_newest.remove(&entry.pubkey) {
             // this pubkey *was* found in the cache
 
-            if cache_value.0 == entry.hash && cache_value.1 == entry.lamports {
+            if cache_value.0 == entry.hash
+                && cache_value.1 == entry.lamports
+                && cache_value.2.contains(&entry.slot)
+            {
                 // match! nothing more to do
             } else {
                 // mismatch! check if there's a match in 'oldest'??
