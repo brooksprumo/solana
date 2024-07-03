@@ -693,7 +693,6 @@ fn cmd_brooks(
     eprintln!("brooks DEBUG: scanning index file...");
     let mut mismatches = Vec::new();
     let mut missing_from_cache_newest = Vec::new();
-    let mut found_in_cache_older = Vec::new();
     let mut count = Saturating(0);
     let mut line = String::with_capacity(1024); // big enough for one line, hopefully
     loop {
@@ -739,6 +738,7 @@ fn cmd_brooks(
             } else {
                 // mismatch! check if there's a match in 'oldest'??
                 eprintln!("brooks DEBUG: mismatch! index: {entry:?}, cache: {cache_value:?}");
+                let mut value_found_in_cache_older = None;
                 let older_cache_values = cache_older.get(&entry.pubkey);
                 if let Some(older_cache_values) = older_cache_values {
                     for older_cache_value in older_cache_values {
@@ -747,13 +747,14 @@ fn cmd_brooks(
                         {
                             // match in older cache values!
                             // this means the cache picked the wrong version of the account to use??
-                            found_in_cache_older.push(entry);
+                            eprintln!("brooks DEBUG: found in older cache! older cache value: {older_cache_value:?}");
+                            value_found_in_cache_older = Some(older_cache_value);
                         } else {
                             // no match; this is what we "expect" (ish?)
                         }
                     }
                 }
-                mismatches.push((entry, cache_value));
+                mismatches.push((entry, cache_value, value_found_in_cache_older));
             }
         } else {
             // not in the newest
@@ -801,8 +802,8 @@ fn cmd_brooks(
     println!("Mismatched entries: {}", mismatches.len());
     for (i, mismatched_entry) in mismatches.into_iter().enumerate() {
         println!(
-            "{i}: index entry: {:?}, cache entry: {:?}",
-            mismatched_entry.0, mismatched_entry.1,
+            "{i}: index entry: {:?}, cache entry: {:?}, correct value in older cache: {:?}",
+            mismatched_entry.0, mismatched_entry.1, mismatched_entry.2,
         );
     }
 
