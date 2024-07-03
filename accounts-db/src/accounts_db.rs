@@ -6842,7 +6842,7 @@ impl AccountsDb {
         collect.stop();
 
         use std::io::Write;
-        let dump = if config.store_detailed_debug_info_on_failure {
+        let mut dump = if config.store_detailed_debug_info_on_failure {
             // this path executes when we are failing with a hash mismatch
             let failed_file = PathBuf::new()
                 .join("~")
@@ -6959,7 +6959,8 @@ impl AccountsDb {
                                                     loaded_account.pubkey(),
                                                     loaded_account.lamports(),
                                                     loaded_hash.0,
-                                                );
+                                                )
+                                                .unwrap();
                                             }
                                             sum += balance as u128;
 
@@ -7416,7 +7417,7 @@ impl AccountsDb {
                 ancestors: Some(ancestors),
                 epoch_schedule,
                 rent_collector,
-                store_detailed_debug_info_on_failure: false,
+                store_detailed_debug_info_on_failure: true,
             },
             expected_capitalization,
         );
