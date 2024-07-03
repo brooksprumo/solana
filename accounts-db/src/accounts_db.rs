@@ -6841,6 +6841,20 @@ impl AccountsDb {
             .collect();
         collect.stop();
 
+        use std::io::Write;
+        let dump = if config.store_detailed_debug_info_on_failure {
+            // this path executes when we are failing with a hash mismatch
+            let failed_file = PathBuf::new()
+                .join("~")
+                .join("failed_calculate_accounts_hash_from_index")
+                .join(max_slot.to_string());
+            _ = std::fs::remove_dir_all(&failed_file);
+
+            std::fs::File::create(failed_file).ok()
+        } else {
+            None
+        };
+
         // Pick a chunk size big enough to allow us to produce output vectors that are smaller than the overall size.
         // We'll also accumulate the lamports within each chunk and fewer chunks results in less contention to accumulate the sum.
         let chunks = crate::accounts_hash::MERKLE_FANOUT.pow(4);
@@ -6885,6 +6899,70 @@ impl AccountsDb {
                                                 loaded_hash = computed_hash;
                                             }
                                             sum += balance as u128;
+
+                                            loaded_hash.0
+                                        })
+                                    },
+                                )
+                                .flatten()
+                        })
+                        .collect();
+                    let mut total = total_lamports.lock().unwrap();
+                    *total = AccountsHasher::checked_cast_for_capitalization(*total as u128 + sum);
+                    account_hashes
+                })
+                .collect()
+        };
+
+        let get_account_hashes_single_thread = || {
+            keys.chunks(chunks)
+                .map(|pubkeys| {
+                    let mut sum = 0u128;
+                    let account_hashes: Vec<Hash> = pubkeys
+                        .iter()
+                        .filter_map(|pubkey| {
+                            let index_entry = self.accounts_index.get_cloned(pubkey)?;
+                            self.accounts_index
+                                .get_account_info_with_and_then(
+                                    &index_entry,
+                                    config.ancestors,
+                                    Some(max_slot),
+                                    |(slot, account_info)| {
+                                        if account_info.is_zero_lamport() {
+                                            return None;
+                                        }
+                                        self.get_account_accessor(
+                                            slot,
+                                            pubkey,
+                                            &account_info.storage_location(),
+                                        )
+                                        .get_loaded_account(|loaded_account| {
+                                            let mut loaded_hash = loaded_account.loaded_hash();
+                                            let balance = loaded_account.lamports();
+                                            let hash_is_missing =
+                                                loaded_hash == AccountHash(Hash::default());
+                                            if hash_is_missing {
+                                                let computed_hash = Self::hash_account_data(
+                                                    loaded_account.lamports(),
+                                                    loaded_account.owner(),
+                                                    loaded_account.executable(),
+                                                    loaded_account.rent_epoch(),
+                                                    loaded_account.data(),
+                                                    loaded_account.pubkey(),
+                                                );
+                                                loaded_hash = computed_hash;
+                                            }
+                                            if let Some(ref mut dump) = dump {
+                                                writeln!(
+                                                    dump,
+                                                    "{} {} {}",
+                                                    loaded_account.pubkey(),
+                                                    loaded_account.lamports(),
+                                                    loaded_hash.0,
+                                                );
+                                            }
+                                            sum += balance as u128;
+
                                             loaded_hash.0
                                         })
                                     },
@@ -6900,7 +6978,12 @@ impl AccountsDb {
         };
 
         let mut scan = Measure::start("scan");
-        let account_hashes: Vec<Vec<Hash>> = self.thread_pool_clean.install(get_account_hashes);
+        let account_hashes: Vec<Vec<Hash>> = if config.store_detailed_debug_info_on_failure {
+            self.thread_pool_clean
+                .install(get_account_hashes_single_thread)
+        } else {
+            self.thread_pool_clean.install(get_account_hashes)
+        };
         scan.stop();
 
         let total_lamports = *total_lamports.lock().unwrap();
