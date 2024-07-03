@@ -911,7 +911,7 @@ fn bank_to_full_snapshot_archive_with(
     bank.force_flush_accounts_cache();
     bank.clean_accounts(Some(bank.slot()));
     let calculated_accounts_hash =
-        bank.update_accounts_hash(CalcAccountsHashDataSource::Storages, false, false);
+        bank.update_accounts_hash(CalcAccountsHashDataSource::Storages, true, false);
 
     let snapshot_storages = bank.get_snapshot_storages(None);
     let status_cache_slot_deltas = bank.status_cache.read().unwrap().root_slot_deltas();

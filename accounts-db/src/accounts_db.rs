@@ -592,7 +592,7 @@ pub struct AccountsAddRootTiming {
     pub store_us: u64,
 }
 
-const ANCIENT_APPEND_VEC_DEFAULT_OFFSET: Option<i64> = Some(-10_000);
+const ANCIENT_APPEND_VEC_DEFAULT_OFFSET: Option<i64> = Some(300_000);
 
 #[derive(Debug, Default, Clone)]
 pub struct AccountsDbConfig {
@@ -7107,6 +7107,8 @@ impl AccountsDb {
                     bin_range.end,
                     hash
                 );
+                // brooks NOTE: uncomment vvv to always regenerate the cache files
+                // load_from_cache = false;
                 if load_from_cache {
                     if let Ok(mapped_file) =
                         cache_hash_data.get_file_reference_to_map_later(&file_name)
@@ -7295,6 +7297,7 @@ impl AccountsDb {
         let (accounts_hash, total_lamports) =
             self.calculate_accounts_hash_from(data_source, slot, &config);
         if debug_verify {
+            log::error!("calculate_accounts_hash_with_verify_from: doing index");
             // calculate the other way (store or non-store) and verify results match.
             let data_source_other = match data_source {
                 CalcAccountsHashDataSource::IndexForTests => CalcAccountsHashDataSource::Storages,
@@ -7333,7 +7336,7 @@ impl AccountsDb {
                 ancestors: Some(ancestors),
                 epoch_schedule,
                 rent_collector,
-                store_detailed_debug_info_on_failure: false,
+                store_detailed_debug_info_on_failure: true,
             },
             expected_capitalization,
         );
@@ -7541,6 +7544,7 @@ impl AccountsDb {
             let failed_dir = accounts_hash_cache_path
                 .join("failed_calculate_accounts_hash_cache")
                 .join(slot.to_string());
+            log::error!("removing all: {:?}", failed_dir);
             _ = std::fs::remove_dir_all(&failed_dir);
             failed_dir
         };
