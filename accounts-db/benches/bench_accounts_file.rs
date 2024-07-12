@@ -194,13 +194,39 @@ fn bench_scan_pubkeys(c: &mut Criterion) {
                 assert_eq!(count, accounts_count);
             });
         });
-        group.bench_function(BenchmarkId::new("append_vec_file", accounts_count), |b| {
-            b.iter(|| {
-                let mut count = 0;
-                append_vec_file.scan_pubkeys(|_| count += 1);
-                assert_eq!(count, accounts_count);
-            });
-        });
+
+        use crate::append_vec::{self, AppendVecFileBacking, SCAN_BUFFER_SIZE};
+        for buffer_size in [
+            4096,
+            64 * 1024,
+            128 * 1024,
+            SCAN_BUFFER_SIZE_WITHOUT_DATA,
+            1 * 1024 * 1024,
+            10 * 1024 * 1024,
+            SCAN_BUFFER_SIZE,
+        ] {
+            group.bench_function(
+                BenchmarkId::new(
+                    "append_vec_file",
+                    format!("accounts_{accounts_count}_buffer_{buffer_size}"),
+                ),
+                |b| {
+                    b.iter(|| {
+                        if let AppendVecFileBacking::File(file) = &append_vec_file.backing {
+                            let mut count = 0;
+                            append_vec::file_scan_pubkeys_with(
+                                file,
+                                buffer_size,
+                                append_vec_file.len(),
+                                |_| count += 1,
+                            );
+                            assert_eq!(count, accounts_count);
+                        }
+                    });
+                },
+            );
+        }
+
         group.bench_function(BenchmarkId::new("hot_storage", accounts_count), |b| {
             b.iter(|| {
                 let mut count = 0;
