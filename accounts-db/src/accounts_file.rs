@@ -77,8 +77,24 @@ impl AccountsFile {
         current_len: usize,
         storage_access: StorageAccess,
     ) -> Result<(Self, usize)> {
-        let (av, num_accounts) = AppendVec::new_from_file(path, current_len, storage_access)?;
-        Ok((Self::AppendVec(av), num_accounts))
+        let path = path.into();
+        match TieredStorage::new_readonly(path.clone()) {
+            Ok(tiered_storage) => {
+                // we are doing unwrap here because TieredStorage::new_readonly() is
+                // guaranteed to have a valid reader instance when opening with
+                // new_readonly.
+                let num_accounts = tiered_storage.reader().unwrap().num_accounts();
+                Ok((Self::TieredStorage(tiered_storage), num_accounts))
+            }
+            Err(TieredStorageError::MagicNumberMismatch(_, _)) => {
+                // In case of MagicNumberMismatch, we can assume that this is not
+                // a tiered-storage file.
+                let (append_vec, num_accounts) =
+                    AppendVec::new_from_file(path, current_len, storage_access)?;
+                Ok((Self::AppendVec(append_vec), num_accounts))
+            }
+            Err(e) => Err(AccountsFileError::TieredStorageError(e)),
+        }
     }
 
     /// true if this storage can possibly be appended to (independent of capacity check)
@@ -304,8 +320,8 @@ impl AccountsFile {
 /// An enum that creates AccountsFile instance with the specified format.
 #[derive(Debug, Default, Copy, Clone, Eq, PartialEq)]
 pub enum AccountsFileProvider {
-    #[default]
     AppendVec,
+    #[default]
     HotStorage,
 }
 
