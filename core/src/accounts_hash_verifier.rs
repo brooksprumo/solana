@@ -355,6 +355,58 @@ impl AccountsHashVerifier {
             assert_eq!(expected_hash, accounts_hash);
         };
 
+        // brooks NOTE: if EAH, then backup the accounts hash cache data files
+        if accounts_package.package_kind == AccountsPackageKind::EpochAccountsHash {
+            error!("brooks DEBUG: just finished EAH calculation. Backing up cache files and snapshot now...");
+            error!("brooks DEBUG: EAH: {accounts_hash:?}, capitalization: {lamports}, slot: {}, block: {}", accounts_package.slot, accounts_package.block_height);
+
+            use solana_runtime::{
+                snapshot_archive_info::SnapshotArchiveInfoGetter, snapshot_utils,
+            };
+            use std::fs;
+            use std::path::Path;
+
+            let backup_dir = Path::new("~/eah_hash_cache").join(accounts_package.slot.to_string());
+            fs::create_dir_all(&backup_dir).unwrap();
+
+            let mut cache_files = Vec::new();
+            let cache_dir = Path::new("~/ledger/accounts_hash_cache");
+            let entries = fs::read_dir(cache_dir).unwrap();
+            for entry in entries {
+                let path = entry.unwrap().path();
+                if path.is_file() {
+                    cache_files.push(path);
+                }
+            }
+
+            // backup the cache files
+            for cache_file in cache_files {
+                let file_name: &Path = cache_file.file_name().unwrap().as_ref();
+                let backup_file = backup_dir.join(file_name);
+                error!(
+                    "brooks DEBUG: backup EAH hash cache file from '{}' to '{}'...",
+                    cache_file.display(),
+                    backup_file.display(),
+                );
+                fs::hard_link(&cache_file, &backup_file).unwrap();
+            }
+
+            // backup the latest full snapshot too
+            let highest_full_snapshot =
+                snapshot_utils::get_highest_full_snapshot_archive_info("~/ledger").unwrap();
+            let full_snapshot_file_name: &Path =
+                highest_full_snapshot.path().file_name().unwrap().as_ref();
+            let backup_snapshot_path = backup_dir.join(full_snapshot_file_name);
+            error!(
+                "brooks DEBUG: backup full snapshot too, from '{}' to '{}'...",
+                highest_full_snapshot.path().display(),
+                backup_snapshot_path.display(),
+            );
+            fs::hard_link(highest_full_snapshot.path(), &backup_snapshot_path).unwrap();
+
+            error!("brooks DEBUG: just finished EAH calculation. Backing up cache files and snapshot now... DONE");
+        }
+
         datapoint_info!(
             "accounts_hash_verifier",
             ("calculate_hash", measure_hash_us, i64),
