@@ -427,6 +427,8 @@ impl AccountsHashVerifier {
                 .accounts_db
                 .epoch_accounts_hash_manager
                 .set_valid(accounts_hash.into(), accounts_package.slot);
+            error!("brooks DEBUG: stopping after EAH");
+            std::process::exit(-1);
         }
     }
 
