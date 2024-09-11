@@ -182,6 +182,7 @@ use {
         ops::{AddAssign, RangeFull, RangeInclusive},
         path::PathBuf,
         slice,
+        str::FromStr as _,
         sync::{
             atomic::{
                 AtomicBool, AtomicI64, AtomicU64, AtomicUsize,
@@ -4225,7 +4226,13 @@ impl Bank {
                 .accounts_db
                 .test_skip_rewrites_but_include_in_bank_hash;
         let mut skipped_rewrites = Vec::default();
+        let pubkey_of_interest =
+            Pubkey::from_str("3PXHNPzHejsKzy7A5gFzuLyZ2zH54KAdGRjC5u2qqzxd").unwrap();
         for (pubkey, account, _loaded_slot) in accounts.iter_mut() {
+            let is_pubkey_of_interest = pubkey == &pubkey_of_interest;
+            if is_pubkey_of_interest {
+                error!("brooks DEBUG: collect_rent_from_accounts() slot {}, before rent collection {pubkey}: {account:?}", self.slot());
+            }
             let (rent_collected_info, collect_rent_us) = measure_us!(collect_rent_from_account(
                 &self.feature_set,
                 &self.rent_collector,
@@ -4271,6 +4278,9 @@ impl Bank {
                 }
                 total_rent_collected_info += rent_collected_info;
                 accounts_to_store.push((pubkey, account));
+                if is_pubkey_of_interest {
+                    error!("brooks DEBUG: collect_rent_from_accounts() slot {}, after rent collection, do rewrite {pubkey}: {account:?}", self.slot());
+                }
             } else if test_skip_rewrites_but_include_hash_in_bank_hash {
                 // include rewrites that we skipped in the accounts delta hash.
                 // This is what consensus requires prior to activation of bank_hash_skips_rent_rewrites.
@@ -4278,6 +4288,9 @@ impl Bank {
                 // feature is enabled.
                 let hash = AccountsDb::hash_account(account, pubkey);
                 skipped_rewrites.push((*pubkey, hash));
+                if is_pubkey_of_interest {
+                    error!("brooks DEBUG: collect_rent_from_accounts() slot {}, after rent collection, SKIP rewrite {pubkey}: {account:?}", self.slot());
+                }
             }
             rent_debits.insert(pubkey, rent_collected_info.rent_amount, account.lamports());
         }
