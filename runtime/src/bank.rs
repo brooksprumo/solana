@@ -4233,6 +4233,7 @@ impl Bank {
             if is_pubkey_of_interest {
                 error!("brooks DEBUG: collect_rent_from_accounts() slot {}, before rent collection {pubkey}: {account:?}", self.slot());
             }
+            let rent_epoch_pre = account.rent_epoch();
             let (rent_collected_info, collect_rent_us) = measure_us!(collect_rent_from_account(
                 &self.feature_set,
                 &self.rent_collector,
@@ -4240,6 +4241,7 @@ impl Bank {
                 account
             ));
             time_collecting_rent_us += collect_rent_us;
+            let rent_epoch_post = account.rent_epoch();
 
             // only store accounts where we collected rent
             // but get the hash for all these accounts even if collected rent is 0 (= not updated).
@@ -4247,7 +4249,9 @@ impl Bank {
             // ensures we verify the whole on-chain state (= all accounts)
             // via the bank delta hash slowly once per an epoch.
             if (!can_skip_rewrites && !test_skip_rewrites_but_include_hash_in_bank_hash)
-                || !Self::skip_rewrite(rent_collected_info.rent_amount, account)
+                //|| !Self::skip_rewrite(rent_collected_info.rent_amount, account)
+                || rent_collected_info.rent_amount != 0
+                    || rent_epoch_post != rent_epoch_pre
             {
                 if rent_collected_info.rent_amount > 0 {
                     if let Some(rent_paying_pubkeys) = rent_paying_pubkeys {
