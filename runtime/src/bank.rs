@@ -3902,10 +3902,16 @@ impl Bank {
                 &maybe_transaction_refs,
                 &processing_results,
             );
-            self.rc.accounts.store_cached(
+
+            // brooks NOTE: create dummy accounts
+            let dummy_lamports = self.rc.accounts.store_cached(
                 (self.slot(), accounts_to_store.as_slice()),
                 transactions.as_deref(),
+                &self.ancestors,
             );
+            if let Some(dummy_lamports) = dummy_lamports {
+                self.capitalization.fetch_add(dummy_lamports, Relaxed);
+            }
         });
 
         self.collect_rent(&processing_results);

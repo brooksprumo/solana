@@ -1521,6 +1521,9 @@ pub struct AccountsDb {
 
     /// The latest full snapshot slot dictates how to handle zero lamport accounts
     latest_full_snapshot_slot: SeqLock<Option<Slot>>,
+
+    /// Extra dummy accounts created
+    pub dummies: DashMap<Pubkey, Vec<Pubkey>>,
 }
 
 #[derive(Debug, Default)]
@@ -2554,6 +2557,7 @@ impl AccountsDb {
             epoch_accounts_hash_manager: EpochAccountsHashManager::new_invalid(),
             test_skip_rewrites_but_include_in_bank_hash: false,
             latest_full_snapshot_slot: SeqLock::new(None),
+            dummies: DashMap::default(),
         }
     }
 
@@ -9423,6 +9427,27 @@ impl AccountsDb {
                 entry.accounts.len(),
                 entry.accounts.capacity(),
             );
+        }
+    }
+
+    pub fn maybe_throttle_add(&self) {
+        loop {
+            let accounts = self
+                .accounts_index
+                .account_maps
+                .first()
+                .unwrap()
+                .stats()
+                .count_in_mem
+                .load(Ordering::Relaxed);
+            if accounts > 100_000_000 || self.epoch_accounts_hash_manager.is_waiting() {
+                sleep(Duration::from_millis(10));
+                if accounts > 200_000_000 {
+                    // stall while we are bigger than 200M accounts here
+                    continue;
+                }
+            }
+            break;
         }
     }
 }

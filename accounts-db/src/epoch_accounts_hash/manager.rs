@@ -1,7 +1,10 @@
 use {
     super::EpochAccountsHash,
     solana_sdk::clock::Slot,
-    std::sync::{Condvar, Mutex},
+    std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Condvar, Mutex,
+    },
 };
 
 /// Manage the epoch accounts hash
@@ -14,6 +17,8 @@ pub struct Manager {
     state: Mutex<State>,
     /// This condition variable is used to wait for an in-flight EAH calculation to complete
     cvar: Condvar,
+    /// brooks NOTE: used when adding dummy accounts
+    is_waiting: AtomicBool,
 }
 
 impl Manager {
@@ -22,6 +27,7 @@ impl Manager {
         Self {
             state: Mutex::new(state),
             cvar: Condvar::new(),
+            is_waiting: false.into(),
         }
     }
 
@@ -68,7 +74,11 @@ impl Manager {
         loop {
             match &*state {
                 State::Valid(epoch_accounts_hash, _slot) => break *epoch_accounts_hash,
-                State::InFlight(_slot) => state = self.cvar.wait(state).unwrap(),
+                State::InFlight(_slot) => {
+                    self.is_waiting.store(true, Ordering::Release);
+                    state = self.cvar.wait(state).unwrap();
+                    self.is_waiting.store(false, Ordering::Release);
+                }
                 State::Invalid => panic!("The epoch accounts hash cannot be awaited when Invalid!"),
             }
         }
@@ -83,6 +93,10 @@ impl Manager {
             State::Valid(epoch_accounts_hash, _slot) => Some(*epoch_accounts_hash),
             _ => None,
         }
+    }
+
+    pub fn is_waiting(&self) -> bool {
+        self.is_waiting.load(Ordering::Acquire)
     }
 }
 
