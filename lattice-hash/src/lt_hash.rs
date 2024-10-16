@@ -40,6 +40,18 @@ impl LtHash {
         }
     }
 
+    #[inline]
+    pub fn simd_mix_in(&mut self, other: &Self) {
+        use std::simd::u16x64;
+        self.0
+            .array_chunks_mut::<64>()
+            .zip(other.0.array_chunks::<64>())
+            .for_each(|(a, b)| {
+                let tmp = u16x64::from_array(*a) + u16x64::from_array(*b);
+                *a = tmp.to_array();
+            });
+    }
+
     /// Mixes `other` out of `self`
     ///
     /// This can be thought of as akin to 'remove'
@@ -47,6 +59,18 @@ impl LtHash {
         for i in 0..self.0.len() {
             self.0[i] = self.0[i].wrapping_sub(other.0[i]);
         }
+    }
+
+    #[inline]
+    pub fn simd_mix_out(&mut self, other: &Self) {
+        use std::simd::u16x64;
+        self.0
+            .array_chunks_mut::<64>()
+            .zip(other.0.array_chunks::<64>())
+            .for_each(|(a, b)| {
+                let tmp = u16x64::from_array(*a) - u16x64::from_array(*b);
+                *a = tmp.to_array();
+            });
     }
 
     /// Computes a checksum of the LtHash
@@ -107,7 +131,7 @@ mod tests {
     impl Add for LtHash {
         type Output = Self;
         fn add(mut self, rhs: Self) -> Self {
-            self.mix_in(&rhs);
+            self.simd_mix_in(&rhs);
             self
         }
     }
@@ -115,7 +139,7 @@ mod tests {
     impl Sub for LtHash {
         type Output = Self;
         fn sub(mut self, rhs: Self) -> Self {
-            self.mix_out(&rhs);
+            self.simd_mix_out(&rhs);
             self
         }
     }

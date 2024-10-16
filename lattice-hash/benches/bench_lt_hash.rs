@@ -21,6 +21,16 @@ fn bench_mix_in(c: &mut Criterion) {
     });
 }
 
+fn bench_simd_mix_in(c: &mut Criterion) {
+    let mut rng = ChaChaRng::seed_from_u64(11);
+    let mut lt_hash1 = new_random_lt_hash(&mut rng);
+    let lt_hash2 = new_random_lt_hash(&mut rng);
+
+    c.bench_function("simd_mix_in", |b| {
+        b.iter(|| lt_hash1.simd_mix_in(&lt_hash2));
+    });
+}
+
 fn bench_mix_out(c: &mut Criterion) {
     let mut rng = ChaChaRng::seed_from_u64(22);
     let mut lt_hash1 = new_random_lt_hash(&mut rng);
@@ -28,6 +38,16 @@ fn bench_mix_out(c: &mut Criterion) {
 
     c.bench_function("mix_out", |b| {
         b.iter(|| lt_hash1.mix_out(&lt_hash2));
+    });
+}
+
+fn bench_simd_mix_out(c: &mut Criterion) {
+    let mut rng = ChaChaRng::seed_from_u64(22);
+    let mut lt_hash1 = new_random_lt_hash(&mut rng);
+    let lt_hash2 = new_random_lt_hash(&mut rng);
+
+    c.bench_function("simd_mix_out", |b| {
+        b.iter(|| lt_hash1.simd_mix_out(&lt_hash2));
     });
 }
 
@@ -53,7 +73,9 @@ fn bench_with(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_mix_in,
+    bench_simd_mix_in,
     bench_mix_out,
+    bench_simd_mix_out,
     bench_checksum,
     bench_with
 );
