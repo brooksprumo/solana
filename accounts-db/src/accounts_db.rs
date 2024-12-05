@@ -115,6 +115,10 @@ use {
     tempfile::TempDir,
 };
 
+lazy_static! {
+    static ref NEEDLES: RwLock<HashSet<Pubkey>> = RwLock::new(HashSet::new());
+}
+
 // when the accounts write cache exceeds this many bytes, we will flush it
 // this can be specified on the command line, too (--accounts-db-cache-limit-mb)
 const WRITE_CACHE_LIMIT_BYTES_DEFAULT: u64 = 15_000_000_000;
@@ -2292,6 +2296,7 @@ impl AccountsDb {
                                 slot_list.len()
                             );
                         }
+                        NEEDLES.write().unwrap().insert(*pubkey);
                     }
 
                     pending_stores.remove(&slot);
@@ -2834,7 +2839,10 @@ impl AccountsDb {
                     let mut should_purge = false;
                     self.accounts_index.scan(
                         [*candidate_pubkey].iter(),
-                        |_candidate_pubkey, slot_list_and_ref_count, _entry| {
+                        |_candidate_pubkey, slot_list_and_ref_count, entry| {
+                            if NEEDLES.read().unwrap().contains(candidate_pubkey) {
+                                error!("brooks DEBUG: clean_accounts() scan candidates, needle: {candidate_pubkey}, slot list ref count: {slot_list_and_ref_count:?}, index entry: {entry:?}");
+                            }
                             let mut useless = true;
                             if let Some((slot_list, ref_count)) = slot_list_and_ref_count {
                                 // find the highest rooted slot in the slot list
