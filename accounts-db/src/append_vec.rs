@@ -190,6 +190,7 @@ impl<'append_vec> ReadableAccount for AppendVecStoredAccountMeta<'append_vec> {
 }
 
 /// info from an entry useful for building an index
+#[derive(Debug)]
 pub(crate) struct IndexInfo {
     /// size of entry, aligned to next u64
     /// This matches the return of `get_account`
@@ -199,6 +200,7 @@ pub(crate) struct IndexInfo {
 }
 
 /// info from an entry useful for building an index
+#[derive(Debug)]
 pub(crate) struct IndexInfoInner {
     /// offset to this entry
     pub offset: usize,

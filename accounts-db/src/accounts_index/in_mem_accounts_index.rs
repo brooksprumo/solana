@@ -132,6 +132,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> Debug for InMemAccoun
     }
 }
 
+#[derive(Debug)]
 pub enum InsertNewEntryResults {
     DidNotExist,
     ExistedNewEntryZeroLamports,
@@ -791,13 +792,21 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
         } else {
             Self::update_stat(&stats.updates_in_mem, 1);
         }
-        if !already_existed {
+        let result = if !already_existed {
             InsertNewEntryResults::DidNotExist
         } else if new_entry_zero_lamports {
             InsertNewEntryResults::ExistedNewEntryZeroLamports
         } else {
             InsertNewEntryResults::ExistedNewEntryNonZeroLamports
+        };
+        let needle = Pubkey::from_str_const("1691SFMiGhHcH96cmTAAFXqFiBN27MkERGNvnfvB8MA");
+        //let needle = Pubkey::from_str_const("11111UcuC2WcKB1aCQNz6DYyaiJBtX5hhdzkUzqRAW");
+        if pubkey == needle {
+            log::error!(
+                "brooks DEBUG: insert_new_entry_if_missing_with_lock() {needle} result: {result:?}"
+            );
         }
+        result
     }
 
     /// Look at the currently held ranges. If 'range' is already included in what is

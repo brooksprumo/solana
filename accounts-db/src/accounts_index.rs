@@ -1749,6 +1749,8 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
 
         let insertion_time = AtomicU64::new(0);
 
+        let needle = Pubkey::from_str_const("1691SFMiGhHcH96cmTAAFXqFiBN27MkERGNvnfvB8MA");
+
         // offset bin processing in the 'binned' array by a random amount.
         // This results in calls to insert_new_entry_if_missing_with_lock from different threads starting at different bins to avoid
         // lock contention.
@@ -1778,6 +1780,9 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
                 items
                     .into_iter()
                     .for_each(|(pubkey, (slot, account_info))| {
+                        if pubkey == needle {
+                            error!("brooks DEBUG: insert_new_if_messing_into_primary_index() no disk, dirty pubkey {needle}: {account_info:?}");
+                        }
                         let new_entry = PreAllocatedAccountMapEntry::new(
                             slot,
                             account_info,

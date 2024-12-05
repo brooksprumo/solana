@@ -8473,9 +8473,14 @@ impl AccountsDb {
         let mut zero_lamport_pubkeys = vec![];
         let mut all_accounts_are_zero_lamports = true;
 
+        let needle = Pubkey::from_str_const("1691SFMiGhHcH96cmTAAFXqFiBN27MkERGNvnfvB8MA");
+
         let (dirty_pubkeys, insert_time_us, mut generate_index_results) = {
             let mut items_local = Vec::default();
             storage.accounts.scan_index(|info| {
+                if info.index_info.pubkey == needle {
+                    error!("brooks DEBUG: generate_index_for_slot() slot: {}, index info for needle: {info:?}", storage.slot());
+                }
                 stored_size_alive += info.stored_size_aligned;
                 if info.index_info.lamports > 0 {
                     accounts_data_len += info.index_info.data_len;
