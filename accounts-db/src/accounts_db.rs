@@ -2920,6 +2920,7 @@ impl AccountsDb {
                         },
                     );
                     if should_purge {
+                        error!("brooks DEBUG: clean_accounts(), scan candidates, collecting reclaims from {candidate_pubkey}");
                         let reclaims_new = self.collect_reclaims(
                             candidate_pubkey,
                             max_clean_root_inclusive,
@@ -2951,6 +2952,10 @@ impl AccountsDb {
         let reclaims = reclaims.into_inner().unwrap();
         let mut pubkeys_removed_from_accounts_index =
             pubkeys_removed_from_accounts_index.into_inner().unwrap();
+
+        error!("brooks DEBUG: clean_accounts() reclaims: {reclaims:?}");
+        error!("brooks DEBUG: clean_accounts() pubkeys removed from accounts index: {pubkeys_removed_from_accounts_index:?}");
+
         let mut clean_old_rooted = Measure::start("clean_old_roots");
         let (purged_account_slots, removed_accounts) =
             self.clean_accounts_older_than_root(&reclaims, &pubkeys_removed_from_accounts_index);
