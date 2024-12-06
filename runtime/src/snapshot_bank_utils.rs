@@ -227,9 +227,11 @@ pub fn bank_from_snapshot_archives(
     let mut i = 0;
     loop {
         error!("brooks DEBUG: looping clean and shrink, iteration: {i}...");
+        error!("brooks DEBUG: CLEAN...");
         bank.clean_accounts();
-        panic!("brooks DEBUG: done");
+        error!("brooks DEBUG: SHRINK...");
         bank.shrink_candidate_slots();
+        panic!("brooks DEBUG: done");
         i += 1;
     }
 

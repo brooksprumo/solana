@@ -2823,7 +2823,7 @@ impl AccountsDb {
         self.accounts_index.scan(
             pubkeys_in_oldest_dirty_storage.iter(),
             |pubkey, slot_list_and_ref_count, entry| {
-                error!("brooks DEBUG: clean_accounts() accounts in oldest dirty storage! slot: {min_dirty_slot:?}, {pubkey}, slot list and ref count: {slot_list_and_ref_count:?}, entry: {entry:?}");
+                error!("brooks DEBUG: clean_accounts() accounts in oldest dirty storage BEFORE! slot: {min_dirty_slot:?}, {pubkey}, slot list and ref count: {slot_list_and_ref_count:?}, entry: {entry:?}");
                 AccountsIndexScanResult::OnlyKeepInMemoryIfDirty
             },
             None,
@@ -2940,7 +2940,7 @@ impl AccountsDb {
                         },
                     );
                     if should_purge {
-                        error!("brooks DEBUG: clean_accounts(), scan candidates, collecting reclaims from {candidate_pubkey}");
+                        //error!("brooks DEBUG: clean_accounts(), scan candidates, collecting reclaims from {candidate_pubkey}");
                         let reclaims_new = self.collect_reclaims(
                             candidate_pubkey,
                             max_clean_root_inclusive,
@@ -3113,6 +3113,17 @@ impl AccountsDb {
             NEEDLES.read().unwrap().iter(),
             |needle, slot_list_and_ref_count, entry| {
                 error!("brooks DEBUG: clean_accounts() needles! {needle}, slot list and ref count: {slot_list_and_ref_count:?}, entry: {entry:?}");
+                AccountsIndexScanResult::OnlyKeepInMemoryIfDirty
+            },
+            None,
+            true,
+            ScanFilter::All,
+        );
+
+        self.accounts_index.scan(
+            pubkeys_in_oldest_dirty_storage.iter(),
+            |pubkey, slot_list_and_ref_count, entry| {
+                error!("brooks DEBUG: clean_accounts() accounts in oldest dirty storage AFTER! slot: {min_dirty_slot:?}, {pubkey}, slot list and ref count: {slot_list_and_ref_count:?}, entry: {entry:?}");
                 AccountsIndexScanResult::OnlyKeepInMemoryIfDirty
             },
             None,

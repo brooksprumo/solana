@@ -377,7 +377,6 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
                     return callback(None).1;
                 }
                 let disk_entry = disk_entry.unwrap();
-                log::error!("brooks DEBUG: in-mem index get_internal() in disk index??? {pubkey}: {disk_entry:?}");
                 let mut map = self.map_internal.write().unwrap();
                 let entry = map.entry(*pubkey);
                 match entry {
