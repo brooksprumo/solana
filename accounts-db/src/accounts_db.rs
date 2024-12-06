@@ -3083,6 +3083,18 @@ impl AccountsDb {
         reclaims_time.stop();
         measure_all.stop();
 
+        // brooks DEBUG
+        self.accounts_index.scan(
+            NEEDLES.read().unwrap().iter(),
+            |needle, slot_list_and_ref_count, entry| {
+                error!("brooks DEBUG: clean_accounts() needles! {needle}, slot list and ref count: {slot_list_and_ref_count:?}, entry: {entry:?}");
+                AccountsIndexScanResult::OnlyKeepInMemoryIfDirty
+            },
+            None,
+            true,
+            ScanFilter::All,
+        );
+
         self.clean_accounts_stats.report();
         datapoint_info!(
             "clean_accounts",
