@@ -228,6 +228,7 @@ pub fn bank_from_snapshot_archives(
     loop {
         error!("brooks DEBUG: looping clean and shrink, iteration: {i}...");
         bank.clean_accounts();
+        panic!("brooks DEBUG: done");
         bank.shrink_candidate_slots();
         i += 1;
     }

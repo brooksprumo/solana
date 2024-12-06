@@ -2286,12 +2286,12 @@ impl AccountsDb {
                     if Some(slot) == min_slot {
                         if let Some(failed_slot) = failed_slot.take() {
                             info!(
-                                "calc_delete_dependencies, oldest slot is not able to be deleted \
+                                "calc_delete_dependencies, oldest slot {slot} is not able to be deleted \
                                  because of {pubkey} in slot {failed_slot}"
                             );
                         } else {
                             info!(
-                                "calc_delete_dependencies, oldest slot is not able to be deleted \
+                                "calc_delete_dependencies, oldest slot {slot} is not able to be deleted \
                                  because of {pubkey}, slot list len: {}, ref count: {ref_count}",
                                 slot_list.len()
                             );
