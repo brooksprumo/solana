@@ -2811,6 +2811,26 @@ impl AccountsDb {
             old_storages_policy,
         );
 
+        // brooks DEBUG
+        let oldest_dirty_storage = self
+            .storage
+            .get_slot_storage_entry(min_dirty_slot.unwrap())
+            .unwrap();
+        let mut pubkeys_in_oldest_dirty_storage = Vec::new();
+        oldest_dirty_storage
+            .accounts
+            .scan_pubkeys(|pubkey| pubkeys_in_oldest_dirty_storage.push(*pubkey));
+        self.accounts_index.scan(
+            pubkeys_in_oldest_dirty_storage.iter(),
+            |pubkey, slot_list_and_ref_count, entry| {
+                error!("brooks DEBUG: clean_accounts() accounts in oldest dirty storage! slot: {min_dirty_slot:?}, {pubkey}, slot list and ref count: {slot_list_and_ref_count:?}, entry: {entry:?}");
+                AccountsIndexScanResult::OnlyKeepInMemoryIfDirty
+            },
+            None,
+            true,
+            ScanFilter::All,
+        );
+
         let num_candidates = Self::count_pubkeys(&candidates);
         let mut accounts_scan = Measure::start("accounts_scan");
         let uncleaned_roots = self.accounts_index.clone_uncleaned_roots();
