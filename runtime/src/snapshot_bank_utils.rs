@@ -223,6 +223,15 @@ pub fn bank_from_snapshot_archives(
         (base_slot, base_capitalization)
     });
 
+    // brooks DEBUG
+    let mut i = 0;
+    loop {
+        error!("brooks DEBUG: looping clean and shrink, iteration: {i}...");
+        bank.clean_accounts();
+        bank.shrink_candidate_slots();
+        i += 1;
+    }
+
     let mut measure_verify = Measure::start("verify");
     if !bank.verify_snapshot_bank(
         test_hash_calculation,
