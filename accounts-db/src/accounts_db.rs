@@ -2820,17 +2820,29 @@ impl AccountsDb {
         oldest_dirty_storage.accounts.scan_pubkeys(|pubkey| {
             pubkeys_in_oldest_dirty_storage.insert(*pubkey);
         });
+        let pubkeys_in_oldest_dirty_storage = pubkeys_in_oldest_dirty_storage;
         self.accounts_index.scan(
             pubkeys_in_oldest_dirty_storage.iter(),
             |pubkey, slot_list_and_ref_count, entry| {
-                error!("brooks DEBUG: clean_accounts() accounts in oldest dirty storage BEFORE! slot: {min_dirty_slot:?}, {pubkey}, slot list and ref count: {slot_list_and_ref_count:?}, entry: {entry:?}");
+                let (slot_list, ref_count) = slot_list_and_ref_count.unzip();
+                let slots = slot_list.map(|sl| sl.iter().map(|(slot, _account_info)| *slot).collect::<Vec<_>>());
+                error!("brooks DEBUG: clean_accounts() accounts in oldest dirty storage BEFORE! slot: {min_dirty_slot:?}, {pubkey}, ref count: {ref_count:?}, slot list slots: {slots:?}, entry: {entry:?}");
                 AccountsIndexScanResult::OnlyKeepInMemoryIfDirty
             },
             None,
             true,
             ScanFilter::All,
         );
-        let pubkeys_in_oldest_dirty_storage = pubkeys_in_oldest_dirty_storage;
+        for oldest_pubkey in pubkeys_in_oldest_dirty_storage.iter() {
+            let bindex = self
+                .accounts_index
+                .bin_calculator
+                .bin_from_pubkey(&oldest_pubkey);
+            let candidates_bin = &candidates[bindex].read().unwrap();
+            if !candidates_bin.contains_key(oldest_pubkey) {
+                error!("brooks DEBUG: clean_accounts() pubkey in oldest storage not a clean candidate: {oldest_pubkey}");
+            }
+        }
 
         let num_candidates = Self::count_pubkeys(&candidates);
         let mut accounts_scan = Measure::start("accounts_scan");
@@ -3155,7 +3167,9 @@ impl AccountsDb {
         self.accounts_index.scan(
             pubkeys_in_oldest_dirty_storage.iter(),
             |pubkey, slot_list_and_ref_count, entry| {
-                error!("brooks DEBUG: clean_accounts() accounts in oldest dirty storage AFTER! slot: {min_dirty_slot:?}, {pubkey}, slot list and ref count: {slot_list_and_ref_count:?}, entry: {entry:?}");
+                let (slot_list, ref_count) = slot_list_and_ref_count.unzip();
+                let slots = slot_list.map(|sl| sl.iter().map(|(slot, _account_info)| *slot).collect::<Vec<_>>());
+                error!("brooks DEBUG: clean_accounts() accounts in oldest dirty storage AFTER! slot: {min_dirty_slot:?}, {pubkey}, ref count: {ref_count:?}, slot list slots: {slots:?}, entry: {entry:?}");
                 AccountsIndexScanResult::OnlyKeepInMemoryIfDirty
             },
             None,
