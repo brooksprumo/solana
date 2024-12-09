@@ -2816,10 +2816,10 @@ impl AccountsDb {
             .storage
             .get_slot_storage_entry(min_dirty_slot.unwrap())
             .unwrap();
-        let mut pubkeys_in_oldest_dirty_storage = Vec::new();
-        oldest_dirty_storage
-            .accounts
-            .scan_pubkeys(|pubkey| pubkeys_in_oldest_dirty_storage.push(*pubkey));
+        let mut pubkeys_in_oldest_dirty_storage = HashSet::new();
+        oldest_dirty_storage.accounts.scan_pubkeys(|pubkey| {
+            pubkeys_in_oldest_dirty_storage.insert(*pubkey);
+        });
         self.accounts_index.scan(
             pubkeys_in_oldest_dirty_storage.iter(),
             |pubkey, slot_list_and_ref_count, entry| {
@@ -2830,6 +2830,7 @@ impl AccountsDb {
             true,
             ScanFilter::All,
         );
+        let pubkeys_in_oldest_dirty_storage = pubkeys_in_oldest_dirty_storage;
 
         let num_candidates = Self::count_pubkeys(&candidates);
         let mut accounts_scan = Measure::start("accounts_scan");
@@ -2860,9 +2861,11 @@ impl AccountsDb {
                     self.accounts_index.scan(
                         [*candidate_pubkey].iter(),
                         |_candidate_pubkey, slot_list_and_ref_count, entry| {
-                            if NEEDLES.read().unwrap().contains(candidate_pubkey) {
-                                error!("brooks DEBUG: clean_accounts() scan candidates, needle: {candidate_pubkey}, slot list ref count: {slot_list_and_ref_count:?}, index entry: {entry:?}");
-                            }
+                            /*
+                             * if NEEDLES.read().unwrap().contains(candidate_pubkey) {
+                             *     error!("brooks DEBUG: clean_accounts() scan candidates, needle: {candidate_pubkey}, slot list ref count: {slot_list_and_ref_count:?}, index entry: {entry:?}");
+                             * }
+                             */
                             let mut useless = true;
                             if let Some((slot_list, ref_count)) = slot_list_and_ref_count {
                                 // find the highest rooted slot in the slot list
@@ -2948,6 +2951,10 @@ impl AccountsDb {
                             epoch_schedule,
                             &pubkeys_removed_from_accounts_index,
                         );
+                        // brooks DEBUG: remove once done
+                        if pubkeys_in_oldest_dirty_storage.contains(candidate_pubkey) {
+                            error!("brooks DEBUG: clean_accounts() reclaiming from pubkey, in oldest storage: {candidate_pubkey}, reclaims: {reclaims_new:?}");
+                        }
                         if !reclaims_new.is_empty() {
                             reclaims.lock().unwrap().extend(reclaims_new);
                         }
@@ -2973,14 +2980,26 @@ impl AccountsDb {
         let mut pubkeys_removed_from_accounts_index =
             pubkeys_removed_from_accounts_index.into_inner().unwrap();
 
-        error!("brooks DEBUG: clean_accounts() reclaims: {reclaims:?}");
-        error!("brooks DEBUG: clean_accounts() pubkeys removed from accounts index: {pubkeys_removed_from_accounts_index:?}");
+        //error!("brooks DEBUG: clean_accounts() reclaims: {reclaims:?}");
+        //error!("brooks DEBUG: clean_accounts() pubkeys removed from accounts index: {pubkeys_removed_from_accounts_index:?}");
+
+        for pubkey_removed_from_accounts_index in pubkeys_removed_from_accounts_index.iter() {
+            if pubkeys_in_oldest_dirty_storage.contains(pubkey_removed_from_accounts_index) {
+                error!("brooks DEBUG: clean_accounts() pubkey removed from index, in oldest storage, pubkey: {pubkey_removed_from_accounts_index}");
+            }
+        }
 
         let mut clean_old_rooted = Measure::start("clean_old_roots");
         let (purged_account_slots, removed_accounts) =
             self.clean_accounts_older_than_root(&reclaims, &pubkeys_removed_from_accounts_index);
         self.do_reset_uncleaned_roots(max_clean_root_inclusive);
         clean_old_rooted.stop();
+
+        for (purged_pubkey, purged_slots) in purged_account_slots.iter() {
+            if pubkeys_in_oldest_dirty_storage.contains(purged_pubkey) {
+                error!("brooks DEBUG: clean_accounts() pubkey purged by clean_accounts_older_than_root(), in oldest storage, pubkey: {purged_pubkey}, purged slots: {purged_slots:?}");
+            }
+        }
 
         let mut store_counts_time = Measure::start("store_counts");
 
@@ -3065,6 +3084,14 @@ impl AccountsDb {
         );
         purge_filter.stop();
 
+        for candidates_bin in candidates.iter() {
+            for (pubkey, cleaning_info) in candidates_bin.read().unwrap().iter() {
+                if pubkeys_in_oldest_dirty_storage.contains(pubkey) {
+                    error!("brooks DEBUG: clean_accounts() post filter_zero_lamport(), in oldest storage, pubkey: {pubkey}, ref count: {}, slot list: {:?}", cleaning_info.ref_count, cleaning_info.slot_list);
+                }
+            }
+        }
+
         let mut reclaims_time = Measure::start("reclaims");
         // Recalculate reclaims with new purge set
         let mut pubkey_to_slot_set = Vec::new();
@@ -3092,6 +3119,11 @@ impl AccountsDb {
 
         let (reclaims, pubkeys_removed_from_accounts_index2) =
             self.purge_keys_exact(pubkey_to_slot_set.iter());
+        for pubkey_removed_from_accounts_index in pubkeys_removed_from_accounts_index.iter() {
+            if pubkeys_in_oldest_dirty_storage.contains(pubkey_removed_from_accounts_index) {
+                error!("brooks DEBUG: clean_accounts() pubkey removed from index2, in oldest storage, pubkey: {pubkey_removed_from_accounts_index}");
+            }
+        }
         pubkeys_removed_from_accounts_index.extend(pubkeys_removed_from_accounts_index2);
 
         // Don't reset from clean, since the pubkeys in those stores may need to be unref'ed
