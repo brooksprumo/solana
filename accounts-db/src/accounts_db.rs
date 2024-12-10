@@ -2840,7 +2840,7 @@ impl AccountsDb {
                 .bin_from_pubkey(&oldest_pubkey);
             let candidates_bin = &candidates[bindex].read().unwrap();
             if !candidates_bin.contains_key(oldest_pubkey) {
-                error!("brooks DEBUG: clean_accounts() pubkey in oldest storage not a clean candidate: {oldest_pubkey}");
+                error!("brooks DEBUG: clean_accounts() pubkey in oldest storage is not a clean candidate??? {oldest_pubkey}");
             }
         }
 
@@ -2902,6 +2902,9 @@ impl AccountsDb {
                                                     max_clean_root_inclusive,
                                                 );
                                             candidate_info.ref_count = ref_count;
+                                            if pubkeys_in_oldest_dirty_storage.contains(candidate_pubkey) {
+                                                error!("brooks DEBUG: clean_accounts() scan candidates, not useless: is zero lamport: {candidate_pubkey}, ref count: {ref_count}");
+                                            }
                                         } else {
                                             found_not_zero += 1;
                                         }
@@ -2918,6 +2921,9 @@ impl AccountsDb {
                                                 should_purge = true;
                                                 purges_old_accounts_local += 1;
                                                 useless = false;
+                                                if pubkeys_in_oldest_dirty_storage.contains(candidate_pubkey) {
+                                                    error!("brooks DEBUG: clean_accounts() scan candidates, not useless: slot list len > 1 AND in uncleaned roots: {candidate_pubkey}, ref count: {ref_count}");
+                                                }
                                             } else {
                                                 self.clean_accounts_stats
                                                     .uncleaned_roots_slot_list_1
@@ -2936,6 +2942,9 @@ impl AccountsDb {
                                         should_purge = true;
                                         purges_old_accounts_local += 1;
                                         useless = false;
+                                        if pubkeys_in_oldest_dirty_storage.contains(candidate_pubkey) {
+                                            error!("brooks DEBUG: clean_accounts() scan candidates, not useless: pubkey without a slot list??? {candidate_pubkey}");
+                                        }
                                     }
                                 }
                             } else {
