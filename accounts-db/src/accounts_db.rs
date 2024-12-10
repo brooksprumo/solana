@@ -2887,6 +2887,7 @@ impl AccountsDb {
                                     max_clean_root_inclusive,
                                 );
 
+
                                 match index_in_slot_list {
                                     Some(index_in_slot_list) => {
                                         // found info relative to max_clean_root
@@ -2946,6 +2947,10 @@ impl AccountsDb {
                                             error!("brooks DEBUG: clean_accounts() scan candidates, not useless: pubkey without a slot list??? {candidate_pubkey}");
                                         }
                                     }
+                                }
+                                if !useless && pubkeys_in_oldest_dirty_storage.contains(candidate_pubkey) {
+                                    let slots = slot_list.iter().map(|(slot, account_info)| (*slot, account_info.is_zero_lamport())).collect::<Vec<_>>();
+                                    error!("brooks DEBUG: clean_accounts() scan candidates, found not useless {candidate_pubkey}, ref count: {ref_count}, latest index in slot list: {index_in_slot_list:?}, (slots,is_zero_lamport) in slot list: {slots:?}, entry: {entry:?}");
                                 }
                             } else {
                                 missing += 1;
