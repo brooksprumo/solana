@@ -2877,7 +2877,7 @@ impl AccountsDb {
                     let mut should_purge = false;
                     self.accounts_index.scan(
                         [*candidate_pubkey].iter(),
-                        |_candidate_pubkey, slot_list_and_ref_count, entry| {
+                        |_candidate_pubkey, slot_list_and_ref_count, _entry| {
                             /*
                              * if NEEDLES.read().unwrap().contains(candidate_pubkey) {
                              *     error!("brooks DEBUG: clean_accounts() scan candidates, needle: {candidate_pubkey}, slot list ref count: {slot_list_and_ref_count:?}, index entry: {entry:?}");
@@ -2885,12 +2885,16 @@ impl AccountsDb {
                              */
                             let mut useless = true;
                             if let Some((slot_list, ref_count)) = slot_list_and_ref_count {
+
+
                                 // find the highest rooted slot in the slot list
                                 let index_in_slot_list = self.accounts_index.latest_slot(
                                     None,
                                     slot_list,
                                     max_clean_root_inclusive,
                                 );
+
+
 
 
                                 match index_in_slot_list {
@@ -2914,6 +2918,32 @@ impl AccountsDb {
                                         } else {
                                             found_not_zero += 1;
                                         }
+
+
+
+
+
+
+
+
+                                        // if we have multiple rooted slot list entries, we may be able to reclaim the older ones
+                                        if slot_list.len() > 1 && *slot <= max_clean_root_inclusive.unwrap_or(Slot::MAX) {
+                                            should_purge = true;
+                                            purges_old_accounts_local += 1;
+                                            useless = false;
+                                            if pubkeys_in_oldest_dirty_storage.contains(candidate_pubkey) {
+                                                error!("brooks DEBUG: clean_accounts() scan candidates, not useless: slot list len > 1 AND entries are rooted: {candidate_pubkey}, ref count: {ref_count}, slot list len: {}", slot_list.len());
+                                            }
+                                        }
+
+
+
+
+
+
+
+
+
                                         if uncleaned_roots.contains(slot) {
                                             // Assertion enforced by `accounts_index.get()`, the latest slot
                                             // will not be greater than the given `max_clean_root`
@@ -2922,15 +2952,18 @@ impl AccountsDb {
                                             {
                                                 assert!(slot <= &max_clean_root_inclusive);
                                             }
-                                            if slot_list.len() > 1 {
-                                                // no need to purge old accounts if there is only 1 slot in the slot list
-                                                should_purge = true;
-                                                purges_old_accounts_local += 1;
-                                                useless = false;
-                                                if pubkeys_in_oldest_dirty_storage.contains(candidate_pubkey) {
-                                                    error!("brooks DEBUG: clean_accounts() scan candidates, not useless: slot list len > 1 AND in uncleaned roots: {candidate_pubkey}, ref count: {ref_count}");
-                                                }
-                                            } else {
+                                            /*
+                                             * if slot_list.len() > 1 {
+                                             *     // no need to purge old accounts if there is only 1 slot in the slot list
+                                             *     should_purge = true;
+                                             *     purges_old_accounts_local += 1;
+                                             *     useless = false;
+                                             *     if pubkeys_in_oldest_dirty_storage.contains(candidate_pubkey) {
+                                             *         error!("brooks DEBUG: clean_accounts() scan candidates, not useless: slot list len > 1 AND in uncleaned roots: {candidate_pubkey}, ref count: {ref_count}");
+                                             *     }
+                                             * }
+                                             */
+                                            if slot_list.len() == 1 {
                                                 self.clean_accounts_stats
                                                     .uncleaned_roots_slot_list_1
                                                     .fetch_add(1, Ordering::Relaxed);
@@ -2963,10 +2996,12 @@ impl AccountsDb {
                                         }
                                     }
                                 }
-                                if !useless && pubkeys_in_oldest_dirty_storage.contains(candidate_pubkey) {
-                                    let slots = slot_list.iter().map(|(slot, account_info)| (*slot, account_info.is_zero_lamport())).collect::<Vec<_>>();
-                                    error!("brooks DEBUG: clean_accounts() scan candidates, found not useless {candidate_pubkey}, ref count: {ref_count}, latest index in slot list: {index_in_slot_list:?}, (slots,is_zero_lamport) in slot list: {slots:?}, entry: {entry:?}");
-                                }
+                                /*
+                                 * if !useless && pubkeys_in_oldest_dirty_storage.contains(candidate_pubkey) {
+                                 *     let slots = slot_list.iter().map(|(slot, account_info)| (*slot, account_info.is_zero_lamport())).collect::<Vec<_>>();
+                                 *     error!("brooks DEBUG: clean_accounts() scan candidates, found not useless {candidate_pubkey}, ref count: {ref_count}, latest index in slot list: {index_in_slot_list:?}, (slots,is_zero_lamport) in slot list: {slots:?}, entry: {entry:?}");
+                                 * }
+                                 */
                             } else {
                                 missing += 1;
                             }
