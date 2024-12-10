@@ -2847,6 +2847,11 @@ impl AccountsDb {
         let num_candidates = Self::count_pubkeys(&candidates);
         let mut accounts_scan = Measure::start("accounts_scan");
         let uncleaned_roots = self.accounts_index.clone_uncleaned_roots();
+
+        let mut sorted_uncleaned_roots = uncleaned_roots.iter().collect::<Vec<_>>();
+        sorted_uncleaned_roots.sort_unstable();
+        error!("brooks DEBUG: clean_accounts() uncleaned roots: {sorted_uncleaned_roots:?}");
+
         let found_not_zero_accum = AtomicU64::new(0);
         let not_found_on_fork_accum = AtomicU64::new(0);
         let missing_accum = AtomicU64::new(0);
@@ -2929,6 +2934,16 @@ impl AccountsDb {
                                                 self.clean_accounts_stats
                                                     .uncleaned_roots_slot_list_1
                                                     .fetch_add(1, Ordering::Relaxed);
+                                            }
+                                        }
+                                        // brooks TODO: check if *any* slot list slots are in the uncleaned roots
+                                        if useless && slot_list.len() > 1 && pubkeys_in_oldest_dirty_storage.contains(candidate_pubkey) {
+                                            let slot_list_slots = slot_list.iter().map(|(slot, _)| *slot).collect::<Vec<_>>();
+                                            let has_any_slot_list_in_uncleaned_roots = slot_list_slots.iter().any(|slot2| {
+                                                uncleaned_roots.contains(slot2)
+                                            });
+                                            if has_any_slot_list_in_uncleaned_roots {
+                                                error!("brooks DEBUG: clean_accounts() scan candidates, useless pubkey but we do have extra slot list entries in uncleaned roots (are all these slots rooted?)! {candidate_pubkey} slots: {slot_list_slots:?}");
                                             }
                                         }
                                     }
