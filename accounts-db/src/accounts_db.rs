@@ -4103,6 +4103,12 @@ impl AccountsDb {
                 // So, the two storages have to be exactly equivalent wrt offsets, counts, len, id, etc.
                 assert_eq!(storage.id(), new_storage.id());
                 assert_eq!(storage.accounts.len(), new_storage.accounts.len());
+                if storage.accounts.capacity() != new_storage.accounts.capacity() {
+                    error!(
+                        "brooks DEBUG: reopen_as_read_only() has different file size (capacity!) old: {}, new: {}",
+                        storage.accounts.capacity(), new_storage.accounts.capacity(),
+                    );
+                }
                 self.storage
                     .replace_storage_with_equivalent(slot, Arc::new(new_storage));
             }
