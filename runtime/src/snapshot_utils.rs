@@ -1040,6 +1040,7 @@ fn archive_snapshot(
 
         let do_archive_files = |encoder: &mut dyn Write| -> std::result::Result<(), E> {
             let mut archive = tar::Builder::new(encoder);
+            archive.mode(tar::HeaderMode::Deterministic);
             // Serialize the version and snapshots files before accounts so we can quickly determine the version
             // and other bank fields. This is necessary if we want to interleave unpacking with reconstruction
             archive
@@ -1060,6 +1061,12 @@ fn archive_snapshot(
                         })?;
                         header.set_size(storage.capacity());
                         header.set_cksum();
+                        /*
+                         * error!(
+                         *     "brooks DEBUG: archive() mmap, header size: {}",
+                         *     size_of_val(&header)
+                         * );
+                         */
                         archive.append(&header, data)
                     }
                     InternalsForArchive::FileIo(path) => {

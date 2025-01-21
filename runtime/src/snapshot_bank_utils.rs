@@ -1235,6 +1235,7 @@ mod tests {
     /// multiple transfers.  So this full snapshot should contain more data.
     #[test]
     fn test_roundtrip_bank_to_and_from_snapshot_complex() {
+        solana_logger::setup();
         let collector = Pubkey::new_unique();
         let key1 = Keypair::new();
         let key2 = Keypair::new();

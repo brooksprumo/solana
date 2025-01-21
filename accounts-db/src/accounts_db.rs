@@ -512,7 +512,7 @@ pub const ACCOUNTS_DB_CONFIG_FOR_TESTING: AccountsDbConfig = AccountsDbConfig {
     create_ancient_storage: CreateAncientStorage::Pack,
     partitioned_epoch_rewards_config: DEFAULT_PARTITIONED_EPOCH_REWARDS_CONFIG,
     test_skip_rewrites_but_include_in_bank_hash: false,
-    storage_access: StorageAccess::File,
+    storage_access: StorageAccess::File, // brooks TODO
     scan_filter_for_shrinking: ScanFilter::OnlyAbnormalWithVerify,
     enable_experimental_accumulator_hash: false,
     verify_experimental_accumulator_hash: false,

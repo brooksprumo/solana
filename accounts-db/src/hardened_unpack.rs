@@ -163,6 +163,17 @@ where
             _ => None,
         };
         let entry_path = if let Some(account) = account_filename {
+            // brooks TODO: impl here
+            /*
+             * let header = entry.header();
+             * error!(
+             *     "brooks DEBUG: unpack_archive() {path_str}, header size: {}, entry size: {}, real size: {:?}, {header:?}",
+             *     header.size().unwrap(),
+             *     header.entry_size().unwrap(),
+             *     header.as_gnu().map(|h| h.real_size().ok()).flatten(),
+             * );
+             */
+
             // Special case account files. We're unpacking an account entry inside one of the
             // account_paths returned by `entry_checker`. We want to unpack into
             // account_path/<account> instead of account_path/accounts/<account> so we strip the
