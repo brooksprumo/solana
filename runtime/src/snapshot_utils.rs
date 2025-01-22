@@ -1052,18 +1052,21 @@ fn archive_snapshot(
             for storage in snapshot_storages {
                 let path_in_archive = Path::new(ACCOUNTS_DIR)
                     .join(AccountsFile::file_name(storage.slot(), storage.id()));
+                let mut header = tar::Header::new_gnu();
+                header.set_path(path_in_archive).map_err(|err| {
+                    E::ArchiveAccountStorageFile(err, storage.path().to_path_buf())
+                })?;
+                header.set_size(storage.capacity());
+                header.set_cksum();
                 match storage.accounts.internals_for_archive() {
-                    InternalsForArchive::Mmap(data) => {
-                        let mut header = tar::Header::new_gnu();
-                        header.set_path(path_in_archive).map_err(|err| {
+                    InternalsForArchive::Mmap(data) => archive.append(&header, data),
+                    InternalsForArchive::FileIo(path) => {
+                        let file = fs::File::open(path).map_err(|err| {
                             E::ArchiveAccountStorageFile(err, storage.path().to_path_buf())
                         })?;
-                        header.set_size(storage.capacity());
-                        header.set_cksum();
-                        archive.append(&header, data)
-                    }
-                    InternalsForArchive::FileIo(path) => {
-                        archive.append_path_with_name(path, path_in_archive)
+                        // the average storage size on mnb is just under 1 MiB, so use that here
+                        let reader = BufReader::with_capacity(1 << 20, file);
+                        archive.append(&header, reader)
                     }
                 }
                 .map_err(|err| E::ArchiveAccountStorageFile(err, storage.path().to_path_buf()))?;
