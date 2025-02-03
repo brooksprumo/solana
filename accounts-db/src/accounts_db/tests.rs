@@ -8110,7 +8110,7 @@ fn test_clean_old_storages_with_reclaims_rooted() {
         // ensure this slot is *not* in the dirty_stores or uncleaned_pubkeys, because we want to
         // test cleaning *old* storages, i.e. when they aren't explicitly marked for cleaning
         assert!(!accounts_db.dirty_stores.contains_key(&slot));
-        assert!(!accounts_db.uncleaned_pubkeys.contains_key(&slot));
+        accounts_db.uncleaned_pubkeys.remove(&slot);
     }
 
     // add `old_slot` to the dirty stores list to mimic it being picked up as old
@@ -8165,16 +8165,19 @@ fn test_clean_old_storages_with_reclaims_unrooted() {
             slot,
             &[(&pubkey, &account), (&Pubkey::new_unique(), &account)],
         );
-        accounts_db.calculate_accounts_delta_hash(slot);
-        // ensure this slot is in uncleaned_pubkeys (but not dirty_stores) so it'll be cleaned
-        assert!(!accounts_db.dirty_stores.contains_key(&slot));
-        assert!(accounts_db.uncleaned_pubkeys.contains_key(&slot));
     }
 
     // only `old_slot` should be rooted, not `new_slot`
     accounts_db.add_root_and_flush_write_cache(old_slot);
     assert!(accounts_db.accounts_index.is_alive_root(old_slot));
     assert!(!accounts_db.accounts_index.is_alive_root(new_slot));
+
+    // ensure `old_slot` is in uncleaned_pubkeys (but not dirty_stores) so it'll be cleaned
+    assert!(accounts_db.uncleaned_pubkeys.contains_key(&old_slot));
+    assert!(!accounts_db.dirty_stores.contains_key(&old_slot));
+    // and `new_slot` should be in neither
+    assert!(!accounts_db.uncleaned_pubkeys.contains_key(&new_slot));
+    assert!(!accounts_db.dirty_stores.contains_key(&new_slot));
 
     // ensure the slot list for `pubkey` has both the old and new slots
     let slot_list = accounts_db
