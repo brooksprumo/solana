@@ -63,6 +63,7 @@ fn test_shrink_and_clean() {
 
                 accounts.store_cached((current_slot, &[(&*pubkey, &*account)][..]), None);
             }
+            accounts.calculate_accounts_delta_hash(current_slot);
             accounts.add_root(current_slot);
             accounts.flush_accounts_cache(true, Some(current_slot));
         }
