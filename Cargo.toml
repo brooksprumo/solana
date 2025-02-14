@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "brooks-geyser-plugin",
     "account-decoder",
     "account-decoder-client-types",
     "accounts-cluster-bench",

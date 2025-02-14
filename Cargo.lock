@@ -1480,6 +1480,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "66bb12751a83493ef4b8da1120451a262554e216a247f14b48cb5e8fe7ed8bdf"
 
 [[package]]
+name = "brooks-geyser-plugin"
+version = "3.1.0"
+dependencies = [
+ "agave-geyser-plugin-interface",
+ "log",
+ "solana-logger",
+]
+
+[[package]]
 name = "brotli"
 version = "3.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

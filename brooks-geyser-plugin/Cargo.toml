@@ -1,0 +1,16 @@
+[package]
+name = "brooks-geyser-plugin"
+version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+agave-geyser-plugin-interface = { workspace = true }
+log = { workspace = true }
+solana-logger = { workspace = true }
