@@ -25,7 +25,7 @@ pub type Age = u8;
 pub type AtomicAge = AtomicU8;
 const _: () = assert!(std::mem::size_of::<Age>() == std::mem::size_of::<AtomicAge>());
 
-const AGE_MS: u64 = DEFAULT_MS_PER_SLOT; // match one age per slot time
+const AGE_MS: u64 = 10 * DEFAULT_MS_PER_SLOT; // match ten age per slot time
 
 pub struct BucketMapHolder<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> {
     pub disk: Option<BucketMap<(Slot, U)>>,
