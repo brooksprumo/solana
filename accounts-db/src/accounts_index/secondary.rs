@@ -67,6 +67,7 @@ pub trait SecondaryIndexEntry: Debug {
     fn is_empty(&self) -> bool;
     fn keys(&self) -> Vec<Pubkey>;
     fn len(&self) -> usize;
+    fn capacity(&self) -> usize;
 }
 
 #[derive(Debug, Default)]
@@ -107,6 +108,10 @@ impl SecondaryIndexEntry for DashMapSecondaryIndexEntry {
     fn len(&self) -> usize {
         self.account_keys.len()
     }
+
+    fn capacity(&self) -> usize {
+        self.account_keys.capacity()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -141,6 +146,10 @@ impl SecondaryIndexEntry for RwLockSecondaryIndexEntry {
 
     fn len(&self) -> usize {
         self.account_keys.read().unwrap().len()
+    }
+
+    fn capacity(&self) -> usize {
+        self.account_keys.read().unwrap().capacity()
     }
 }
 
@@ -190,20 +199,19 @@ impl<SecondaryIndexEntryType: SecondaryIndexEntry + Default + Sync + Send>
             }
         }
 
-        if self.stats.last_report.should_update(1000) {
+        if self.stats.last_report.should_update(10_000) {
+            let (num_bytes_secondary_index, num_bytes_reverse_index) = self.num_bytes();
             datapoint_info!(
                 self.metrics_name,
                 ("num_secondary_keys", self.index.len() as i64, i64),
                 (
                     "num_inner_keys",
-                    self.stats.num_inner_keys.load(Ordering::Relaxed) as i64,
+                    self.stats.num_inner_keys.load(Ordering::Relaxed),
                     i64
                 ),
-                (
-                    "num_reverse_index_keys",
-                    self.reverse_index.len() as i64,
-                    i64
-                ),
+                ("num_reverse_index_keys", self.reverse_index.len(), i64),
+                ("num_bytes_secondary_index", num_bytes_secondary_index, i64),
+                ("num_bytes_reverse_index", num_bytes_reverse_index, i64),
             );
         }
     }
@@ -281,5 +289,31 @@ impl<SecondaryIndexEntryType: SecondaryIndexEntry + Default + Sync + Send>
             .rev()
             .take(20)
             .for_each(|(v, k)| info!("owner: {}, accounts: {}", k, v));
+    }
+
+    pub fn num_bytes(&self) -> (usize, usize) {
+        let outer_capacity = self.index.capacity();
+        let outer_bytes =
+            outer_capacity * (size_of::<Pubkey>() + size_of::<SecondaryIndexEntryType>());
+        let inner_capacity: usize = self
+            .index
+            .iter()
+            .map(|shard| shard.value().capacity())
+            .sum();
+        let inner_bytes = inner_capacity * size_of::<Pubkey>();
+        let secondary_index_bytes = outer_bytes + inner_bytes;
+
+        let outer_capacity = self.reverse_index.capacity();
+        let outer_bytes =
+            outer_capacity * (size_of::<Pubkey>() + size_of::<SecondaryReverseIndexEntry>());
+        let inner_capacity: usize = self
+            .reverse_index
+            .iter()
+            .map(|shard| shard.value().read().unwrap().capacity())
+            .sum();
+        let inner_bytes = inner_capacity * size_of::<Pubkey>();
+        let reverse_index_bytes = outer_bytes + inner_bytes;
+
+        (secondary_index_bytes, reverse_index_bytes)
     }
 }
