@@ -212,6 +212,8 @@ pub fn create_and_canonicalize_directory(directory: impl AsRef<Path>) -> io::Res
     fs::canonicalize(directory)
 }
 
+// brooks TODO: need to move hard_link_storages_to_snapshots() here
+
 #[cfg(test)]
 mod tests {
     use {super::*, tempfile::TempDir};

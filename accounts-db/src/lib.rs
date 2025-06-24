@@ -31,7 +31,7 @@ pub mod contains;
 pub mod epoch_accounts_hash;
 mod file_io;
 pub mod hardened_unpack;
-mod io_uring;
+pub mod io_uring; // brooks XXX pub is just for testing
 pub mod is_loadable;
 mod is_zero_lamport;
 pub mod partitioned_rewards;

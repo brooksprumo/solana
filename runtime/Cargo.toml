@@ -181,6 +181,10 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 zstd = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+agave-io-uring = { workspace = true }
+io-uring = { workspace = true }
+
 [dev-dependencies]
 agave-transaction-view = { workspace = true }
 ed25519-dalek = { workspace = true }

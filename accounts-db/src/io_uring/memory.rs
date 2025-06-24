@@ -151,6 +151,10 @@ impl BorrowedBytesMut {
         self.size
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Return a clone of `self` reduced to specified `size`
     pub fn sub_buf_to(&self, size: usize) -> Self {
         assert!(size <= self.size);

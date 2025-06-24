@@ -52,6 +52,12 @@ use {
     tempfile::TempDir,
     thiserror::Error,
 };
+#[cfg(target_os = "linux")]
+use {
+    agave_io_uring::io_uring_supported,
+    solana_accounts_db::io_uring::hard_linker::RingHardLinker,
+    std::os::fd::{AsRawFd, OwnedFd},
+};
 #[cfg(feature = "dev-context-only-utils")]
 use {
     hardened_unpack::UnpackedAppendVecMap, rayon::prelude::*,
@@ -558,6 +564,9 @@ pub enum HardLinkStoragesToSnapshotError {
 
     #[error("failed to hard link storage from '{1}' to '{2}': {0}")]
     HardLinkStorage(#[source] IoError, PathBuf, PathBuf),
+
+    #[error("failed to drain io_uring hard linker: {0}")]
+    DrainRingHardLinker(#[source] IoError),
 }
 
 /// Errors that can happen in `get_snapshot_accounts_hardlink_dir()`
@@ -1545,6 +1554,63 @@ pub fn hard_link_storages_to_snapshot(
             accounts_hardlinks_dir.clone(),
         )
     })?;
+
+    #[cfg(target_os = "linux")]
+    if io_uring_supported() {
+        if let Ok(mut hard_linker) = RingHardLinker::new().inspect_err(|err| {
+            info!("failed to create io_uring hard linker, falling back to slow impl: {err}")
+        }) {
+            let mut file_descriptors_to_keep_open = HashMap::new();
+            let mut account_paths = HashSet::new();
+            for storage in snapshot_storages {
+                let storage_path = storage.accounts.path();
+                let storage_file_name = storage_path.file_name().expect("storage has a file name");
+                let storage_dir = storage_path
+                    .parent()
+                    .expect("storage is in a directory")
+                    .to_path_buf();
+                let storage_dir_fd = file_descriptors_to_keep_open
+                    .entry(storage_dir)
+                    .or_insert_with_key(|dir| {
+                        OwnedFd::from(fs::File::open(dir).expect("open dir containing storages"))
+                    })
+                    .as_raw_fd();
+                let hard_link_dir = get_snapshot_accounts_hardlink_dir(
+                    storage_path,
+                    bank_slot,
+                    &mut account_paths,
+                    &accounts_hardlinks_dir,
+                )?;
+                let hard_link_path = hard_link_dir.join(storage_file_name); // brooks TODO: try to remove
+                let hard_link_dir_fd = file_descriptors_to_keep_open
+                    .entry(hard_link_dir)
+                    .or_insert_with_key(|dir| {
+                        OwnedFd::from(fs::File::open(dir).expect("open dir for storage hard links"))
+                    })
+                    .as_raw_fd();
+
+                hard_linker
+                    .hard_link_rel(
+                        storage_dir_fd,
+                        storage_file_name,
+                        hard_link_dir_fd,
+                        storage_file_name,
+                    )
+                    .map_err(|err| {
+                        HardLinkStoragesToSnapshotError::HardLinkStorage(
+                            err,
+                            storage_path.to_path_buf(),
+                            hard_link_path,
+                        )
+                    })?;
+            }
+
+            hard_linker
+                .drain()
+                .map_err(HardLinkStoragesToSnapshotError::DrainRingHardLinker)?;
+            return Ok(());
+        }
+    }
 
     let mut account_paths: HashSet<PathBuf> = HashSet::new();
     for storage in snapshot_storages {

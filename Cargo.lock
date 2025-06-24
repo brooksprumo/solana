@@ -10033,6 +10033,7 @@ name = "solana-runtime"
 version = "3.0.0"
 dependencies = [
  "agave-feature-set",
+ "agave-io-uring",
  "agave-precompiles",
  "agave-reserved-account-keys",
  "agave-transaction-view",
@@ -10051,6 +10052,7 @@ dependencies = [
  "ed25519-dalek",
  "fnv",
  "im",
+ "io-uring",
  "itertools 0.12.1",
  "libc",
  "libsecp256k1",
