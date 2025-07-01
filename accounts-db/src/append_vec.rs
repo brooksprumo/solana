@@ -265,6 +265,11 @@ impl AppendVec {
         let initial_len = 0;
         AppendVec::sanitize_len_and_size(initial_len, size).unwrap();
 
+        log::error!(
+            "brooks DEBUG: AppendVec::new() file size: {size}, path: {}",
+            file.display(),
+        );
+
         if create {
             let _ignored = remove_file(&file);
         }

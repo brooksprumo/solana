@@ -300,6 +300,7 @@ impl<'a> SnapshotMinimizer<'a> {
         dead_storages: &Mutex<Vec<Arc<AccountStorageEntry>>>,
     ) {
         let slot = storage.slot();
+        // brooks TODO: there are no duplicates within a single storage
         let GetUniqueAccountsResult {
             stored_accounts, ..
         } = self.accounts_db().get_unique_accounts_from_storage(storage);
@@ -357,7 +358,10 @@ impl<'a> SnapshotMinimizer<'a> {
             self.accounts_db()
                 .store_accounts_frozen(storable_accounts, new_storage);
 
+            // brooks TODO: no need to flush here
             new_storage.flush().unwrap();
+
+            log::error!("brooks DEBUG: filter_storage() slot: {slot}, total_bytes: {total_bytes}, original file size: {}, new file size: {}", storage.capacity(), new_storage.capacity());
         }
 
         let mut dead_storages_this_time = self.accounts_db().mark_dirty_dead_stores(
