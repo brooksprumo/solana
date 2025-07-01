@@ -296,7 +296,7 @@ impl<'a> SnapshotMinimizer<'a> {
     /// Creates new storage replacing `storages` that contains only accounts in `minimized_account_set`.
     fn filter_storage(
         &self,
-        storage: &Arc<AccountStorageEntry>,
+        storage: &AccountStorageEntry,
         dead_storages: &Mutex<Vec<Arc<AccountStorageEntry>>>,
     ) {
         let slot = storage.slot();
