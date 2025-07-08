@@ -5077,35 +5077,6 @@ impl Bank {
         Ok(())
     }
 
-    /// Calculates and returns the capitalization.
-    ///
-    /// Panics if capitalization overflows a u64.
-    ///
-    /// Note, this is *very* expensive!  It walks the whole accounts index,
-    /// account-by-account, summing each account's balance.
-    ///
-    /// Only intended to be called at startup by ledger-tool or tests.
-    /// (cannot be made DCOU due to snapshot-minimizer)
-    pub fn calculate_capitalization(&self) -> u64 {
-        self.rc
-            .accounts
-            .accounts_db
-            .verify_accounts_hash_in_bg
-            .join_background_thread();
-        self.rc
-            .accounts
-            .accounts_db
-            .calculate_capitalization_at_startup_from_index(&self.ancestors, self.slot())
-    }
-
-    /// Sets the capitalization.
-    ///
-    /// Only intended to be called by ledger-tool or tests.
-    /// (cannot be made DCOU due to snapshot-minimizer)
-    pub fn set_capitalization(&self, capitalization: u64) {
-        self.capitalization.store(capitalization, Relaxed);
-    }
-
     /// Returns the `AccountsHash` that was calculated for this bank's slot
     ///
     /// This fn is used when creating a snapshot with ledger-tool, or when
@@ -6535,6 +6506,29 @@ impl Bank {
             .for_each(|(pubkey, _)| {
                 minimized_account_set.insert(*pubkey);
             });
+    }
+
+    /// Calculates and returns the capitalization.
+    ///
+    /// Panics if capitalization overflows a u64.
+    ///
+    /// Note, this is *very* expensive!  It walks the whole accounts index,
+    /// account-by-account, summing each account's balance.
+    pub fn calculate_capitalization(&self) -> u64 {
+        self.rc
+            .accounts
+            .accounts_db
+            .verify_accounts_hash_in_bg
+            .join_background_thread();
+        self.rc
+            .accounts
+            .accounts_db
+            .calculate_capitalization_at_startup_from_index(&self.ancestors, self.slot())
+    }
+
+    /// Sets the capitalization.
+    pub fn set_capitalization(&self, capitalization: u64) {
+        self.capitalization.store(capitalization, Relaxed);
     }
 }
 
