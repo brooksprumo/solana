@@ -95,6 +95,7 @@ use {
     std::{
         borrow::Cow,
         boxed::Box,
+        cmp,
         collections::{BTreeSet, HashMap, HashSet, VecDeque},
         fs,
         hash::{Hash as StdHash, Hasher as StdHasher},
@@ -3187,25 +3188,36 @@ impl AccountsDb {
                     return true;
                 }
 
+                // SAFETY: Since we are filtering for incremental snapshots, the latest full
+                // snapshot slot must be Some.
+                let latest_full_snapshot_slot = latest_full_snapshot_slot.unwrap();
+
                 // Safety: We exited early if the slot list was empty,
                 // so we're guaranteed here that `.max_by_key()` returns Some.
-                let (slot, account_info) = slot_list
+                let mut min_slot = Slot::MAX;
+                let (max_slot, account_info) = slot_list
                     .iter()
+                    .inspect(|(slot, _account_info)| {
+                        min_slot = cmp::min(min_slot, *slot);
+                    })
                     .max_by_key(|(slot, _account_info)| slot)
                     .unwrap();
 
-                // Do *not* purge zero-lamport accounts if the slot is greater than the last full
-                // snapshot slot.  Since we're `retain`ing the accounts-to-purge, I felt creating
-                // the `cannot_purge` variable made this easier to understand.  Accounts that do
-                // not get purged here are added to a list so they be considered for purging later
-                // (i.e. after the next full snapshot).
+                // Do *not* purge zero-lamport accounts if they became zero-lamport since the
+                // latest full snapshot. IOW, we cannot purge if the account balance was non-zero
+                // in the latest full snapshot, but the balance *is* zero now.
+                //
+                // This means we *can* purge zero-lamport accounts if:
+                // - the max slot/newest version of the account is <= the latest full snapshot slot
+                // - the min slot/oldest version of the account is > the latest full snapshot slot
                 assert!(account_info.is_zero_lamport());
-                let cannot_purge = *slot > latest_full_snapshot_slot.unwrap();
-                if cannot_purge {
+                let can_purge =
+                    *max_slot <= latest_full_snapshot_slot || min_slot > latest_full_snapshot_slot;
+                if !can_purge {
                     self.zero_lamport_accounts_to_purge_after_full_snapshot
-                        .insert((*slot, *pubkey));
+                        .insert((*max_slot, *pubkey));
                 }
-                !cannot_purge
+                can_purge
             });
         }
     }
