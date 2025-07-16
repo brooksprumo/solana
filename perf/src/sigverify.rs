@@ -510,7 +510,7 @@ pub fn shrink_batches(batches: Vec<PacketBatch>) -> Vec<PacketBatch> {
 }
 
 pub fn ed25519_verify_cpu(batches: &mut [PacketBatch], reject_non_vote: bool, packet_count: usize) {
-    debug!("CPU ECDSA for {}", packet_count);
+    debug!("CPU ECDSA for {packet_count}");
     PAR_THREAD_POOL.install(|| {
         batches.par_iter_mut().flatten().for_each(|mut packet| {
             if !packet.meta().discard() && !verify_packet(&mut packet, reject_non_vote) {
@@ -522,7 +522,7 @@ pub fn ed25519_verify_cpu(batches: &mut [PacketBatch], reject_non_vote: bool, pa
 
 pub fn ed25519_verify_disabled(batches: &mut [PacketBatch]) {
     let packet_count = count_packets_in_batches(batches);
-    debug!("disabled ECDSA for {}", packet_count);
+    debug!("disabled ECDSA for {packet_count}");
     PAR_THREAD_POOL.install(|| {
         batches.par_iter_mut().flatten().for_each(|mut packet| {
             packet.meta_mut().set_discard(false);
@@ -613,7 +613,7 @@ pub fn ed25519_verify(
     let (signature_offsets, pubkey_offsets, msg_start_offsets, msg_sizes, sig_lens) =
         generate_offsets(batches, recycler, reject_non_vote);
 
-    debug!("CUDA ECDSA for {}", valid_packet_count);
+    debug!("CUDA ECDSA for {valid_packet_count}");
     debug!("allocating out..");
     let mut out = recycler_out.allocate("out_buffer");
     out.set_pinnable();
@@ -642,7 +642,7 @@ pub fn ed25519_verify(
         num_packets = num_packets.saturating_add(batch.len());
     }
     out.resize(signature_offsets.len(), 0);
-    trace!("Starting verify num packets: {}", num_packets);
+    trace!("Starting verify num packets: {num_packets}");
     trace!("elem len: {}", elems.len() as u32);
     trace!("packet sizeof: {}", size_of::<Packet>() as u32);
     trace!("len offset: {}", PACKET_DATA_SIZE as u32);
@@ -662,7 +662,7 @@ pub fn ed25519_verify(
             USE_NON_DEFAULT_STREAM,
         );
         if res != 0 {
-            trace!("RETURN!!!: {}", res);
+            trace!("RETURN!!!: {res}");
         }
     }
     trace!("done verify");

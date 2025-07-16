@@ -50,7 +50,7 @@ pub fn init_poh() {
 fn init(name: &OsStr) {
     static INIT_HOOK: Once = Once::new();
 
-    info!("Loading {:?}", name);
+    info!("Loading {name:?}");
     INIT_HOOK.call_once(|| {
         let path;
         let lib_name = if let Some(perf_libs_path) = solana_perf::perf_libs::locate_perf_libs() {
@@ -888,10 +888,7 @@ impl EntrySlice for [Entry] {
             if entry.is_tick() {
                 if *tick_hash_count != hashes_per_tick {
                     warn!(
-                        "invalid tick hash count!: entry: {:#?}, tick_hash_count: {}, hashes_per_tick: {}",
-                        entry,
-                        tick_hash_count,
-                        hashes_per_tick
+                        "invalid tick hash count!: entry: {entry:#?}, tick_hash_count: {tick_hash_count}, hashes_per_tick: {hashes_per_tick}"
                     );
                     return false;
                 }
