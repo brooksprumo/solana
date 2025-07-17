@@ -53,6 +53,17 @@ impl SnapshotPackagerService {
                 let mut snapshot_gossip_manager = enable_gossip_push
                     .then(|| SnapshotGossipManager::new(cluster_info, starting_snapshot_hashes));
 
+                // brooks TODO: ioprio_set
+                let res = unsafe {
+                    libc::syscall(
+                        libc::SYS_ioprio_set,
+                        1 as libc::c_int, // which - IOPRIO_WHO_PROCESS
+                        0 as libc::c_int, // who - 0 means this thread
+                        (2u16 << 13 | 7u16) as libc::c_int, // ioprio - 2 is IOPRIO_CLASS_BE, 7 is "nicest"/lowest io priority level
+                    )
+                };
+                assert_eq!(res, 0, "ioprio_set() failed: errno {res}");
+
                 let mut teardown_state = None;
                 loop {
                     if exit.load(Ordering::Relaxed) {
