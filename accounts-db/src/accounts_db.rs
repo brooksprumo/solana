@@ -6444,6 +6444,11 @@ impl AccountsDb {
                     i64
                 ),
                 (
+                    "read_only_accounts_cache_capacity",
+                    self.read_only_accounts_cache.capacity(),
+                    i64
+                ),
+                (
                     "read_only_accounts_cache_data_size",
                     self.read_only_accounts_cache.data_size(),
                     i64

@@ -245,6 +245,10 @@ impl ReadOnlyAccountsCache {
         self.data_size.load(Ordering::Relaxed)
     }
 
+    pub fn capacity(&self) -> usize {
+        self.cache.capacity()
+    }
+
     pub(crate) fn get_and_reset_stats(&self) -> ReadOnlyCacheStats {
         let hits = self.stats.hits.swap(0, Ordering::Relaxed);
         let misses = self.stats.misses.swap(0, Ordering::Relaxed);
