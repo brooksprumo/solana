@@ -57,7 +57,7 @@ pub const ACCOUNTS_INDEX_CONFIG_FOR_TESTING: AccountsIndexConfig = AccountsIndex
     bins: Some(BINS_FOR_TESTING),
     num_flush_threads: Some(FLUSH_THREADS_TESTING),
     drives: None,
-    index_limit_mb: IndexLimitMb::Minimal,
+    index_in_mem_limit: IndexInMemLimit::Minimal,
     ages_to_stay_in_cache: None,
     scan_results_limit_bytes: None,
 };
@@ -65,7 +65,7 @@ pub const ACCOUNTS_INDEX_CONFIG_FOR_BENCHMARKS: AccountsIndexConfig = AccountsIn
     bins: Some(BINS_FOR_BENCHMARKS),
     num_flush_threads: Some(FLUSH_THREADS_TESTING),
     drives: None,
-    index_limit_mb: IndexLimitMb::Minimal,
+    index_in_mem_limit: IndexInMemLimit::Minimal,
     ages_to_stay_in_cache: None,
     scan_results_limit_bytes: None,
 };
@@ -219,7 +219,7 @@ enum ScanTypes<R: RangeBounds<Pubkey>> {
 
 /// specification of how much memory in-mem portion of account index can use
 #[derive(Debug, Copy, Clone)]
-pub enum IndexLimitMb {
+pub enum IndexInMemLimit {
     /// use disk index while keeping a minimal amount in-mem
     Minimal,
     /// in-mem-only was specified, no disk index
@@ -231,7 +231,7 @@ pub struct AccountsIndexConfig {
     pub bins: Option<usize>,
     pub num_flush_threads: Option<NonZeroUsize>,
     pub drives: Option<Vec<PathBuf>>,
-    pub index_limit_mb: IndexLimitMb,
+    pub index_in_mem_limit: IndexInMemLimit,
     pub ages_to_stay_in_cache: Option<Age>,
     pub scan_results_limit_bytes: Option<usize>,
 }
@@ -242,7 +242,7 @@ impl Default for AccountsIndexConfig {
             bins: None,
             num_flush_threads: None,
             drives: None,
-            index_limit_mb: IndexLimitMb::Minimal,
+            index_in_mem_limit: IndexInMemLimit::Minimal,
             ages_to_stay_in_cache: None,
             scan_results_limit_bytes: None,
         }
@@ -2284,10 +2284,10 @@ pub mod tests {
         let key = solana_pubkey::new_rand();
 
         let mut config = ACCOUNTS_INDEX_CONFIG_FOR_TESTING;
-        config.index_limit_mb = if use_disk {
-            IndexLimitMb::Minimal
+        config.index_in_mem_limit = if use_disk {
+            IndexInMemLimit::Minimal
         } else {
-            IndexLimitMb::InMemOnly // in-mem only
+            IndexInMemLimit::InMemOnly // in-mem only
         };
         let index = AccountsIndex::<T, T>::new(&config, Arc::default());
         let mut gc = Vec::new();

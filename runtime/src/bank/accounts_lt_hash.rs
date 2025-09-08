@@ -397,7 +397,7 @@ mod tests {
         solana_accounts_db::{
             accounts_db::{AccountsDbConfig, MarkObsoleteAccounts, ACCOUNTS_DB_CONFIG_FOR_TESTING},
             accounts_index::{
-                AccountsIndexConfig, IndexLimitMb, ACCOUNTS_INDEX_CONFIG_FOR_TESTING,
+                AccountsIndexConfig, IndexInMemLimit, ACCOUNTS_INDEX_CONFIG_FOR_TESTING,
             },
         },
         solana_fee_calculator::FeeRateGovernor,
@@ -780,12 +780,12 @@ mod tests {
 
     #[test_matrix(
         [Features::None, Features::All],
-        [IndexLimitMb::Minimal, IndexLimitMb::InMemOnly],
+        [IndexInMemLimit::Minimal, IndexInMemLimit::InMemOnly],
         [MarkObsoleteAccounts::Disabled, MarkObsoleteAccounts::Enabled]
     )]
     fn test_verify_accounts_lt_hash_at_startup(
         features: Features,
-        accounts_index_limit: IndexLimitMb,
+        accounts_index_in_mem_limit: IndexInMemLimit,
         mark_obsolete_accounts: MarkObsoleteAccounts,
     ) {
         let (mut genesis_config, mint_keypair) = genesis_config_with(features);
@@ -872,7 +872,7 @@ mod tests {
         .unwrap();
         let (_accounts_tempdir, accounts_dir) = snapshot_utils::create_tmp_accounts_dir_for_tests();
         let accounts_index_config = AccountsIndexConfig {
-            index_limit_mb: accounts_index_limit,
+            index_in_mem_limit: accounts_index_in_mem_limit,
             ..ACCOUNTS_INDEX_CONFIG_FOR_TESTING
         };
         let accounts_db_config = AccountsDbConfig {

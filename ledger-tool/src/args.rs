@@ -5,7 +5,7 @@ use {
     solana_accounts_db::{
         accounts_db::{AccountsDbConfig, DEFAULT_MEMLOCK_BUDGET_SIZE},
         accounts_file::StorageAccess,
-        accounts_index::{AccountsIndexConfig, IndexLimitMb, ScanFilter},
+        accounts_index::{AccountsIndexConfig, IndexInMemLimit, ScanFilter},
     },
     solana_clap_utils::{
         hidden_unless_forced,
@@ -241,10 +241,10 @@ pub fn get_accounts_db_config(
     let ledger_tool_ledger_path = ledger_path.join(LEDGER_TOOL_DIRECTORY);
 
     let accounts_index_bins = value_t!(arg_matches, "accounts_index_bins", usize).ok();
-    let accounts_index_index_limit_mb = if arg_matches.is_present("disable_accounts_disk_index") {
-        IndexLimitMb::InMemOnly
+    let accounts_index_in_mem_limit = if arg_matches.is_present("disable_accounts_disk_index") {
+        IndexInMemLimit::InMemOnly
     } else {
-        IndexLimitMb::Minimal
+        IndexInMemLimit::Minimal
     };
     let accounts_index_drives = values_t!(arg_matches, "accounts_index_path", String)
         .ok()
@@ -252,7 +252,7 @@ pub fn get_accounts_db_config(
         .unwrap_or_else(|| vec![ledger_tool_ledger_path.join("accounts_index")]);
     let accounts_index_config = AccountsIndexConfig {
         bins: accounts_index_bins,
-        index_limit_mb: accounts_index_index_limit_mb,
+        index_in_mem_limit: accounts_index_in_mem_limit,
         drives: Some(accounts_index_drives),
         ..AccountsIndexConfig::default()
     };

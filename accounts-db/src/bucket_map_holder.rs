@@ -2,7 +2,7 @@ use {
     crate::{
         accounts_index::{
             in_mem_accounts_index::{InMemAccountsIndex, StartupStats},
-            AccountsIndexConfig, DiskIndexValue, IndexLimitMb, IndexValue,
+            AccountsIndexConfig, DiskIndexValue, IndexInMemLimit, IndexValue,
         },
         bucket_map_holder_stats::BucketMapHolderStats,
         waitable_condvar::WaitableCondvar,
@@ -209,9 +209,9 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> BucketMapHolder<T, U>
             .and_then(|drives| drives.first())
             .map(|drive| drive.join("accounts_index_restart"));
 
-        let disk = match config.index_limit_mb {
-            IndexLimitMb::InMemOnly => None,
-            IndexLimitMb::Minimal => Some(BucketMap::new(bucket_config)),
+        let disk = match config.index_in_mem_limit {
+            IndexInMemLimit::InMemOnly => None,
+            IndexInMemLimit::Minimal => Some(BucketMap::new(bucket_config)),
         };
 
         Self {

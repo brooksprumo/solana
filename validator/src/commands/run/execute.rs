@@ -13,7 +13,9 @@ use {
     solana_accounts_db::{
         accounts_db::{AccountShrinkThreshold, AccountsDbConfig, MarkObsoleteAccounts},
         accounts_file::StorageAccess,
-        accounts_index::{AccountSecondaryIndexes, AccountsIndexConfig, IndexLimitMb, ScanFilter},
+        accounts_index::{
+            AccountSecondaryIndexes, AccountsIndexConfig, IndexInMemLimit, ScanFilter,
+        },
         hardened_unpack::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
         utils::{
             create_all_accounts_run_and_snapshot_dirs, create_and_canonicalize_directories,
@@ -312,10 +314,11 @@ pub fn execute(
         accounts_index_config.bins = Some(bins);
     }
 
-    accounts_index_config.index_limit_mb = if matches.is_present("disable_accounts_disk_index") {
-        IndexLimitMb::InMemOnly
+    accounts_index_config.index_in_mem_limit = if matches.is_present("disable_accounts_disk_index")
+    {
+        IndexInMemLimit::InMemOnly
     } else {
-        IndexLimitMb::Minimal
+        IndexInMemLimit::Minimal
     };
 
     {
