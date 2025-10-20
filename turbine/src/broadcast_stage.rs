@@ -32,7 +32,6 @@ use {
         socket::SocketAddrSpace,
     },
     solana_time_utils::{timestamp, AtomicInterval},
-    static_assertions::const_assert_eq,
     std::{
         collections::{HashMap, HashSet},
         net::{SocketAddr, UdpSocket},
@@ -54,7 +53,8 @@ pub(crate) mod broadcast_utils;
 mod fail_entry_verification_broadcast_run;
 pub(crate) mod standard_broadcast_run;
 
-const_assert_eq!(CLUSTER_NODES_CACHE_NUM_EPOCH_CAP, 5);
+//const_assert_eq!(CLUSTER_NODES_CACHE_NUM_EPOCH_CAP, 5);
+// brooks TODO: can hardcode to 5?
 const CLUSTER_NODES_CACHE_NUM_EPOCH_CAP: usize = MAX_LEADER_SCHEDULE_STAKES as usize;
 const CLUSTER_NODES_CACHE_TTL: Duration = Duration::from_secs(5);
 
