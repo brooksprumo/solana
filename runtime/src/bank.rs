@@ -212,7 +212,8 @@ pub(crate) mod tests;
 
 pub const SECONDS_PER_YEAR: f64 = 365.25 * 24.0 * 60.0 * 60.0;
 
-pub const MAX_LEADER_SCHEDULE_STAKES: Epoch = 5;
+// brooks TODO: can reduce?
+pub const MAX_LEADER_SCHEDULE_STAKES: Epoch = 2;
 
 pub type BankStatusCache = StatusCache<Result<()>>;
 #[cfg_attr(
