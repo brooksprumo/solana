@@ -1059,6 +1059,26 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
             self.write_startup_info_to_disk();
         }
 
+        // 8 GB limit
+        // 88 bytes per entry
+        // 8 GB / 88 bytes per entry = 90,909,090 == 91 M entries
+        // 8 GB / 88 bytes per entry / 8192 = 11,097 == 11 K entries per bin
+        // pow2-floor
+        //
+        let limit_size: usize = 8_000_000_000;
+        let bytes_per_entry = Self::size_of_uninitialized() + Self::size_of_single_entry();
+        let num_bins = self.storage.bins;
+        let limit_entries_per_bin = limit_size / bytes_per_entry / num_bins;
+        let limit_entries_per_bin_log2 = limit_entries_per_bin.ilog2();
+        let flush_watermark_high = (1usize << limit_entries_per_bin_log2) * 3 / 4;
+        let num_entries = self.map_internal.read().unwrap().len();
+        if !startup && num_entries < flush_watermark_high {
+            // do not flush
+            assert_eq!(current_age, self.storage.current_age());
+            self.set_has_aged(current_age, can_advance_age);
+            return;
+        }
+
         let ages_flushing_now = if iterate_for_age && !startup {
             let old_value = self
                 .remaining_ages_to_skip_flushing
