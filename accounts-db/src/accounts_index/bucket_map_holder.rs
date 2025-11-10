@@ -27,7 +27,7 @@ const _: () = assert!(std::mem::size_of::<Age>() == std::mem::size_of::<AtomicAg
 // - 4 seconds was tried and showed a large reduction in disk iops, almost as good as when the disk
 //   index is entirely disabled!  But there were concerns about the in-mem index growth behavior.
 // - 2 seconds is much faster, and does also reduce disk iops quite a lot.
-const AGE_MS: u64 = 2_000;
+const AGE_MS: u64 = 400; // brooks <--
 
 pub struct BucketMapHolder<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> {
     pub disk: Option<BucketMap<(Slot, U)>>,
