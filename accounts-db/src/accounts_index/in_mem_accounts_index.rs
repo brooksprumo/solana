@@ -1065,7 +1065,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
         // 8 GB / 88 bytes per entry / 8192 = 11,097 == 11 K entries per bin
         // pow2-floor
         //
-        let limit_size: usize = 8_000_000_000;
+        let limit_size: usize = 32_000_000_000;
         let bytes_per_entry = Self::size_of_uninitialized() + Self::size_of_single_entry();
         let num_bins = self.storage.bins;
         let limit_entries_per_bin = limit_size / bytes_per_entry / num_bins;
