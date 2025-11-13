@@ -299,7 +299,17 @@ impl SnapshotBankFields {
 
     /// Collapse the SnapshotBankFields into a single (the latest) BankFieldsToDeserialize.
     pub fn collapse_into(self) -> BankFieldsToDeserialize {
-        self.incremental.unwrap_or(self.full)
+        // brooks TODO: here, grab the epoch stakes from full, then insert from incremental
+        if let Some(mut incremental) = self.incremental {
+            let mut epoch_stakes = self.full.versioned_epoch_stakes;
+            for (epoch, stakes) in incremental.versioned_epoch_stakes {
+                epoch_stakes.insert(epoch, stakes);
+            }
+            incremental.versioned_epoch_stakes = epoch_stakes;
+            incremental
+        } else {
+            self.full
+        }
     }
 }
 
