@@ -50,11 +50,19 @@ impl SnapshotPackage {
         // brooks TODO: if snapshot kind is incremental, only keep two latest epoch stakes
         let mut bank_fields_to_serialize = bank.get_fields_to_serialize();
         if snapshot_kind.is_incremental_snapshot() {
+            log::error!(
+                "brooks DEBUG: snapshot package: slot: {slot}, BEG: epoch stakes epochs: {:?}",
+                bank_fields_to_serialize.versioned_epoch_stakes.keys(),
+            );
             let epoch_stakes = &mut bank_fields_to_serialize.versioned_epoch_stakes;
             let mut epochs: Vec<_> = epoch_stakes.keys().cloned().collect();
             epochs.sort_unstable_by_key(|epoch| Reverse(*epoch));
             let epochs = &epochs[..2];
             epoch_stakes.retain(|epoch, _| epochs.contains(epoch));
+            log::error!(
+                "brooks DEBUG: snapshot package: slot: {slot}, END: epoch stakes epochs: {:?}",
+                bank_fields_to_serialize.versioned_epoch_stakes.keys(),
+            );
         }
         Self {
             snapshot_kind,

@@ -302,9 +302,18 @@ impl SnapshotBankFields {
         // brooks TODO: here, grab the epoch stakes from full, then insert from incremental
         if let Some(mut incremental) = self.incremental {
             let mut epoch_stakes = self.full.versioned_epoch_stakes;
+            error!(
+                "brooks DEBUG: BEG: full snapshot epoch stake epochs: {:?}, incremental snapshot epoch stake epochs: {:?}",
+                epoch_stakes.keys(),
+                incremental.versioned_epoch_stakes.keys(),
+            );
             for (epoch, stakes) in incremental.versioned_epoch_stakes {
                 epoch_stakes.insert(epoch, stakes);
             }
+            error!(
+                "brooks DEBUG: END: snapshot epoch stake epochs: {:?}",
+                epoch_stakes.keys(),
+            );
             incremental.versioned_epoch_stakes = epoch_stakes;
             incremental
         } else {
