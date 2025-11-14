@@ -1044,7 +1044,12 @@ impl Validator {
                      *         .unwrap();
                      * error!("brooks DEBUG: snapshotting bank... DONE: {bank_snapshot:?}");
                      */
-                    thread::sleep(Duration::from_secs(1));
+                    if snapshot_config.should_generate_snapshots() {
+                        for i in 0..5 {
+                            error!("brooks DEBUG: snapshots are enabled, so just sleep a bit... {i}");
+                            thread::sleep(Duration::from_secs(1));
+                        }
+                    }
 
                     error!("brooks DEBUG: taking fastboot snapshot... DONE");
                     exit_backpressure.store(false, Ordering::Relaxed);
