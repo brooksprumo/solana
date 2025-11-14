@@ -1001,9 +1001,11 @@ impl Validator {
         );
 
         // brooks:
-        if !snapshot_controller
-            .snapshot_config()
-            .should_generate_snapshots()
+        /*
+         * if !snapshot_controller
+         *     .snapshot_config()
+         *     .should_generate_snapshots()
+         */
         {
             // 1. register exit backpressure
             // 2. register exit fn
