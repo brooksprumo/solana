@@ -302,6 +302,10 @@ impl AdminRpc for AdminRpcImpl {
                 info!("validator exit requested");
                 meta.validator_exit.write().unwrap().exit();
 
+                error!(
+                    "brooks DEBUG: validator exit backpressure: {:?}",
+                    meta.validator_exit_backpressure
+                );
                 if !meta.validator_exit_backpressure.is_empty() {
                     let service_names = meta.validator_exit_backpressure.keys();
                     info!("Wait for these services to complete: {service_names:?}");

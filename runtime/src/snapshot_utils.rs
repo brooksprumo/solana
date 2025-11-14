@@ -498,6 +498,36 @@ pub fn serialize_and_archive_snapshot_package(
     Ok(snapshot_archive_info)
 }
 
+// brooks TODO:
+pub fn serialize_snapshot_package_for_fastboot(
+    snapshot_package: SnapshotPackage,
+    snapshot_config: &SnapshotConfig,
+) -> Result<BankSnapshotInfo> {
+    let SnapshotPackage {
+        snapshot_kind: _,
+        slot: _,
+        block_height: _,
+        hash: _,
+        snapshot_storages,
+        status_cache_slot_deltas,
+        bank_fields_to_serialize,
+        bank_hash_stats,
+        write_version,
+        enqueued: _,
+    } = snapshot_package;
+
+    serialize_snapshot(
+        &snapshot_config.bank_snapshots_dir,
+        snapshot_config.snapshot_version,
+        snapshot_storages.as_slice(),
+        status_cache_slot_deltas.as_slice(),
+        bank_fields_to_serialize,
+        bank_hash_stats,
+        write_version,
+        true, /* yes, flush and hard link storages */
+    )
+}
+
 /// Serializes a snapshot into `bank_snapshots_dir`
 #[allow(clippy::too_many_arguments)]
 fn serialize_snapshot(

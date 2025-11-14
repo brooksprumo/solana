@@ -630,10 +630,16 @@ pub fn execute(
         enable_scheduler_bindings: matches.is_present("enable_scheduler_bindings"),
         banking_trace_dir_byte_limit: parse_banking_trace_dir_byte_limit(matches),
         validator_exit: Arc::new(RwLock::new(Exit::default())),
-        validator_exit_backpressure: [(
-            SnapshotPackagerService::NAME.to_string(),
-            Arc::new(AtomicBool::new(false)),
-        )]
+        validator_exit_backpressure: [
+            (
+                SnapshotPackagerService::NAME.to_string(),
+                Arc::new(AtomicBool::new(false)),
+            ),
+            (
+                "brooks fastboot".to_string(),
+                Arc::new(AtomicBool::new(false)),
+            ),
+        ]
         .into(),
     };
 

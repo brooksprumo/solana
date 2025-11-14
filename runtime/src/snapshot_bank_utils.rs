@@ -777,6 +777,25 @@ pub fn bank_to_incremental_snapshot_archive(
     ))
 }
 
+// brooks TODO: doc
+// caller must ensure bank is rooted
+// caller must ensure ABS is not running
+pub fn bank_to_fastboot_snapshot(
+    bank: &Bank,
+    snapshot_config: &SnapshotConfig,
+) -> agave_snapshots::Result<BankSnapshotInfo> {
+    bank.force_flush_accounts_cache();
+
+    let snapshot_package = SnapshotPackage::new(
+        SnapshotKind::FullSnapshot,
+        bank,
+        bank.get_snapshot_storages(None),
+        bank.status_cache.read().unwrap().root_slot_deltas(),
+    );
+
+    snapshot_utils::serialize_snapshot_package_for_fastboot(snapshot_package, snapshot_config)
+}
+
 #[cfg(test)]
 mod tests {
     use {

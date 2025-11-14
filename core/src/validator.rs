@@ -999,6 +999,53 @@ impl Validator {
                 pruned_banks_request_handler,
             },
         );
+
+        // brooks:
+        if !snapshot_controller
+            .snapshot_config()
+            .should_generate_snapshots()
+        {
+            // 1. register exit backpressure
+            // 2. register exit fn
+            let abs_status = accounts_background_service.status().clone();
+            let exit_backpressure = config
+                .validator_exit_backpressure
+                .get("brooks fastboot")
+                .cloned()
+                .unwrap();
+            exit_backpressure.store(true, Ordering::Relaxed);
+            let bank_forks = bank_forks.clone();
+            let snapshot_config = snapshot_controller.snapshot_config().clone();
+            config
+                .validator_exit
+                .write()
+                .unwrap()
+                .register_exit(Box::new(move || {
+                    error!("brooks DEBUG: taking fastboot snapshot...");
+                    // read lock bank forks so it can't be dropped from under us
+                    let bank_forks = bank_forks.read().unwrap();
+                    let bank = bank_forks.root_bank();
+                    error!("brooks DEBUG: bank: {bank:?}");
+                    error!("brooks DEBUG: snapshot config: {snapshot_config:?}");
+
+                    // brooks TODO: wait for ABS to finish
+                    error!("brooks DEBUG: waiting for ABS to finish...");
+                    while abs_status.is_running() {
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                    error!("brooks DEBUG: waiting for ABS to finish... DONE");
+
+                    error!("brooks DEBUG: snapshotting bank...");
+                    let bank_snapshot =
+                        snapshot_bank_utils::bank_to_fastboot_snapshot(&bank, &snapshot_config)
+                            .unwrap();
+                    error!("brooks DEBUG: snapshotting bank... DONE: {bank_snapshot:?}");
+
+                    error!("brooks DEBUG: taking fastboot snapshot... DONE");
+                    exit_backpressure.store(false, Ordering::Relaxed);
+                }));
+        }
+
         info!(
             "Using: block-verification-method: {}, block-production-method: {}",
             config.block_verification_method, config.block_production_method,
