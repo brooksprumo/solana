@@ -1035,15 +1035,19 @@ impl Validator {
                     }
                     error!("brooks DEBUG: waiting for ABS to finish... DONE");
 
-                    error!("brooks DEBUG: snapshotting bank...");
-                    let bank_snapshot =
-                        snapshot_bank_utils::bank_to_fastboot_snapshot(&bank, &snapshot_config)
-                            .unwrap();
-                    error!("brooks DEBUG: snapshotting bank... DONE: {bank_snapshot:?}");
+                    /*
+                     * error!("brooks DEBUG: snapshotting bank...");
+                     * let bank_snapshot =
+                     *     snapshot_bank_utils::bank_to_fastboot_snapshot(&bank, &snapshot_config)
+                     *         .unwrap();
+                     * error!("brooks DEBUG: snapshotting bank... DONE: {bank_snapshot:?}");
+                     */
+                    thread::sleep(Duration::from_secs(1));
 
                     error!("brooks DEBUG: taking fastboot snapshot... DONE");
                     exit_backpressure.store(false, Ordering::Relaxed);
                 }));
+            error!("brooks DEBUG: successfully registered fastboot exit");
         }
 
         info!(
