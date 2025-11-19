@@ -829,41 +829,40 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
         startup || current_age.wrapping_sub(entry.age()) <= ages_flushing_now
     }
 
-    /// return true if 'entry' should be evicted from the in-mem index
+    /// Returns if `entry` should be evicted from the in-mem index
     fn should_evict_from_mem(
         &self,
-        current_age: Age,
         entry: &AccountMapEntry<T>,
-        startup: bool,
-        update_stats: bool,
+        current_age: Age,
         ages_flushing_now: Age,
-    ) -> bool {
+        startup: bool,
+    ) -> ShouldEvictFromMem {
         // this could be tunable dynamically based on memory pressure
-        // we could look at more ages or we could throw out more items we are choosing to keep in the cache
-        if Self::should_evict_based_on_age(current_age, entry, startup, ages_flushing_now) {
-            if entry.ref_count() != 1 {
-                Self::update_stat(&self.stats().held_in_mem.ref_count, 1);
-                false
-            } else {
-                // only read the slot list if we are planning to throw the item out
-                let slot_list = entry.slot_list_read_lock();
-                if slot_list.len() != 1 {
-                    if update_stats {
-                        Self::update_stat(&self.stats().held_in_mem.slot_list_len, 1);
-                    }
-                    false // keep 0 and > 1 slot lists in mem. They will be cleaned or shrunk soon.
-                } else {
-                    // keep items with slot lists that contained cached items
-                    let evict = !slot_list.iter().any(|(_, info)| info.is_cached());
-                    if !evict && update_stats {
-                        Self::update_stat(&self.stats().held_in_mem.slot_list_cached, 1);
-                    }
-                    evict
-                }
-            }
-        } else {
-            false
+        // we could look at more ages or we could throw out more items
+        // we are choosing to keep in the cache
+
+        if entry.dirty() {
+            return ShouldEvictFromMem::No(HoldInMemReason::Dirty);
         }
+
+        if !Self::should_evict_based_on_age(current_age, entry, startup, ages_flushing_now) {
+            return ShouldEvictFromMem::No(HoldInMemReason::Age);
+        }
+
+        if entry.ref_count() != 1 {
+            return ShouldEvictFromMem::No(HoldInMemReason::RefCount);
+        }
+
+        // only read the slot list if we are planning to throw the item out
+        let slot_list = entry.slot_list_read_lock();
+        if slot_list.len() != 1 {
+            return ShouldEvictFromMem::No(HoldInMemReason::SlotListLen);
+        }
+        if slot_list[0].1.is_cached() {
+            return ShouldEvictFromMem::No(HoldInMemReason::SlotListCached);
+        }
+
+        ShouldEvictFromMem::Yes
     }
 
     /// Collect possible evictions from `iter` by checking age
@@ -1101,16 +1100,15 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
 
                             let mut mse = Measure::start("flush_should_evict");
                             let should_evict = self.should_evict_from_mem(
-                                current_age,
                                 entry,
-                                startup,
-                                true,
+                                current_age,
                                 ages_flushing_now,
+                                startup,
                             );
                             mse.stop();
                             flush_stats.flush_should_evict_us += mse.as_us();
 
-                            if !should_evict {
+                            if should_evict != ShouldEvictFromMem::Yes {
                                 // not evicting, so don't write, even if dirty
                                 flush_stats.flush_read_lock_us += lock_measure.end_as_us();
                                 return None;
@@ -1208,6 +1206,10 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
         let stats = self.stats();
         let mut failed = 0;
         let mut evicted = 0;
+        let mut num_held_in_mem_ref_count = 0;
+        let mut num_held_in_mem_slot_list_len = 0;
+        let mut num_held_in_mem_slot_list_cached = 0;
+
         // chunk these so we don't hold the write lock too long
         for evictions in evictions.chunks(50) {
             let mut map = self.map_internal.write().unwrap();
@@ -1215,25 +1217,29 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
             for k in evictions {
                 if let Entry::Occupied(occupied) = map.entry(*k) {
                     let v = occupied.get();
-
-                    if v.dirty()
-                        || !Self::should_evict_based_on_age(
-                            current_age,
-                            v,
-                            startup,
-                            ages_flushing_now,
-                        )
-                    {
-                        // marked dirty or bumped in age after we looked above
-                        // these evictions will be handled in later passes (at later ages)
-                        // but, at startup, everything is ready to age out if it isn't dirty
-                        failed += 1;
-                        continue;
+                    let should_evict =
+                        self.should_evict_from_mem(v, current_age, ages_flushing_now, startup);
+                    match should_evict {
+                        ShouldEvictFromMem::Yes => {
+                            evicted += 1;
+                            occupied.remove();
+                        }
+                        ShouldEvictFromMem::No(hold_in_mem_reason) => {
+                            failed += 1;
+                            match hold_in_mem_reason {
+                                HoldInMemReason::Dirty | HoldInMemReason::Age => {
+                                    // marked dirty or bumped in age after we looked above
+                                    // these evictions will be handled in later passes (at later ages)
+                                    // but, at startup, everything is ready to age out if it isn't dirty
+                                }
+                                HoldInMemReason::RefCount => num_held_in_mem_ref_count += 1,
+                                HoldInMemReason::SlotListLen => num_held_in_mem_slot_list_len += 1,
+                                HoldInMemReason::SlotListCached => {
+                                    num_held_in_mem_slot_list_cached += 1
+                                }
+                            }
+                        }
                     }
-
-                    // all conditions for eviction succeeded, so really evict item from in-mem cache
-                    evicted += 1;
-                    occupied.remove();
                 }
             }
             let capacity_post = map.capacity();
@@ -1242,7 +1248,16 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
         }
         stats.sub_mem_count(evicted);
         Self::update_stat(&stats.flush_entries_evicted_from_mem, evicted as u64);
-        Self::update_stat(&stats.failed_to_evict, failed as u64);
+        Self::update_stat(&stats.failed_to_evict, failed);
+        Self::update_stat(&stats.held_in_mem.ref_count, num_held_in_mem_ref_count);
+        Self::update_stat(
+            &stats.held_in_mem.slot_list_len,
+            num_held_in_mem_slot_list_len,
+        );
+        Self::update_stat(
+            &stats.held_in_mem.slot_list_cached,
+            num_held_in_mem_slot_list_cached,
+        );
     }
 
     pub fn stats(&self) -> &Stats {
@@ -1334,6 +1349,33 @@ impl Drop for FlushGuard<'_> {
     fn drop(&mut self) {
         self.flushing.store(false, Ordering::Release);
     }
+}
+
+/// Should an entry be evicted from the in-mem index?
+#[derive(Debug, Eq, PartialEq)]
+enum ShouldEvictFromMem {
+    /// Yes, evict this entry
+    Yes,
+    /// No, do not evict this entry. See inner `HoldInMemReason` for why.
+    No(HoldInMemReason),
+}
+
+/// Why was an entry *not* evicted from the in-mem index?
+#[derive(Debug, Eq, PartialEq)]
+enum HoldInMemReason {
+    /// Dirty entries must be flushed to disk before they can be evicted.
+    Dirty,
+    /// This entry isn't old enough to evict yet.
+    Age,
+    /// ref count was != 1
+    /// This account has versions in multiple storages, and will be cleaned/shrunk soon.
+    RefCount,
+    /// slot list len was != 1
+    /// This account has versions in multiple locations, and will be cleaned/shrunk soon.
+    SlotListLen,
+    /// slot list contained an item with a cached account
+    /// An account in the write cache will be flushed soon, so do not evict yet.
+    SlotListCached,
 }
 
 #[cfg(test)]
@@ -1669,13 +1711,8 @@ mod tests {
 
             // exceeded budget
             assert_eq!(
-                bucket.should_evict_from_mem(
-                    current_age,
-                    &one_element_slot_list_entry,
-                    startup,
-                    false,
-                    1,
-                ),
+                bucket.should_evict_from_mem(&one_element_slot_list_entry, current_age, 1, startup)
+                    == ShouldEvictFromMem::Yes,
                 ref_count == 1
             );
         }
@@ -1755,78 +1792,72 @@ mod tests {
         );
 
         // empty slot list
-        assert!(!bucket.should_evict_from_mem(
-            current_age,
-            &AccountMapEntry::new(SlotList::new(), ref_count, AccountMapEntryMeta::default()),
-            startup,
-            false,
-            0,
-        ));
-        // 1 element slot list
-        assert!(bucket.should_evict_from_mem(
-            current_age,
-            &one_element_slot_list_entry,
-            startup,
-            false,
-            0,
-        ));
-        // 2 element slot list
-        assert!(!bucket.should_evict_from_mem(
-            current_age,
-            &AccountMapEntry::new(
-                SlotList::from_iter([(0, 0u64), (1, 1)]),
-                ref_count,
-                AccountMapEntryMeta::default()
+        assert_eq!(
+            bucket.should_evict_from_mem(
+                &AccountMapEntry::new(SlotList::new(), ref_count, AccountMapEntryMeta::default()),
+                current_age,
+                0,
+                startup,
             ),
-            startup,
-            false,
-            0,
-        ));
+            ShouldEvictFromMem::No(HoldInMemReason::SlotListLen),
+        );
+        // 1 element slot list
+        assert_eq!(
+            bucket.should_evict_from_mem(&one_element_slot_list_entry, current_age, 0, startup),
+            ShouldEvictFromMem::Yes,
+        );
+        // 2 element slot list
+        assert_eq!(
+            bucket.should_evict_from_mem(
+                &AccountMapEntry::new(
+                    SlotList::from_iter([(0, 0u64), (1, 1)]),
+                    ref_count,
+                    AccountMapEntryMeta::default()
+                ),
+                current_age,
+                0,
+                startup,
+            ),
+            ShouldEvictFromMem::No(HoldInMemReason::SlotListLen),
+        );
 
         {
             let bucket = new_for_test::<f64>();
             // 1 element slot list with a CACHED item - f64 acts like cached
-            assert!(!bucket.should_evict_from_mem(
-                current_age,
-                &AccountMapEntry::new(
-                    SlotList::from([(0, 0.0)]),
-                    ref_count,
-                    AccountMapEntryMeta::default()
+            assert_eq!(
+                bucket.should_evict_from_mem(
+                    &AccountMapEntry::new(
+                        SlotList::from([(0, 0.0)]),
+                        ref_count,
+                        AccountMapEntryMeta::default()
+                    ),
+                    current_age,
+                    0,
+                    startup,
                 ),
-                startup,
-                false,
-                0,
-            ));
+                ShouldEvictFromMem::No(HoldInMemReason::SlotListCached),
+            );
         }
 
         // 1 element slot list, age is now
-        assert!(bucket.should_evict_from_mem(
-            current_age,
-            &one_element_slot_list_entry,
-            startup,
-            false,
-            0,
-        ));
+        assert_eq!(
+            bucket.should_evict_from_mem(&one_element_slot_list_entry, current_age, 0, startup),
+            ShouldEvictFromMem::Yes,
+        );
 
         // 1 element slot list, but not current age
         current_age = 1;
-        assert!(!bucket.should_evict_from_mem(
-            current_age,
-            &one_element_slot_list_entry,
-            startup,
-            false,
-            0,
-        ));
+        assert_eq!(
+            bucket.should_evict_from_mem(&one_element_slot_list_entry, current_age, 0, startup),
+            ShouldEvictFromMem::No(HoldInMemReason::Age),
+        );
 
         // 1 element slot list, but at startup and age not current
         startup = true;
-        assert!(bucket.should_evict_from_mem(
-            current_age,
-            &one_element_slot_list_entry,
-            startup,
-            false,
-            0,
-        ));
+        assert_eq!(
+            bucket.should_evict_from_mem(&one_element_slot_list_entry, current_age, 0, startup),
+            ShouldEvictFromMem::Yes,
+        );
     }
 
     #[test]
