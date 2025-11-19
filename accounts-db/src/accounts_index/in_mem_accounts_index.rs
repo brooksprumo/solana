@@ -908,6 +908,12 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
     ) -> Vec<(Pubkey, /*is_dirty*/ bool)> {
         let (possible_evictions, m) = {
             let map = self.map_internal.read().unwrap();
+            if startup && !map.is_empty() {
+                log::error!(
+                    "brooks DEBUG: startup is true, but in-mem index is not empty! len: {}",
+                    map.len()
+                );
+            }
             let m = Measure::start("flush_scan"); // we don't care about lock time in this metric - bg threads can wait
             let possible_evictions = Self::gather_possible_evictions(
                 map.iter(),
