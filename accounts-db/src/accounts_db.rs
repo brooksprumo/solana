@@ -1180,7 +1180,7 @@ pub struct AccountsDb {
     zero_lamport_accounts_to_purge_after_full_snapshot: DashSet<(Slot, Pubkey)>,
 
     /// GeyserPlugin accounts update notifier
-    accounts_update_notifier: Option<AccountsUpdateNotifier>,
+    pub accounts_update_notifier: Option<AccountsUpdateNotifier>,
 
     pub(crate) active_stats: ActiveStats,
 
@@ -5962,32 +5962,39 @@ impl AccountsDb {
         &self,
         slot: Slot,
         accounts_and_meta_to_store: &impl StorableAccounts<'b>,
-        txs: Option<&[&SanitizedTransaction]>,
+        _txs: Option<&[&SanitizedTransaction]>, // brooks TODO: remove me
     ) -> Vec<AccountInfo> {
-        let mut current_write_version = if self.accounts_update_notifier.is_some() {
-            self.write_version
-                .fetch_add(accounts_and_meta_to_store.len() as u64, Ordering::AcqRel)
-        } else {
-            0
-        };
+        /*
+         * let mut current_write_version = if self.accounts_update_notifier.is_some() {
+         *     self.write_version
+         *         .fetch_add(accounts_and_meta_to_store.len() as u64, Ordering::AcqRel)
+         * } else {
+         *     0
+         * };
+         */
 
+        // brooks TODO: remove all this geyser accounts_update stuff and move it back to bank
         (0..accounts_and_meta_to_store.len())
             .map(|index| {
-                let txn = txs.map(|txs| *txs.get(index).expect("txs must be present if provided"));
+                /*
+                 * let txn = txs.map(|txs| *txs.get(index).expect("txs must be present if provided"));
+                 */
                 accounts_and_meta_to_store.account_default_if_zero_lamport(index, |account| {
                     let account_shared_data = account.take_account();
                     let pubkey = account.pubkey();
                     let account_info =
                         AccountInfo::new(StorageLocation::Cached, account.is_zero_lamport());
 
-                    self.notify_account_at_accounts_update(
-                        slot,
-                        &account_shared_data,
-                        &txn,
-                        pubkey,
-                        current_write_version,
-                    );
-                    current_write_version = current_write_version.saturating_add(1);
+                    /*
+                     * self.notify_account_at_accounts_update(
+                     *     slot,
+                     *     &account_shared_data,
+                     *     &txn,
+                     *     pubkey,
+                     *     current_write_version,
+                     * );
+                     * current_write_version = current_write_version.saturating_add(1);
+                     */
 
                     self.accounts_cache.store(slot, pubkey, account_shared_data);
                     account_info

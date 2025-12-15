@@ -4,6 +4,7 @@ use {
 };
 
 impl AccountsDb {
+    // brooks TODO: remove, or move to Bank
     pub fn notify_account_at_accounts_update(
         &self,
         slot: Slot,

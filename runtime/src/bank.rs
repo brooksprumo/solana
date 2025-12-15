@@ -579,6 +579,7 @@ impl PartialEq for Bank {
             block_id,
             bank_hash_stats: _,
             epoch_rewards_calculation_cache: _,
+            write_version_for_geyser: _,
             // Ignore new fields explicitly if they do not impact PartialEq.
             // Adding ".." will remove compile-time checks that if a new field
             // is added to the struct, this PartialEq is accordingly updated.
@@ -926,6 +927,9 @@ pub struct Bank {
     /// This is used to avoid recalculating the same epoch rewards at epoch boundary.
     /// The hashmap is keyed by parent_hash.
     epoch_rewards_calculation_cache: Arc<Mutex<HashMap<Hash, Arc<PartitionedRewardsCalculation>>>>,
+
+    // brooks TODO: doc
+    write_version_for_geyser: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -1130,6 +1134,7 @@ impl Bank {
             block_id: RwLock::new(None),
             bank_hash_stats: AtomicBankHashStats::default(),
             epoch_rewards_calculation_cache: Arc::new(Mutex::new(HashMap::default())),
+            write_version_for_geyser: AtomicU64::new(0),
         };
 
         bank.transaction_processor =
@@ -1377,6 +1382,7 @@ impl Bank {
             block_id: RwLock::new(None),
             bank_hash_stats: AtomicBankHashStats::default(),
             epoch_rewards_calculation_cache: parent.epoch_rewards_calculation_cache.clone(),
+            write_version_for_geyser: AtomicU64::new(0),
         };
 
         let (_, ancestors_time_us) = measure_us!({
@@ -1899,6 +1905,7 @@ impl Bank {
             block_id: RwLock::new(None),
             bank_hash_stats: AtomicBankHashStats::new(&fields.bank_hash_stats),
             epoch_rewards_calculation_cache: Arc::new(Mutex::new(HashMap::default())),
+            write_version_for_geyser: AtomicU64::new(0), // brooks TODO: could get from fields??
         };
 
         // Sanity assertions between bank snapshot and genesis config
@@ -3702,6 +3709,41 @@ impl Bank {
             self.rc
                 .accounts
                 .store_accounts_seq(to_store, transactions.as_deref());
+
+            // brooks TODO: do geyser account_updates here, before (or after?) calling `store_accounts()`
+            // use the lt hash cache to get the initial state of an account that was closed (so we can get the original owner)
+            if let Some(geyser) = self
+                .accounts()
+                .accounts_db
+                .accounts_update_notifier
+                .as_ref()
+            {
+                // brooks TODO: impl
+                // get and update write_version
+                //     new write_version_for_geyser field can be added to the bank, since write version only matters within a single slot
+                // go through accounts to store
+                // if account is default/None, then look it up in the accounts lt hash cache and update the account's owner with value from lt hash cache
+                // call geyser notify_account
+                let mut current_write_version = self
+                    .write_version_for_geyser
+                    .fetch_add(accounts_to_store.len() as u64, Ordering::Relaxed);
+                for (i, (pubkey, account)) in accounts_to_store.iter().enumerate() {
+                    let txn = transactions
+                        .as_ref()
+                        .map(|txs| *txs.get(i).expect("txs must be present if provided"));
+                    if account.lamports() == 0 {
+                        error!("brooks DEBUG: geyser account update, closed in slot {}, {pubkey}: {account:?}", self.slot());
+                    }
+                    geyser.notify_account_update(
+                        self.slot(),
+                        account,
+                        &txn,
+                        pubkey,
+                        current_write_version,
+                    );
+                    current_write_version += 1;
+                }
+            }
         });
 
         // Cached vote and stake accounts are synchronized with accounts-db
