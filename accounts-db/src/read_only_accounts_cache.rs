@@ -173,7 +173,7 @@ impl ReadOnlyAccountsCache {
 
     #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
     pub(crate) fn store(&self, pubkey: Pubkey, slot: Slot, account: AccountSharedData) {
-        self.store_with_timestamp(pubkey, slot, account, self.timestamp())
+        // brooks: self.store_with_timestamp(pubkey, slot, account, self.timestamp())
     }
 
     #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
