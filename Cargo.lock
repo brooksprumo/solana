@@ -1445,6 +1445,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake3"
+version = "1.8.3"
+source = "git+https://github.com/brooksprumo/BLAKE3.git?branch=fill-maybe-uninit#b78b841328d9bcab5fc9ab1914823d6e291ab520"
+dependencies = [
+ "arrayref",
+ "arrayvec",
+ "cc",
+ "cfg-if 1.0.4",
+ "constant_time_eq",
+ "cpufeatures",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7075,7 +7088,7 @@ dependencies = [
  "ahash 0.8.12",
  "assert_matches",
  "bincode",
- "blake3",
+ "blake3 1.8.3 (git+https://github.com/brooksprumo/BLAKE3.git?branch=fill-maybe-uninit)",
  "bv",
  "bytemuck",
  "bytemuck_derive",
@@ -7354,7 +7367,7 @@ version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7116e1d942a2432ca3f514625104757ab8a56233787e95144c93950029e31176"
 dependencies = [
- "blake3",
+ "blake3 1.8.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "solana-define-syscall 4.0.1",
  "solana-hash 4.0.1",
 ]
@@ -9013,7 +9026,7 @@ name = "solana-lattice-hash"
 version = "4.0.0-alpha.0"
 dependencies = [
  "base64 0.22.1",
- "blake3",
+ "blake3 1.8.3 (git+https://github.com/brooksprumo/BLAKE3.git?branch=fill-maybe-uninit)",
  "bs58",
  "bytemuck",
  "criterion",
@@ -9317,7 +9330,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85666605c9fd727f865ed381665db0a8fc29f984a030ecc1e40f43bfb2541623"
 dependencies = [
  "bincode",
- "blake3",
+ "blake3 1.8.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "lazy_static",
  "serde",
  "serde_derive",
@@ -10284,7 +10297,7 @@ dependencies = [
  "assert_matches",
  "base64 0.22.1",
  "bincode",
- "blake3",
+ "blake3 1.8.3 (git+https://github.com/brooksprumo/BLAKE3.git?branch=fill-maybe-uninit)",
  "bv",
  "bytemuck",
  "crossbeam-channel",

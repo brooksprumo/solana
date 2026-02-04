@@ -48,6 +48,10 @@ fn bench_with(c: &mut Criterion) {
     c.bench_function("with", |b| {
         b.iter(|| LtHash::with(&hasher));
     });
+
+    c.bench_function("with2", |b| {
+        b.iter(|| LtHash::with2(&hasher));
+    });
 }
 
 criterion_group!(

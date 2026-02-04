@@ -234,7 +234,8 @@ bencher = "0.1.5"
 bincode = "1.3.3"
 bitflags = { version = "2.10.0" }
 bitvec = { version = "1.0.1", features = ["serde"] }
-blake3 = "1.8.3"
+#blake3 = { path = "/Users/brooks/src/BLAKE3" }
+blake3 = { git = "https://github.com/brooksprumo/BLAKE3.git", branch = "fill-maybe-uninit" }
 blst = "0.3.16"
 blstrs = "0.7.1"
 borsh = { version = "1.6.0", features = ["derive", "unstable__schema"] }
