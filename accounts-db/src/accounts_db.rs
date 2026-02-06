@@ -6391,7 +6391,7 @@ impl AccountsDb {
                             let mut state = IndexGenerationThreadState::default();
                             let mut reader = append_vec::new_scan_accounts_reader();
                             for next_item in storages_orderer.iter() {
-                                self.maybe_throttle_index_generation();
+                                // brooks XXX: self.maybe_throttle_index_generation();
                                 let storage = next_item.storage;
                                 let slot_info =
                                     self.generate_index_for_slot(&mut reader, &mut state, storage);
