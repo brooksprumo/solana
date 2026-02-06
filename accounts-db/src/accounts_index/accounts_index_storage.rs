@@ -107,6 +107,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndexStorage<
         self.storage.set_startup(is_startup);
     }
 
+    // brooks TODO: remove me
     /// estimate how many items are still needing to be flushed to the disk cache.
     pub fn get_startup_remaining_items_to_flush_estimate(&self) -> usize {
         self.storage

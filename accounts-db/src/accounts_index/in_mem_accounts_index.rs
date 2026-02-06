@@ -24,6 +24,7 @@ use {
             atomic::{AtomicBool, AtomicU64, Ordering},
             Arc, Mutex, RwLock,
         },
+        time::Instant,
     },
 };
 
@@ -101,12 +102,24 @@ struct StartupInfoDuplicates<T: IndexValue> {
     duplicates_from_in_memory_only: Vec<(Slot, Pubkey)>,
 }
 
-#[derive(Default, Debug)]
+#[derive(Debug)]
 struct StartupInfo<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> {
     /// entries to add next time we are flushing to disk
-    insert: Mutex<Vec<(Pubkey, (Slot, U))>>,
+    insert_a: Mutex<Vec<(Pubkey, (Slot, U))>>,
+    // brooks TODO: doc
+    insert_b: Mutex<Option<Vec<(Pubkey, (Slot, U))>>>,
     /// pubkeys with more than 1 entry
     duplicates: Mutex<StartupInfoDuplicates<T>>,
+}
+
+impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> Default for StartupInfo<T, U> {
+    fn default() -> Self {
+        Self {
+            insert_a: Mutex::new(Vec::default()),
+            insert_b: Mutex::new(Some(Vec::default())), // <-- must be Some
+            duplicates: Mutex::new(StartupInfoDuplicates::default()),
+        }
+    }
 }
 
 impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T, U> {
@@ -686,12 +699,14 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
         assert!(self.storage.get_startup());
         assert!(self.bucket.is_some());
 
-        let mut insert = self.startup_info.insert.lock().unwrap();
+        let mut insert = self.startup_info.insert_a.lock().unwrap();
         let m = Measure::start("copy");
         insert.extend(items.map(|(k, v)| (k, (slot, v.into()))));
+        let copy_data_us = m.end_as_us();
+        drop(insert);
         self.startup_stats
             .copy_data_us
-            .fetch_add(m.end_as_us(), Ordering::Relaxed);
+            .fetch_add(copy_data_us, Ordering::Relaxed);
     }
 
     pub fn startup_update_duplicates_from_in_memory_only(&self, items: Vec<(Slot, Pubkey)>) {
@@ -975,11 +990,18 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
     /// If the configured memory limit is "minimal", nothing is writen to in-mem.
     /// Otherwise write to in-mem (and respect the memory limit).
     fn write_startup_info(&self) {
-        let insert = std::mem::take(&mut *self.startup_info.insert.lock().unwrap());
-        if insert.is_empty() {
-            // nothing to insert for this bin
-            return;
-        }
+        let mut insert = {
+            let mut insert_a = self.startup_info.insert_a.lock().unwrap();
+            let insert_a = &mut *insert_a;
+            if insert_a.is_empty() {
+                // nothing to insert for this bin
+                return;
+            }
+            // double buffer swap
+            // SAFETY: brooks TODO must be Some
+            let insert_b_inner = self.startup_info.insert_b.lock().unwrap().take().unwrap();
+            mem::replace(insert_a, insert_b_inner)
+        };
 
         // this fn should only be called from a single thread, so holding the lock is fine
         let mut duplicates = self.startup_info.duplicates.lock().unwrap();
@@ -1063,6 +1085,15 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
             drop(map_internal);
         }
 
+        // brooks TODO: put insert back
+        {
+            insert.clear();
+            let mut insert_b = self.startup_info.insert_b.lock().unwrap();
+            // SAFETY: brooks TODO
+            assert!(insert_b.is_none());
+            *insert_b = Some(insert);
+        };
+
         self.stats().inc_insert_count(count);
     }
 
@@ -1071,8 +1102,29 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
     /// These were collected for this bin when we did batch inserts in the bg flush threads.
     /// Insert these into the in-mem index, then return the duplicate (Slot, Pubkey)
     pub fn populate_and_retrieve_duplicate_keys_from_startup(&self) -> Vec<(Slot, Pubkey)> {
-        // in order to return accurate and complete duplicates, we must have nothing left remaining to insert
-        assert!(self.startup_info.insert.lock().unwrap().is_empty());
+        {
+            // in order to return accurate and complete duplicates, we must have nothing left remaining to insert
+            // brooks TODO: check/ensure both
+            // brooks TODO: also need to drop both??
+
+            // brooks TODO: doc, make sure startup info is empty, and also drop the vecs
+            // TODO: time it?
+            let start = Instant::now();
+
+            let insert_a = mem::take(&mut *self.startup_info.insert_a.lock().unwrap());
+            assert!(insert_a.is_empty());
+            drop(insert_a);
+
+            // brooks TODO: doc SAFETY
+            let insert_b = self.startup_info.insert_b.lock().unwrap().take().unwrap();
+            assert!(insert_b.is_empty());
+            drop(insert_b);
+
+            log::error!(
+                "brooks DEBUG: done dropping startup_info insert vecs, and took: {:?}",
+                start.elapsed()
+            );
+        }
 
         let mut duplicate_items = self.startup_info.duplicates.lock().unwrap();
         let duplicates = std::mem::take(&mut duplicate_items.duplicates);
@@ -2602,12 +2654,19 @@ mod tests {
             (Pubkey::new_unique(), (/*slot*/ 11, /*T*/ 42))
         })
         .take(high_water_mark);
-        index.startup_info.insert.lock().unwrap().extend(to_insert);
+        // brooks TODO: fix
+        index
+            .startup_info
+            .insert_a
+            .lock()
+            .unwrap()
+            .extend(to_insert);
 
         // Also push some duplicates, to ensure we do not put those in-mem
         let duplicate_pubkey = Pubkey::new_unique();
         {
-            let mut startup_info_insert = index.startup_info.insert.lock().unwrap();
+            // brooks TODO: fix
+            let mut startup_info_insert = index.startup_info.insert_a.lock().unwrap();
             // Yes, we want three duplicates.  Two is the minimum (by definition), but we want
             // three to ensure we don't see the first two, remove 'em, then see a third and think
             // "oh, this is a new non-duplicate!" and erroneously insert it in-mem.
