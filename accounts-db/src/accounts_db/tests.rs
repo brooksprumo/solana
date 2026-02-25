@@ -6869,3 +6869,114 @@ fn test_write_accounts_to_cache_scenarios(
         "Wrong number of duplicate skips"
     );
 }
+
+#[cfg(all(test, feature = "shuttle-test"))]
+mod shuttle_tests {
+    use {
+        super::*,
+        shuttle::{check_dfs, check_random, sync::Arc as ShuttleArc, thread},
+    };
+
+    const SHUTTLE_DFS_ITERATIONS: usize = 40;
+    const SHUTTLE_RANDOM_ITERATIONS: usize = 250;
+    const TEST_SLOT: Slot = 11;
+    const TEST_BANK_ID: BankId = 11;
+
+    fn setup_single_unrooted_account() -> (ShuttleArc<AccountsDb>, Ancestors, Pubkey, u64) {
+        let db = AccountsDb::new_single_for_tests();
+        let pubkey = Pubkey::new_unique();
+        let lamports = 42;
+        let account = AccountSharedData::new(lamports, 0, AccountSharedData::default().owner());
+        db.store_for_tests((TEST_SLOT, &[(&pubkey, &account)][..]));
+        let ancestors = Ancestors::from(vec![(TEST_SLOT, 0)]);
+        (ShuttleArc::new(db), ancestors, pubkey, lamports)
+    }
+
+    fn do_test_shuttle_remove_unrooted_slots_vs_flush_unrooted_slot_cache() {
+        let (db, _ancestors, pubkey, _lamports) = setup_single_unrooted_account();
+        let db_for_remove = db.clone();
+        let db_for_flush = db.clone();
+
+        let remove_handle = thread::spawn(move || {
+            thread::yield_now();
+            db_for_remove.remove_unrooted_slots(&[(TEST_SLOT, TEST_BANK_ID)]);
+        });
+        let flush_handle = thread::spawn(move || {
+            thread::yield_now();
+            let _ = db_for_flush.flush_unrooted_slot_cache(TEST_SLOT);
+        });
+
+        remove_handle.join().unwrap();
+        flush_handle.join().unwrap();
+
+        assert_no_storages_at_slot(&db, TEST_SLOT);
+        assert!(db.accounts_cache.slot_cache(TEST_SLOT).is_none());
+        assert!(!db.accounts_index.contains(&pubkey));
+    }
+
+    #[test]
+    fn test_shuttle_remove_unrooted_slots_vs_flush_unrooted_slot_cache_dfs() {
+        check_dfs(
+            do_test_shuttle_remove_unrooted_slots_vs_flush_unrooted_slot_cache,
+            Some(SHUTTLE_DFS_ITERATIONS),
+        );
+    }
+
+    #[test]
+    fn test_shuttle_remove_unrooted_slots_vs_flush_unrooted_slot_cache_random() {
+        check_random(
+            do_test_shuttle_remove_unrooted_slots_vs_flush_unrooted_slot_cache,
+            SHUTTLE_RANDOM_ITERATIONS,
+        );
+    }
+
+    fn do_test_shuttle_do_load_with_populate_read_cache_vs_remove_unrooted_slots() {
+        let (db, ancestors, pubkey, lamports) = setup_single_unrooted_account();
+        let db_for_load = db.clone();
+        let db_for_remove = db.clone();
+        let ancestors_for_load = ancestors.clone();
+
+        let load_handle = thread::spawn(move || {
+            // This exercises `do_load_with_populate_read_cache()` through `do_load()`.
+            for _ in 0..2 {
+                let loaded = db_for_load.do_load(
+                    &ancestors_for_load,
+                    &pubkey,
+                    LoadHint::Unspecified,
+                    LoadZeroLamports::None,
+                    PopulateReadCache::True,
+                );
+                if let Some((account, _slot)) = loaded {
+                    assert_eq!(account.lamports(), lamports);
+                }
+                thread::yield_now();
+            }
+        });
+        let remove_handle = thread::spawn(move || {
+            thread::yield_now();
+            db_for_remove.remove_unrooted_slots(&[(TEST_SLOT, TEST_BANK_ID)]);
+        });
+
+        load_handle.join().unwrap();
+        remove_handle.join().unwrap();
+
+        assert_no_storages_at_slot(&db, TEST_SLOT);
+        assert!(db.accounts_cache.slot_cache(TEST_SLOT).is_none());
+    }
+
+    #[test]
+    fn test_shuttle_do_load_with_populate_read_cache_vs_remove_unrooted_slots_dfs() {
+        check_dfs(
+            do_test_shuttle_do_load_with_populate_read_cache_vs_remove_unrooted_slots,
+            Some(SHUTTLE_DFS_ITERATIONS),
+        );
+    }
+
+    #[test]
+    fn test_shuttle_do_load_with_populate_read_cache_vs_remove_unrooted_slots_random() {
+        check_random(
+            do_test_shuttle_do_load_with_populate_read_cache_vs_remove_unrooted_slots,
+            SHUTTLE_RANDOM_ITERATIONS,
+        );
+    }
+}
