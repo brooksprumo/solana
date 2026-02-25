@@ -4651,7 +4651,7 @@ pub(crate) mod tests {
         },
         crossbeam_channel::unbounded,
         itertools::Itertools,
-        solana_account::{ReadableAccount, state_traits::StateMut},
+        solana_account::{AccountSharedData, ReadableAccount, state_traits::StateMut},
         solana_client::connection_cache::ConnectionCache,
         solana_clock::NUM_CONSECUTIVE_LEADER_SLOTS,
         solana_entry::entry::{self, Entry},
@@ -4678,18 +4678,29 @@ pub(crate) mod tests {
         solana_runtime::{
             commitment::{BlockCommitment, VOTE_THRESHOLD_SIZE},
             genesis_utils::{GenesisConfigInfo, ValidatorVoteKeypairs},
+            installed_scheduler_pool::SchedulingContext,
         },
+        solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
         solana_sha256_hasher::hash,
+        solana_sdk_ids::system_program,
+        solana_svm_timings::ExecuteTimings,
         solana_system_transaction as system_transaction,
         solana_tpu_client::tpu_client::{DEFAULT_TPU_CONNECTION_POOL_SIZE, DEFAULT_VOTE_USE_QUIC},
-        solana_transaction_error::TransactionError,
+        solana_transaction_error::{TransactionError, TransactionResult as Result},
         solana_transaction_status::VersionedTransactionWithStatusMeta,
+        solana_unified_scheduler_logic::{OrderedTaskId, Task},
+        solana_unified_scheduler_pool::{
+            DefaultTaskHandler, HandlerContext, PooledScheduler, SchedulerPool, TaskHandler,
+        },
         solana_vote::vote_transaction,
         solana_vote_program::vote_state::{self, TowerSync, VoteStateV4, VoteStateVersions},
         std::{
             fs::remove_dir_all,
             iter,
+            panic::{self, AssertUnwindSafe},
             sync::{Arc, Mutex, RwLock, atomic::AtomicU64},
+            thread,
+            time::Duration,
         },
         tempfile::tempdir,
         test_case::test_case,
@@ -6595,6 +6606,158 @@ pub(crate) mod tests {
             parent_slot,
             &progress_map,
         ));
+    }
+
+    #[derive(Debug)]
+    struct DelayTaskHandler;
+    impl TaskHandler for DelayTaskHandler {
+        fn handle(
+            result: &mut Result<()>,
+            timings: &mut ExecuteTimings,
+            scheduling_context: &SchedulingContext,
+            task: &Task,
+            handler_context: &HandlerContext,
+        ) {
+            // Stretch execution a bit so purge and execution overlap more reliably.
+            thread::sleep(Duration::from_micros(250));
+            DefaultTaskHandler::handle(result, timings, scheduling_context, task, handler_context);
+        }
+    }
+
+    fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
+        if let Some(message) = payload.downcast_ref::<String>() {
+            message.clone()
+        } else if let Some(message) = payload.downcast_ref::<&str>() {
+            (*message).to_string()
+        } else {
+            "<non-string panic payload>".to_string()
+        }
+    }
+
+    fn run_duplicate_purge_scheduler_race_trial(trial: u64) {
+        let (vote_simulator, blockstore) = setup_default_forks(2, None::<GenerateVotes>);
+        let VoteSimulator {
+            bank_forks,
+            mut progress,
+            ..
+        } = vote_simulator;
+
+        let scheduler_pool =
+            SchedulerPool::<PooledScheduler<DelayTaskHandler>, _>::new_for_verification(
+                None, None, None, None, None,
+            );
+        bank_forks
+            .write()
+            .unwrap()
+            .install_scheduler_pool(scheduler_pool.clone());
+
+        let duplicate_slot = 100 + trial.saturating_mul(2);
+        let inflight_slot = duplicate_slot + 1;
+        let parent_slot = 4;
+
+        let parent = bank_forks.read().unwrap().get(parent_slot).unwrap();
+        let duplicate_bank = Bank::new_from_parent(parent, &Pubkey::default(), duplicate_slot);
+        let duplicate_bank = bank_forks.write().unwrap().insert(duplicate_bank);
+        let inflight_bank = Bank::new_from_parent(
+            duplicate_bank.clone_without_scheduler(),
+            &Pubkey::default(),
+            inflight_slot,
+        );
+        let inflight_bank = bank_forks.write().unwrap().insert(inflight_bank);
+
+        blockstore.add_tree(
+            tr(parent_slot) / (tr(duplicate_slot) / tr(inflight_slot)),
+            false,
+            false,
+            3,
+            Hash::default(),
+        );
+        blockstore.insert_bank_hash(duplicate_slot, Hash::new_unique(), false);
+        blockstore.insert_bank_hash(inflight_slot, Hash::new_unique(), false);
+
+        // Make purge over this slot non-trivial, so in-flight writes can overlap with it.
+        let system_owner = system_program::id();
+        for _ in 0..2_000 {
+            let pubkey = Pubkey::new_unique();
+            let account = AccountSharedData::new(1, 0, &system_owner);
+            inflight_bank.store_account(&pubkey, &account);
+        }
+
+        let payer = Keypair::new();
+        let payer_pubkey = payer.pubkey();
+        let payer_account = AccountSharedData::new(10_000_000, 0, &system_owner);
+        inflight_bank.store_account(&payer_pubkey, &payer_account);
+
+        const TX_COUNT: usize = 512;
+        for task_id in 0..TX_COUNT {
+            let tx = RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
+                &payer,
+                &Pubkey::new_unique(),
+                1,
+                inflight_bank.last_blockhash(),
+            ));
+            inflight_bank
+                .schedule_transaction_executions([(tx, task_id as OrderedTaskId)].into_iter())
+                .unwrap();
+        }
+
+        let mut descendants = bank_forks.read().unwrap().descendants();
+        let mut ancestors = bank_forks.read().unwrap().ancestors();
+        progress.insert(
+            duplicate_slot,
+            ForkProgress::new(Hash::default(), None, None, 0, 0),
+        );
+        progress.insert(
+            inflight_slot,
+            ForkProgress::new(Hash::default(), None, None, 0, 0),
+        );
+
+        // Let some handler tasks start before purge removes the duplicate slot branch.
+        thread::sleep(Duration::from_millis(10));
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        ReplayStage::purge_unconfirmed_slot(
+            duplicate_slot,
+            &mut ancestors,
+            &mut descendants,
+            &mut progress,
+            &root_bank,
+            &bank_forks,
+            &blockstore,
+        );
+
+        // Propagate panics from scheduler handlers, if any.
+        let _ = inflight_bank.wait_for_completed_scheduler();
+
+        // Trigger the same FixedMaxRoot load path as replay/banking.
+        let _ = inflight_bank.get_account_with_fixed_root(&payer_pubkey);
+    }
+
+    #[test]
+    #[ignore = "Manual stress reproducer for docs/incidents/2026-02-25-accountsdb-cached-index-panic.md"]
+    #[should_panic(expected = "Bad index entry detected")]
+    fn test_repro_duplicate_slot_purge_races_with_inflight_scheduler_processing() {
+        const MAX_TRIALS: u64 = 200;
+        for trial in 0..MAX_TRIALS {
+            let attempt = panic::catch_unwind(AssertUnwindSafe(|| {
+                run_duplicate_purge_scheduler_race_trial(trial);
+            }));
+
+            match attempt {
+                Ok(()) => {}
+                Err(payload) => {
+                    let message = panic_payload_to_string(payload.as_ref());
+                    if message.contains("Bad index entry detected") {
+                        panic!("{message}");
+                    }
+                    panic::resume_unwind(payload);
+                }
+            }
+        }
+
+        panic!(
+            "failed to reproduce 'Bad index entry detected' panic in {MAX_TRIALS} trials; rerun \
+             the ignored test"
+        );
     }
 
     #[test]
