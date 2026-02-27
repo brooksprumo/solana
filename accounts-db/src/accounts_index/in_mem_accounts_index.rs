@@ -12,7 +12,7 @@ use {
     rand::{Rng, rng},
     solana_bucket_map::bucket_api::BucketApi,
     solana_clock::Slot,
-    solana_measure::measure::Measure,
+    solana_measure::{measure::Measure, measure_us},
     solana_pubkey::Pubkey,
     std::{
         cmp,
@@ -29,6 +29,7 @@ use {
 
 #[derive(Debug, Default)]
 pub struct StartupStats {
+    pub acquire_lock_us: AtomicU64,
     pub copy_data_us: AtomicU64,
 }
 
@@ -686,12 +687,16 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
         assert!(self.storage.get_startup());
         assert!(self.bucket.is_some());
 
-        let mut insert = self.startup_info.insert.lock().unwrap();
-        let m = Measure::start("copy");
-        insert.extend(items.map(|(k, v)| (k, (slot, v.into()))));
+        let (mut insert, lock_us) = measure_us!(self.startup_info.insert.lock().unwrap());
+        let (_, copy_us) = measure_us!(insert.extend(items.map(|(k, v)| (k, (slot, v.into())))));
+        drop(insert);
+
+        self.startup_stats
+            .acquire_lock_us
+            .fetch_add(lock_us, Ordering::Relaxed);
         self.startup_stats
             .copy_data_us
-            .fetch_add(m.end_as_us(), Ordering::Relaxed);
+            .fetch_add(copy_us, Ordering::Relaxed);
     }
 
     pub fn startup_update_duplicates_from_in_memory_only(&self, items: Vec<(Slot, Pubkey)>) {
