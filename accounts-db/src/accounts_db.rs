@@ -568,16 +568,6 @@ impl GenerateIndexTimings {
             ),
             ("total_slots", self.total_slots, i64),
             (
-                "disk_startup_info_acquire_lock_us",
-                startup_stats.acquire_lock_us.swap(0, Ordering::Relaxed),
-                i64
-            ),
-            (
-                "disk_startup_info_copy_data_us",
-                startup_stats.copy_data_us.swap(0, Ordering::Relaxed),
-                i64
-            ),
-            (
                 "num_zero_lamport_single_refs",
                 self.num_zero_lamport_single_refs,
                 i64
