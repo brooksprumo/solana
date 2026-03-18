@@ -12,6 +12,7 @@ target/
 /config/
 
 .cache
+.repo-context/
 
 # log files
 *.log
