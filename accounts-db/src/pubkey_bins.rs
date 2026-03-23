@@ -1,6 +1,10 @@
 use {
-    solana_pubkey::Pubkey,
-    std::num::{NonZeroU32, NonZeroUsize},
+    solana_pubkey::{Pubkey, PubkeyHasherBuilder},
+    std::{
+        fmt,
+        hash::{BuildHasher as _, Hasher as _},
+        num::{NonZeroU32, NonZeroU64, NonZeroUsize},
+    },
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -43,6 +47,53 @@ impl PubkeyBinCalculator24 {
         let as_ref = pubkey.as_ref();
         (((as_ref[0] as usize) << 16) | ((as_ref[1] as usize) << 8) | (as_ref[2] as usize))
             >> self.shift_bits
+    }
+}
+
+// brooks TODO: doc
+#[derive(Clone)]
+pub struct PubkeyBinCalculator {
+    num_bins: NonZeroUsize,
+    hasher_builder: PubkeyHasherBuilder,
+}
+
+impl PubkeyBinCalculator {
+    pub fn bin_from_pubkey(&self, pubkey: &Pubkey) -> usize {
+        let mut hasher = self.hasher_builder.build_hasher();
+        hasher.write(pubkey.as_array());
+        let hash = hasher.finish();
+        // SAFETY: Value is guaranteed to be non-zero, since it comes from a NonZero type.
+        let num_bins = unsafe { NonZeroU64::new_unchecked(self.num_bins.get() as u64) };
+        (hash % num_bins) as usize
+    }
+}
+
+impl fmt::Debug for PubkeyBinCalculator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PubkeyBinCalculator")
+            .field("num_bins", &self.num_bins)
+            .finish()
+    }
+}
+
+// brooks TODO: doc
+pub struct PubkeyBinCalculatorBuilder {
+    hasher_builder: PubkeyHasherBuilder,
+}
+
+impl PubkeyBinCalculatorBuilder {
+    // brooks TODO: doc
+    pub fn new() -> Self {
+        Self {
+            hasher_builder: PubkeyHasherBuilder::default(),
+        }
+    }
+    // brooks TODO: doc
+    pub fn build(&self, num_bins: NonZeroUsize) -> PubkeyBinCalculator {
+        PubkeyBinCalculator {
+            num_bins,
+            hasher_builder: self.hasher_builder.clone(),
+        }
     }
 }
 
@@ -219,5 +270,24 @@ mod tests {
     #[should_panic(expected = "bins is non-zero")]
     fn test_pubkey_bins_bad_is_zero() {
         PubkeyBinCalculator24::new(0);
+    }
+
+    #[test]
+    fn test_bin_from_pubkey_is_deterministic() {
+        for num_bins in [1 << 10, 1 << 14, 1 << 19] {
+            let bin_calculator_builder = PubkeyBinCalculatorBuilder::new();
+            let bin_calculator = bin_calculator_builder.build(NonZeroUsize::new(num_bins).unwrap());
+            for i_pubkey in 0..1_000 {
+                let pubkey = Pubkey::new_unique();
+                let expected_bin = bin_calculator.bin_from_pubkey(&pubkey);
+                for i_calculation in 0..100 {
+                    let actual_bin = bin_calculator.bin_from_pubkey(&pubkey);
+                    assert_eq!(
+                        actual_bin, expected_bin,
+                        "num_bins: {num_bins}, i_pubkey: {i_pubkey}, i_calculation: {i_calculation}, pubkey: {pubkey}",
+                    );
+                }
+            }
+        }
     }
 }
