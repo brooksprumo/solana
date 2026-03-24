@@ -8,8 +8,11 @@ mod secondary;
 mod stats;
 use {
     crate::{
-        ancestors::Ancestors, contains::Contains, is_zero_lamport::IsZeroLamport,
-        pubkey_bins::PubkeyBinCalculator24, rolling_bit_field::RollingBitField,
+        ancestors::Ancestors,
+        contains::Contains,
+        is_zero_lamport::IsZeroLamport,
+        pubkey_bins::{PubkeyBinCalculator, PubkeyBinCalculatorBuilder},
+        rolling_bit_field::RollingBitField,
     },
     account_map_entry::{AccountMapEntry, PreAllocatedAccountMapEntry, SlotListWriteGuard},
     accounts_index_storage::AccountsIndexStorage,
@@ -309,7 +312,7 @@ pub enum AccountsIndexScanResult {
 /// U: account info type to be persisted to disk
 pub struct AccountsIndex<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> {
     pub account_maps: Box<[Arc<InMemAccountsIndex<T, U>>]>,
-    pub bin_calculator: PubkeyBinCalculator24,
+    pub bin_calculator: PubkeyBinCalculator,
     program_id_index: SecondaryIndex<RwLockSecondaryIndexEntry>,
     spl_token_mint_index: SecondaryIndex<RwLockSecondaryIndexEntry>,
     spl_token_owner_index: SecondaryIndex<RwLockSecondaryIndexEntry>,
@@ -365,12 +368,13 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
         exit: Arc<AtomicBool>,
     ) -> (
         Box<[Arc<InMemAccountsIndex<T, U>>]>,
-        PubkeyBinCalculator24,
+        PubkeyBinCalculator,
         AccountsIndexStorage<T, U>,
     ) {
         let bins = config.bins.unwrap_or(BINS_DEFAULT);
         // create bin_calculator early to verify # bins is reasonable
-        let bin_calculator = PubkeyBinCalculator24::new(bins);
+        let bin_calculator =
+            PubkeyBinCalculatorBuilder::build(NonZeroUsize::new(bins).expect("bins is non-zero"));
         let storage = AccountsIndexStorage::new(bins, config, exit);
 
         let account_maps: Box<_> = (0..bins)
@@ -1255,7 +1259,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
         // lock contention.
         let bins = self.bins();
         let random_bin_offset = rng().random_range(0..bins);
-        let bin_calc = self.bin_calculator;
+        let bin_calc = &self.bin_calculator;
         items.sort_unstable_by(|(pubkey_a, _), (pubkey_b, _)| {
             ((bin_calc.bin_from_pubkey(pubkey_a) + random_bin_offset) % bins)
                 .cmp(&((bin_calc.bin_from_pubkey(pubkey_b) + random_bin_offset) % bins))
@@ -4056,15 +4060,6 @@ mod tests {
             index.handle_dead_keys(&[key], &AccountSecondaryIndexes::default()),
             vec![key].into_iter().collect::<HashSet<_>>()
         );
-    }
-
-    #[test]
-    #[should_panic(expected = "bins.is_power_of_two()")]
-    #[allow(clippy::field_reassign_with_default)]
-    fn test_illegal_bins() {
-        let mut config = AccountsIndexConfig::default();
-        config.bins = Some(3);
-        AccountsIndex::<bool, bool>::new(&config, Arc::default());
     }
 
     #[test]
