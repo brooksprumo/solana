@@ -253,11 +253,6 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> BucketMapHolder<T, U>
 
         let mut bucket_config = BucketMapConfig::new(bins);
         bucket_config.drives = config.drives.as_ref().cloned();
-        bucket_config.restart_config_file = bucket_config
-            .drives
-            .as_ref()
-            .and_then(|drives| drives.first())
-            .map(|drive| drive.join("accounts_index_restart"));
 
         let disk = match config.index_limit {
             IndexLimit::InMemOnly => None,
