@@ -6300,16 +6300,26 @@ impl AccountsDb {
         // across all the bins and set the initial value for the stat.
         // We do this all at once, at the end, since getting the capacity requires iterating all
         // the bins and grabbing a read lock, which we try to avoid whenever possible.
+        error!(
+            "brooks DEBUG: accounts index bin sizes, num bins: {}",
+            self.accounts_index.bins(),
+        );
         let (index_len, index_capacity) = self
             .accounts_index
             .account_maps
             .iter()
-            .map(|bin| bin.len_and_cap_for_startup())
+            .enumerate()
+            .map(|(i, bin)| {
+                let (len, cap) = bin.len_and_cap_for_startup();
+                error!("brooks DEBUG: bin: {i}, len: {len}, cap: {cap}");
+                (len, cap)
+            })
             .fold((0, 0), |mut accum, (len, cap)| {
                 accum.0 += len;
                 accum.1 += cap;
                 accum
             });
+        error!("brooks DEBUG: accounts index total len: {index_len}, total cap: {index_capacity}",);
         self.accounts_index
             .stats()
             .count_in_mem
