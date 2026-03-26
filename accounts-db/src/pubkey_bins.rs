@@ -1,10 +1,6 @@
 use {
     solana_pubkey::{Pubkey, PubkeyHasherBuilder},
-    std::{
-        fmt,
-        hash::{BuildHasher as _, Hasher as _},
-        num::{NonZeroU64, NonZeroUsize},
-    },
+    std::{fmt, hash::BuildHasher as _, num::NonZeroUsize},
 };
 
 /// Used to calculate which bin a pubkey maps to.
@@ -14,7 +10,7 @@ use {
 /// To instantiate, use `PubkeyBinCalculatorBuilder::build(num_bins)`.
 #[derive(Clone)]
 pub struct PubkeyBinCalculator {
-    num_bins: NonZeroUsize,
+    mask: u64,
     hasher_builder: PubkeyHasherBuilder,
 }
 
@@ -22,25 +18,21 @@ impl PubkeyBinCalculator {
     /// Calculates the bin that `pubkey` maps to.
     #[inline]
     pub fn bin_from_pubkey(&self, pubkey: &Pubkey) -> usize {
-        // SAFETY: Value is guaranteed to be non-zero, since it comes from a NonZero type.
-        let num_bins = unsafe { NonZeroU64::new_unchecked(self.num_bins.get() as u64) };
         let hash = self.hash_from_pubkey(pubkey);
-        (hash % num_bins) as usize
+        (hash & self.mask) as usize
     }
 
     /// Calculates the hash of `pubkey`.
     #[inline]
     fn hash_from_pubkey(&self, pubkey: &Pubkey) -> u64 {
-        let mut hasher = self.hasher_builder.build_hasher();
-        hasher.write(pubkey.as_array());
-        hasher.finish()
+        self.hasher_builder.hash_one(pubkey)
     }
 }
 
 impl fmt::Debug for PubkeyBinCalculator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PubkeyBinCalculator")
-            .field("num_bins", &self.num_bins)
+            .field("num_bins", &(self.mask + 1))
             .finish_non_exhaustive()
     }
 }
@@ -54,9 +46,16 @@ impl PubkeyBinCalculatorBuilder {
     ///
     /// The returned bin calculator will produce *unique* mappings
     /// compared to other bin calculators!
+    ///
+    /// # Panics
+    ///
+    /// This function will panic if the following conditions are not met:
+    /// * `num_bins` must be a power of two
     pub fn build(num_bins: NonZeroUsize) -> PubkeyBinCalculator {
+        assert!(num_bins.is_power_of_two());
+        let num_bins_mask = num_bins.get() - 1;
         PubkeyBinCalculator {
-            num_bins,
+            mask: num_bins_mask as u64,
             hasher_builder: PubkeyHasherBuilder::default(),
         }
     }
@@ -101,5 +100,13 @@ mod tests {
             bin_calculator1.hash_from_pubkey(&pubkey),
             bin_calculator2.hash_from_pubkey(&pubkey),
         );
+    }
+
+    /// Ensure non-power-of-two number of bins is not allowed.
+    #[test]
+    #[should_panic(expected = "num_bins.is_power_of_two()")]
+    fn test_num_bins_not_power_of_two() {
+        let num_bins = NonZeroUsize::new(3).unwrap();
+        PubkeyBinCalculatorBuilder::build(num_bins);
     }
 }
