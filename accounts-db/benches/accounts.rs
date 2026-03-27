@@ -224,6 +224,7 @@ fn bench_load_largest_accounts(b: &mut Bencher) {
     });
 }
 
+// brooks TODO: remove me
 #[bench]
 fn bench_sort_and_remove_dups(b: &mut Bencher) {
     fn generate_sample_account_from_storage(i: u8) -> AccountFromStorage {

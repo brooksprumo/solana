@@ -58,6 +58,7 @@ use {
         contains::Contains,
         is_zero_lamport::IsZeroLamport,
         partitioned_rewards::PartitionedEpochRewardsConfig,
+        pubkey_bins::PubkeyBinCalculator,
         read_only_accounts_cache::ReadOnlyAccountsCache,
         storable_accounts::{StorableAccounts, StorableAccountsBySlot},
         u64_align,
@@ -2484,8 +2485,9 @@ impl AccountsDb {
             })
             .expect("must scan accounts storage");
 
-        // sort by pubkey to keep account index lookups close
-        let num_duplicated_accounts = Self::sort_and_remove_dups(&mut stored_accounts);
+        // sort by pubkey bin to keep account index lookups close
+        let num_duplicated_accounts =
+            Self::sort_and_remove_dups(&self.accounts_index.bin_calculator, &mut stored_accounts);
 
         GetUniqueAccountsResult {
             stored_accounts,
@@ -2499,14 +2501,22 @@ impl AccountsDb {
         self.storage_access = storage_access;
     }
 
-    /// Sort `accounts` by pubkey and removes all but the *last* of consecutive
-    /// accounts in the vector with the same pubkey.
+    /// Sort `accounts` by pubkey bin and pubkey, and remove all but the
+    /// *last* of consecutive accounts in the vector with the same pubkey.
     ///
     /// Return the number of duplicated elements in the vector.
     #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
-    fn sort_and_remove_dups(accounts: &mut Vec<AccountFromStorage>) -> usize {
-        // stable sort because we want the most recent only
-        accounts.sort_by(|a, b| a.pubkey().cmp(b.pubkey()));
+    fn sort_and_remove_dups(
+        bin_calculator: &PubkeyBinCalculator,
+        accounts: &mut Vec<AccountFromStorage>,
+    ) -> usize {
+        // Stable sort because we want the most recent duplicate only.
+        // Sort by pubkey within a bin so duplicates remain adjacent.
+        accounts.sort_by(|a, b| {
+            let a_bin = bin_calculator.bin_from_pubkey(a.pubkey());
+            let b_bin = bin_calculator.bin_from_pubkey(b.pubkey());
+            a_bin.cmp(&b_bin).then_with(|| a.pubkey().cmp(b.pubkey()))
+        });
         let len0 = accounts.len();
         if accounts.len() > 1 {
             let mut last = 0;
