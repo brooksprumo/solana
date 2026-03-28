@@ -340,6 +340,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
     pub fn new(config: &AccountsIndexConfig, exit: Arc<AtomicBool>) -> Self {
         let scan_results_limit_bytes = config.scan_results_limit_bytes;
         let (account_maps, bin_calculator, storage) = Self::allocate_accounts_index(config, exit);
+        info!("AccountsIndex bin calculator: {bin_calculator:?}");
         Self {
             purge_older_root_entries_one_slot_list: AtomicUsize::default(),
             account_maps,
@@ -373,8 +374,9 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
     ) {
         let bins = config.bins.unwrap_or(BINS_DEFAULT);
         // create bin_calculator early to verify # bins is reasonable
-        let bin_calculator =
-            PubkeyBinCalculatorBuilder::build(NonZeroUsize::new(bins).expect("bins is non-zero"));
+        let bin_calculator = PubkeyBinCalculatorBuilder::with_bins(
+            NonZeroUsize::new(bins).expect("bins is non-zero"),
+        );
         let storage = AccountsIndexStorage::new(bins, config, exit);
 
         let account_maps: Box<_> = (0..bins)

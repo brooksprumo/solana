@@ -7,7 +7,7 @@ use {
 ///
 /// This struct may be cloned, and will retain the same pubkey -> bin results.
 ///
-/// To instantiate, use `PubkeyBinCalculatorBuilder::build(num_bins)`.
+/// To instantiate, use `PubkeyBinCalculatorBuilder::with_bins(num_bins)`.
 #[derive(Clone)]
 pub struct PubkeyBinCalculator {
     mask: u64,
@@ -33,6 +33,7 @@ impl fmt::Debug for PubkeyBinCalculator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PubkeyBinCalculator")
             .field("num_bins", &(self.mask + 1))
+            .field("offset", &(self.hasher_builder.offset()))
             .finish_non_exhaustive()
     }
 }
@@ -42,7 +43,7 @@ impl fmt::Debug for PubkeyBinCalculator {
 pub struct PubkeyBinCalculatorBuilder;
 
 impl PubkeyBinCalculatorBuilder {
-    /// Builds a `PubkeyBinCalculator`.
+    /// Builds a `PubkeyBinCalculator` with `num_bins`.
     ///
     /// The returned bin calculator will produce *unique* mappings
     /// compared to other bin calculators!
@@ -51,12 +52,35 @@ impl PubkeyBinCalculatorBuilder {
     ///
     /// This function will panic if the following conditions are not met:
     /// * `num_bins` must be a power of two
-    pub fn build(num_bins: NonZeroUsize) -> PubkeyBinCalculator {
+    pub fn with_bins(num_bins: NonZeroUsize) -> PubkeyBinCalculator {
+        Self::build(num_bins, PubkeyHasherBuilder::default())
+    }
+
+    /// Builds a `PubkeyBinCalculator` with `num_bins` and `offset`.
+    ///
+    /// The `offset` is used to instantiate a specific PubkeyHasher for the bin calculator.
+    /// Prefer `with_bins()` whenever possible.
+    ///
+    /// The returned bin calculator will produce *identical* mappings
+    /// compared to other bin calculators with the same num_bins and offset.
+    ///
+    /// # Panics
+    ///
+    /// This function will panic if the following conditions are not met:
+    /// * `num_bins` must be a power of two
+    pub fn with_bins_and_offset(num_bins: NonZeroUsize, offset: usize) -> PubkeyBinCalculator {
+        Self::build(num_bins, PubkeyHasherBuilder::with_offset(offset))
+    }
+
+    /// Internal helper for building a `PubkeyBinCalculator`.
+    ///
+    /// Only intended to be called by the public build methods.
+    fn build(num_bins: NonZeroUsize, hasher_builder: PubkeyHasherBuilder) -> PubkeyBinCalculator {
         assert!(num_bins.is_power_of_two());
         let num_bins_mask = num_bins.get() - 1;
         PubkeyBinCalculator {
             mask: num_bins_mask as u64,
-            hasher_builder: PubkeyHasherBuilder::default(),
+            hasher_builder,
         }
     }
 }
@@ -70,7 +94,7 @@ mod tests {
     fn test_bin_from_pubkey_is_deterministic() {
         for num_bins in [1 << 10, 1 << 14, 1 << 19] {
             let bin_calculator1 =
-                PubkeyBinCalculatorBuilder::build(NonZeroUsize::new(num_bins).unwrap());
+                PubkeyBinCalculatorBuilder::with_bins(NonZeroUsize::new(num_bins).unwrap());
             // second bin calculator that exercies Calculator::clone()
             let bin_calculator2 = bin_calculator1.clone();
             for i_pubkey in 0..1_000 {
@@ -91,12 +115,27 @@ mod tests {
 
     /// Ensure that bin calculators from *different* builders produce different hashes.
     #[test]
-    fn test_builder_produces_unique_instances() {
+    fn test_builders_produces_unique_instances() {
         let num_bins = NonZeroUsize::new(1).unwrap();
-        let bin_calculator1 = PubkeyBinCalculatorBuilder::build(num_bins);
-        let bin_calculator2 = PubkeyBinCalculatorBuilder::build(num_bins);
+        let bin_calculator1 = PubkeyBinCalculatorBuilder::with_bins(num_bins);
+        let bin_calculator2 = PubkeyBinCalculatorBuilder::with_bins(num_bins);
         let pubkey = Pubkey::new_unique();
         assert_ne!(
+            bin_calculator1.hash_from_pubkey(&pubkey),
+            bin_calculator2.hash_from_pubkey(&pubkey),
+        );
+    }
+
+    /// Ensure that bin calculators from different builders, but with the
+    /// same num_bins and offset, produce *identical* hashes.
+    #[test]
+    fn test_builders_with_same_offset_produce_identical_instances() {
+        let num_bins = NonZeroUsize::new(1).unwrap();
+        let offset = 0;
+        let bin_calculator1 = PubkeyBinCalculatorBuilder::with_bins_and_offset(num_bins, offset);
+        let bin_calculator2 = PubkeyBinCalculatorBuilder::with_bins_and_offset(num_bins, offset);
+        let pubkey = Pubkey::new_unique();
+        assert_eq!(
             bin_calculator1.hash_from_pubkey(&pubkey),
             bin_calculator2.hash_from_pubkey(&pubkey),
         );
@@ -105,8 +144,8 @@ mod tests {
     /// Ensure non-power-of-two number of bins is not allowed.
     #[test]
     #[should_panic(expected = "num_bins.is_power_of_two()")]
-    fn test_num_bins_not_power_of_two() {
+    fn test_num_bins_not_power_of_two_should_panic() {
         let num_bins = NonZeroUsize::new(3).unwrap();
-        PubkeyBinCalculatorBuilder::build(num_bins);
+        PubkeyBinCalculatorBuilder::with_bins(num_bins);
     }
 }
