@@ -1262,10 +1262,16 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
         let bins = self.bins();
         let random_bin_offset = rng().random_range(0..bins);
         let bin_calc = &self.bin_calculator;
-        items.sort_unstable_by(|(pubkey_a, _), (pubkey_b, _)| {
-            ((bin_calc.bin_from_pubkey(pubkey_a) + random_bin_offset) % bins)
-                .cmp(&((bin_calc.bin_from_pubkey(pubkey_b) + random_bin_offset) % bins))
-                .then_with(|| pubkey_a.cmp(pubkey_b))
+        /*
+         * items.sort_unstable_by(|(pubkey_a, _), (pubkey_b, _)| {
+         *     ((bin_calc.bin_from_pubkey(pubkey_a) + random_bin_offset) % bins)
+         *         .cmp(&((bin_calc.bin_from_pubkey(pubkey_b) + random_bin_offset) % bins))
+         *         .then_with(|| pubkey_a.cmp(pubkey_b))
+         * });
+         */
+        items.sort_unstable_by_key(|(pubkey, _)| {
+            let bin = self.bin_calculator.bin_from_pubkey(pubkey);
+            (bin + random_bin_offset) % bins
         });
 
         let storage = self.storage.storage.as_ref();
