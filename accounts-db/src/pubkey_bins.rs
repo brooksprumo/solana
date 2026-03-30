@@ -1,7 +1,10 @@
 use {
-    solana_pubkey::{Pubkey, PubkeyHasherBuilder},
-    std::{fmt, hash::BuildHasher as _, num::NonZeroUsize},
+    rand::{Rng, rng},
+    solana_pubkey::{PUBKEY_BYTES, Pubkey},
+    std::{cell::Cell, fmt, num::NonZeroUsize},
 };
+
+const MAX_OFFSET: usize = PUBKEY_BYTES - size_of::<u64>();
 
 /// Used to calculate which bin a pubkey maps to.
 ///
@@ -11,7 +14,7 @@ use {
 #[derive(Clone)]
 pub struct PubkeyBinCalculator {
     mask: u64,
-    hasher_builder: PubkeyHasherBuilder,
+    offset: usize,
 }
 
 impl PubkeyBinCalculator {
@@ -22,10 +25,28 @@ impl PubkeyBinCalculator {
         (hash & self.mask) as usize
     }
 
-    /// Calculates the hash of `pubkey`.
+    /// Calculates the "hash" of `pubkey`.
     #[inline]
     fn hash_from_pubkey(&self, pubkey: &Pubkey) -> u64 {
-        self.hasher_builder.hash_one(pubkey)
+        debug_assert!(self.offset <= MAX_OFFSET);
+        let ptr = pubkey.as_array().as_ptr();
+        // SAFETY:
+        //
+        // - `offset` was checked at build time to be in range to read a u64.
+        //
+        // add() is safe:
+        // - `offset` can fit in an isize.
+        // - `offset` is in-range of `bytes` because the caller guarantees `bytes`
+        //   is always of size `ADDRESS_BYTES`.
+        //
+        // read_unaligned() is safe:
+        // - the ptr being read is valid
+        //   - the ptr came from `bytes`.
+        //   - the memory range being read is entirely contained within the
+        //     bounds of the allocation (this was checked above by `add()`).
+        // - the value of the type being read (u64) is valid
+        //   - the memory of `bytes` has been initialized
+        unsafe { ptr.add(self.offset).cast::<u64>().read_unaligned() }
     }
 }
 
@@ -33,8 +54,8 @@ impl fmt::Debug for PubkeyBinCalculator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PubkeyBinCalculator")
             .field("num_bins", &(self.mask + 1))
-            .field("offset", &(self.hasher_builder.offset()))
-            .finish_non_exhaustive()
+            .field("offset", &self.offset)
+            .finish()
     }
 }
 
@@ -53,7 +74,19 @@ impl PubkeyBinCalculatorBuilder {
     /// This function will panic if the following conditions are not met:
     /// * `num_bins` must be a power of two
     pub fn with_bins(num_bins: NonZeroUsize) -> PubkeyBinCalculator {
-        Self::build(num_bins, PubkeyHasherBuilder::default())
+        std::thread_local!(static OFFSET: Cell<usize>  = {
+            let mut rng = rng();
+            Cell::new(rng.random_range(0..=MAX_OFFSET))
+        });
+        let offset = OFFSET.with(|offset| {
+            let mut next_offset = offset.get() + 1;
+            if next_offset > MAX_OFFSET {
+                next_offset = 0;
+            }
+            offset.set(next_offset);
+            next_offset
+        });
+        Self::with_bins_and_offset(num_bins, offset)
     }
 
     /// Builds a `PubkeyBinCalculator` with `num_bins` and `offset`.
@@ -68,19 +101,17 @@ impl PubkeyBinCalculatorBuilder {
     ///
     /// This function will panic if the following conditions are not met:
     /// * `num_bins` must be a power of two
+    /// * `offset` must be <= 24
     pub fn with_bins_and_offset(num_bins: NonZeroUsize, offset: usize) -> PubkeyBinCalculator {
-        Self::build(num_bins, PubkeyHasherBuilder::with_offset(offset))
-    }
-
-    /// Internal helper for building a `PubkeyBinCalculator`.
-    ///
-    /// Only intended to be called by the public build methods.
-    fn build(num_bins: NonZeroUsize, hasher_builder: PubkeyHasherBuilder) -> PubkeyBinCalculator {
+        assert!(
+            offset <= MAX_OFFSET,
+            "offset must be in range of 0..={MAX_OFFSET}, actual: {offset}",
+        );
         assert!(num_bins.is_power_of_two());
         let num_bins_mask = num_bins.get() - 1;
         PubkeyBinCalculator {
             mask: num_bins_mask as u64,
-            hasher_builder,
+            offset,
         }
     }
 }
@@ -147,5 +178,13 @@ mod tests {
     fn test_num_bins_not_power_of_two_should_panic() {
         let num_bins = NonZeroUsize::new(3).unwrap();
         PubkeyBinCalculatorBuilder::with_bins(num_bins);
+    }
+
+    /// Ensure offset is in range.
+    #[test]
+    #[should_panic(expected = "offset must be in range of 0..=24")]
+    fn test_bad_offset_should_panic() {
+        let num_bins = NonZeroUsize::new(1).unwrap();
+        PubkeyBinCalculatorBuilder::with_bins_and_offset(num_bins, MAX_OFFSET + 1);
     }
 }
