@@ -4,7 +4,8 @@ use {
     std::{cell::Cell, fmt, num::NonZeroUsize},
 };
 
-const MAX_OFFSET: usize = PUBKEY_BYTES - size_of::<u64>();
+type HashType = u32;
+const MAX_OFFSET: usize = PUBKEY_BYTES - size_of::<HashType>();
 
 /// Used to calculate which bin a pubkey maps to.
 ///
@@ -13,7 +14,7 @@ const MAX_OFFSET: usize = PUBKEY_BYTES - size_of::<u64>();
 /// To instantiate, use `PubkeyBinCalculatorBuilder::with_bins(num_bins)`.
 #[derive(Clone)]
 pub struct PubkeyBinCalculator {
-    mask: u64,
+    mask: HashType,
     offset: usize,
 }
 
@@ -27,12 +28,12 @@ impl PubkeyBinCalculator {
 
     /// Calculates the "hash" of `pubkey`.
     #[inline]
-    fn hash_from_pubkey(&self, pubkey: &Pubkey) -> u64 {
+    fn hash_from_pubkey(&self, pubkey: &Pubkey) -> HashType {
         debug_assert!(self.offset <= MAX_OFFSET);
         let ptr = pubkey.as_array().as_ptr();
         // SAFETY:
         //
-        // - `offset` was checked at build time to be in range to read a u64.
+        // - `offset` was checked at build time to be in range to read a HashType.
         //
         // add() is safe:
         // - `offset` can fit in an isize.
@@ -44,9 +45,9 @@ impl PubkeyBinCalculator {
         //   - the ptr came from `bytes`.
         //   - the memory range being read is entirely contained within the
         //     bounds of the allocation (this was checked above by `add()`).
-        // - the value of the type being read (u64) is valid
+        // - the value of the type being read (HashType) is valid
         //   - the memory of `bytes` has been initialized
-        unsafe { ptr.add(self.offset).cast::<u64>().read_unaligned() }
+        unsafe { ptr.add(self.offset).cast::<HashType>().read_unaligned() }
     }
 }
 
@@ -110,7 +111,7 @@ impl PubkeyBinCalculatorBuilder {
         assert!(num_bins.is_power_of_two());
         let num_bins_mask = num_bins.get() - 1;
         PubkeyBinCalculator {
-            mask: num_bins_mask as u64,
+            mask: num_bins_mask as HashType,
             offset,
         }
     }
