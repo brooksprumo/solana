@@ -3,7 +3,7 @@ use {
         AccountsIndexConfig, DiskIndexValue, IndexValue, Startup,
         bucket_map_holder::BucketMapHolder, in_mem_accounts_index::InMemAccountsIndex,
     },
-    crate::{accounts_index, waitable_condvar::WaitableCondvar},
+    crate::{accounts_index, pubkey_bins::PubkeyBinCalculator, waitable_condvar::WaitableCondvar},
     std::{
         fmt::Debug,
         num::NonZeroUsize,
@@ -108,7 +108,12 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndexStorage<
     }
 
     /// allocate BucketMapHolder and InMemAccountsIndex[]
-    pub fn new(bins: usize, config: &AccountsIndexConfig, exit: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        bins: usize,
+        bin_calculator: &PubkeyBinCalculator,
+        config: &AccountsIndexConfig,
+        exit: Arc<AtomicBool>,
+    ) -> Self {
         let num_flush_threads = config
             .num_flush_threads
             .unwrap_or_else(accounts_index::default_num_flush_threads);
@@ -117,7 +122,14 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndexStorage<
 
         let num_initial_accounts = config.num_initial_accounts;
         let in_mem: Box<_> = (0..bins)
-            .map(|bin| Arc::new(InMemAccountsIndex::new(&storage, bin, num_initial_accounts)))
+            .map(|bin| {
+                Arc::new(InMemAccountsIndex::new(
+                    &storage,
+                    bin,
+                    bin_calculator,
+                    num_initial_accounts,
+                ))
+            })
             .collect();
 
         Self {

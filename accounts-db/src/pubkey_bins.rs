@@ -48,6 +48,11 @@ impl PubkeyBinCalculator {
         //   - the memory of `bytes` has been initialized
         unsafe { ptr.add(self.offset).cast::<u64>().read_unaligned() }
     }
+
+    // brooks TODO: doc
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
 }
 
 impl fmt::Debug for PubkeyBinCalculator {

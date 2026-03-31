@@ -377,7 +377,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
         let bin_calculator = PubkeyBinCalculatorBuilder::with_bins(
             NonZeroUsize::new(bins).expect("bins is non-zero"),
         );
-        let storage = AccountsIndexStorage::new(bins, config, exit);
+        let storage = AccountsIndexStorage::new(bins, &bin_calculator, config, exit);
 
         let account_maps: Box<_> = (0..bins)
             .map(|bin| Arc::clone(&storage.in_mem[bin]))
@@ -1298,6 +1298,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
             } else {
                 // not using disk buckets, so just write to in-mem
                 // this is no longer the default case
+                // brooks TODO: reserve drain.len() more entries in map_internal?
                 let mut duplicates_from_in_memory = vec![];
                 items.for_each(|(pubkey, account_info)| {
                     let new_entry =

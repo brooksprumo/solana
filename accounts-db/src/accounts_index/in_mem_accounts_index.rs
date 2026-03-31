@@ -8,11 +8,12 @@ use {
         bucket_map_holder::{Age, AtomicAge, BucketMapHolder},
         stats::Stats,
     },
+    crate::pubkey_bins::PubkeyBinCalculator,
     rand::{Rng, rng},
     solana_bucket_map::bucket_api::BucketApi,
     solana_clock::Slot,
     solana_measure::measure::Measure,
-    solana_pubkey::Pubkey,
+    solana_pubkey::{Pubkey, PubkeyHasherBuilder},
     std::{
         cmp,
         collections::{HashMap, HashSet, hash_map::Entry},
@@ -36,7 +37,7 @@ pub struct InMemAccountsIndex<T: IndexValue, U: DiskIndexValue + From<T> + Into<
     last_age_flushed: AtomicAge,
 
     // backing store
-    map_internal: RwLock<HashMap<Pubkey, Box<AccountMapEntry<T>>, ahash::RandomState>>,
+    map_internal: RwLock<HashMap<Pubkey, Box<AccountMapEntry<T>>, PubkeyHasherBuilder>>,
     storage: Arc<BucketMapHolder<T, U>>,
     _bin: usize,
 
@@ -110,22 +111,23 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
     pub fn new(
         storage: &Arc<BucketMapHolder<T, U>>,
         bin: usize,
+        bin_calcaultor: &PubkeyBinCalculator,
         num_initial_accounts: Option<usize>,
     ) -> Self {
         let num_ages_to_distribute_flushes = Age::MAX - storage.ages_to_stay_in_cache;
 
+        let hasher_offset = (bin_calcaultor.offset() + size_of::<u64>()) % 25;
+        // brooks TODO: don't let offset be 0
+        let hasher = PubkeyHasherBuilder::with_offset(hasher_offset);
         let map_internal = if let Some(num_initial_accounts) = num_initial_accounts {
             let capacity_per_bin = num_initial_accounts / storage.bins;
-            RwLock::new(HashMap::with_capacity_and_hasher(
-                capacity_per_bin,
-                ahash::RandomState::default(),
-            ))
+            HashMap::with_capacity_and_hasher(capacity_per_bin, hasher)
         } else {
-            RwLock::default()
+            HashMap::with_hasher(hasher)
         };
 
         Self {
-            map_internal,
+            map_internal: RwLock::new(map_internal),
             storage: Arc::clone(storage),
             _bin: bin,
             bucket: storage
