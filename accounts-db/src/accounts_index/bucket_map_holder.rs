@@ -35,7 +35,7 @@ const _: () = assert!(std::mem::size_of::<Age>() == std::mem::size_of::<AtomicAg
 /// higher the utilization of the in-mem index bins.
 ///
 /// This value is used to compute the high watermark.
-pub const DEFAULT_NUM_ENTRIES_OVERHEAD: usize = 5_000;
+pub const DEFAULT_NUM_ENTRIES_OVERHEAD: usize = 10_000;
 
 /// The number of entries to evict, once we've hit the high watermark.
 ///
@@ -46,7 +46,7 @@ pub const DEFAULT_NUM_ENTRIES_OVERHEAD: usize = 5_000;
 /// with that goal.
 ///
 /// This value is used to compute the low watermark.
-pub const DEFAULT_NUM_ENTRIES_TO_EVICT: usize = 10_000;
+pub const DEFAULT_NUM_ENTRIES_TO_EVICT: usize = 15_000;
 
 pub struct BucketMapHolder<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> {
     pub disk: Option<BucketMap<(Slot, U)>>,
