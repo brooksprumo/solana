@@ -3,7 +3,10 @@ use {
     super::*,
     crate::{
         accounts_file::AccountsFileProvider,
-        accounts_index::{AccountSecondaryIndexesIncludeExclude, test_utils::*},
+        accounts_index::{
+            ACCOUNTS_INDEX_CONFIG_FOR_TESTING, AccountSecondaryIndexesIncludeExclude,
+            AccountsIndexConfig, IndexLimit, IndexLimitThreshold, test_utils::*,
+        },
         append_vec::{AppendVec, test_utils::TempFile},
         storable_accounts::AccountForStorage,
     },
@@ -2799,6 +2802,95 @@ fn test_flush_accounts_cache() {
         db.load_without_fixed_root(&Ancestors::default(), &key6),
         Some((account0, root6))
     );
+}
+
+#[test]
+fn test_flush_accounts_cache_writes_back_flushed_index_entries_to_disk() {
+    let db = AccountsDb::new_with_config(
+        Vec::new(),
+        AccountsDbConfig {
+            index: Some(AccountsIndexConfig {
+                index_limit: IndexLimit::Threshold(IndexLimitThreshold {
+                    num_bytes: u64::MAX,
+                    num_entries_overhead: 1,
+                    num_entries_to_evict: 1,
+                }),
+                ..ACCOUNTS_INDEX_CONFIG_FOR_TESTING
+            }),
+            ..ACCOUNTS_DB_CONFIG_FOR_TESTING
+        },
+        None,
+        Arc::default(),
+    );
+    let slot = 1;
+    let pubkey = Pubkey::new_unique();
+    let account = AccountSharedData::new(1, 0, &Pubkey::default());
+
+    db.store_for_tests((slot, [(&pubkey, &account)].as_slice()));
+    db.mark_slot_frozen(slot);
+    db.add_root(slot);
+
+    db.accounts_index.get_and_then(&pubkey, |entry| {
+        let entry = entry.expect("entry should be present before the cache flush");
+        assert!(entry.dirty());
+        (false, ())
+    });
+
+    db.flush_accounts_cache(true, Some(slot));
+
+    db.accounts_index.get_and_then(&pubkey, |entry| {
+        let entry = entry.expect("entry should remain present after the cache flush");
+        assert!(!entry.dirty());
+        assert_eq!(entry.ref_count(), 1);
+        assert_eq!(entry.slot_list_lock_read_len(), 1);
+        (false, ())
+    });
+}
+
+#[test]
+fn test_flush_accounts_cache_keeps_mixed_cached_and_stored_entry_dirty() {
+    let db = AccountsDb::new_with_config(
+        Vec::new(),
+        AccountsDbConfig {
+            index: Some(AccountsIndexConfig {
+                index_limit: IndexLimit::Threshold(IndexLimitThreshold {
+                    num_bytes: u64::MAX,
+                    num_entries_overhead: 1,
+                    num_entries_to_evict: 1,
+                }),
+                ..ACCOUNTS_INDEX_CONFIG_FOR_TESTING
+            }),
+            ..ACCOUNTS_DB_CONFIG_FOR_TESTING
+        },
+        None,
+        Arc::default(),
+    );
+    let rooted_slot = 1;
+    let unrooted_slot = 2;
+    let pubkey = Pubkey::new_unique();
+    let rooted_account = AccountSharedData::new(1, 0, &Pubkey::default());
+    let unrooted_account = AccountSharedData::new(2, 0, &Pubkey::default());
+
+    db.store_for_tests((rooted_slot, [(&pubkey, &rooted_account)].as_slice()));
+    db.mark_slot_frozen(rooted_slot);
+    db.add_root(rooted_slot);
+    db.store_for_tests((unrooted_slot, [(&pubkey, &unrooted_account)].as_slice()));
+
+    db.flush_accounts_cache(true, Some(rooted_slot));
+
+    db.accounts_index.get_and_then(&pubkey, |entry| {
+        let entry = entry.expect("entry should remain present after the cache flush");
+        assert!(entry.dirty());
+        assert_eq!(entry.ref_count(), 1);
+        assert_eq!(entry.slot_list_lock_read_len(), 2);
+        assert!(
+            entry.slot_list_read_lock().iter().any(|(slot, info)| {
+                *slot == unrooted_slot && info.is_cached()
+            }),
+            "expected the newer cached slot to keep this entry non-regular"
+        );
+        (false, ())
+    });
 }
 
 fn max_cache_slots() -> usize {

@@ -994,6 +994,19 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
         self.update_secondary_indexes(pubkey, account, account_indexes);
     }
 
+    pub(crate) fn writeback_entries_to_disk<'a>(
+        &self,
+        pubkeys: impl IntoIterator<Item = &'a Pubkey>,
+    ) {
+        if !self.is_disk_index_enabled() {
+            return;
+        }
+
+        for pubkey in pubkeys {
+            self.get_bin(pubkey).writeback_if_dirty(pubkey);
+        }
+    }
+
     pub fn ref_count_from_storage(&self, pubkey: &Pubkey) -> RefCount {
         let map = self.get_bin(pubkey);
         map.get_internal_inner(pubkey, |entry| {

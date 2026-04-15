@@ -4716,6 +4716,12 @@ impl AccountsDb {
             flush_stats.store_accounts_timing = store_accounts_timing_inner;
             flush_stats.store_accounts_total_us = Saturating(store_accounts_total_inner_us);
 
+            let (_, writeback_disk_index_us) = measure_us!(self
+                .accounts_index
+                .writeback_entries_to_disk(accounts.iter().map(|(pubkey, _account)| *pubkey)));
+            flush_stats.store_accounts_timing.update_index_elapsed += writeback_disk_index_us;
+            flush_stats.store_accounts_total_us += writeback_disk_index_us;
+
             // If the above sizing function is correct, just one AppendVec is enough to hold
             // all the data for the slot
             assert!(self.storage.get_slot_storage_entry(slot).is_some());
