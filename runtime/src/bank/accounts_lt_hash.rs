@@ -21,171 +21,19 @@ use {
     },
 };
 
-const ACCOUNT_HASH_METADATA_BYTES: usize = 8 /* lamports */
-    + 1 /* executable */
-    + 32 /* owner */
-    + 32 /* address */;
-
-#[derive(Debug)]
-struct AccountsLtHashUpdate {
-    address: Pubkey,
-    prev_account: Option<AccountSharedData>,
-    curr_account: Option<AccountSharedData>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct UpdateStats {
-    num_updates: Saturating<u64>,
-    time_async: Duration,
-}
-
-#[derive(Default)]
-struct AccountsLtHashBatch {
-    updates: Vec<AccountsLtHashUpdate>,
-    hash_cost: usize,
-}
-
-struct AccountsLtHashAccumulator {
-    lt_hash: LtHash,
-    stats: UpdateStats,
-    first_panic: Option<Box<dyn Any + Send + 'static>>,
-}
-
-#[derive(Debug)]
-struct AccountsLtHashAsyncProgressState {
-    num_jobs_total: Saturating<u64>,
-    is_finalized: bool,
-}
-
-pub struct AccountsLtHashAsyncProgress {
-    accumulator: Arc<Mutex<AccountsLtHashAccumulator>>,
-    updates_freelist: Arc<SegQueue<Vec<AccountsLtHashUpdate>>>,
-    num_jobs_pending: Arc<AtomicUsize>,
-    state: Mutex<AccountsLtHashAsyncProgressState>,
-}
-
-impl AccountsLtHashAsyncProgress {
-    pub fn new() -> Self {
-        let accumulator = AccountsLtHashAccumulator {
-            lt_hash: LtHash::identity(),
-            stats: UpdateStats::default(),
-            first_panic: None,
-        };
-        Self {
-            accumulator: Arc::new(Mutex::new(accumulator)),
-            updates_freelist: Arc::new(SegQueue::new()),
-            num_jobs_pending: Arc::new(AtomicUsize::new(0)),
-            state: Mutex::new(AccountsLtHashAsyncProgressState {
-                num_jobs_total: Saturating(0),
-                is_finalized: false,
-            }),
-        }
-    }
-
-    fn spawn(&self, thread_pool: &'static ThreadPool, updates: Vec<AccountsLtHashUpdate>) {
-        debug_assert!(!updates.is_empty());
-        {
-            let mut state = self.state.lock().unwrap();
-            assert!(!state.is_finalized);
-            state.num_jobs_total += 1;
-            self.num_jobs_pending.fetch_add(1, Ordering::Relaxed);
-        }
-        let accumulator = Arc::clone(&self.accumulator);
-        let num_jobs_pending = Arc::clone(&self.num_jobs_pending);
-        let updates_freelist = Arc::clone(&self.updates_freelist);
-        thread_pool.spawn(move || {
-            let mut updates = updates;
-            let result = catch_unwind(AssertUnwindSafe(|| {
-                let start = Instant::now();
-                let num_updates = Saturating(updates.len() as u64);
-                let lt_hash = Self::process_updates(&mut updates);
-                let mut accumulator = accumulator.lock().unwrap_or_else(|err| err.into_inner());
-                accumulator.lt_hash.mix_in(&lt_hash);
-                accumulator.stats.num_updates += num_updates;
-                accumulator.stats.time_async += start.elapsed();
-            }));
-
-            updates.clear();
-            updates_freelist.push(updates);
-
-            if let Err(payload) = result {
-                let mut accumulator = accumulator.lock().unwrap_or_else(|err| err.into_inner());
-                if accumulator.first_panic.is_none() {
-                    accumulator.first_panic = Some(payload);
-                }
-            }
-
-            num_jobs_pending.fetch_sub(1, Ordering::Release);
-        });
-    }
-
-    fn process_updates(updates: &mut Vec<AccountsLtHashUpdate>) -> LtHash {
-        let mut accum_lt_hash = LtHash::identity();
-        for AccountsLtHashUpdate {
-            address,
-            prev_account,
-            curr_account,
-        } in updates.drain(..)
-        {
-            if let Some(prev_account) = prev_account {
-                let prev_lt_hash = AccountsDb::lt_hash_account(&prev_account, &address);
-                accum_lt_hash.mix_out(&prev_lt_hash.0);
-            }
-            if let Some(curr_account) = curr_account {
-                let curr_lt_hash = AccountsDb::lt_hash_account(&curr_account, &address);
-                accum_lt_hash.mix_in(&curr_lt_hash.0);
-            }
-        }
-        accum_lt_hash
-    }
-
-    fn finish(&self) -> (LtHash, UpdateStats, Saturating<u64>, bool) {
-        // make sure to lock `state` before spinning on num_jobs_pending
-        // to ensure no new jobs are added
-        let mut state = self.state.lock().unwrap();
-        while self.num_jobs_pending.load(Ordering::Acquire) > 0 {
-            // Spin, do not yield! This is called by Bank::freeze() and we want to be fast.
-        }
-
-        let mut accumulator = self
-            .accumulator
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        if let Some(payload) = accumulator.first_panic.take() {
-            resume_unwind(payload);
-        }
-        let was_finalized = state.is_finalized;
-        state.is_finalized = true;
-        (
-            accumulator.lt_hash.clone(),
-            accumulator.stats.clone(),
-            state.num_jobs_total,
-            !was_finalized,
-        )
-    }
-}
-
-fn get_updates_vec(
-    updates_freelist: &SegQueue<Vec<AccountsLtHashUpdate>>,
-) -> Vec<AccountsLtHashUpdate> {
-    let updates = updates_freelist.pop().unwrap_or_else(Vec::new);
-    assert!(updates.is_empty());
-    updates
-}
-
 impl Bank {
+    // brooks TODO: doc
     pub fn enqueue_accounts_lt_hash_updates<'a>(&self, accounts: &impl StorableAccounts<'a>) {
         if accounts.is_empty() {
             return;
         }
         let thread_pool = replay_hash_thread_pool();
         let progress = &self.accounts_lt_hash_async_progress;
-        let updates_freelist = &progress.updates_freelist;
 
         let mut seen = AHashSet::with_capacity(accounts.len());
         let mut batches: [AccountsLtHashBatch; NUM_REPLAY_HASH_THREADS] =
             array::from_fn(|_| AccountsLtHashBatch {
-                updates: get_updates_vec(updates_freelist),
+                updates: progress.updates_freelist.pop(),
                 hash_cost: 0,
             });
         // process accounts in reverse because we must only count the latest version of each account
@@ -236,14 +84,12 @@ impl Bank {
             if !updates.is_empty() {
                 progress.spawn(thread_pool, updates);
             } else {
-                // only keep the vec if its capacity is non-zero
-                if updates.capacity() != 0 {
-                    updates_freelist.push(updates);
-                }
+                progress.updates_freelist.push(updates);
             }
         }
     }
 
+    // brooks TODO: doc
     pub(crate) fn finish_accounts_lt_hash_updates(&self) {
         let finish_time = Measure::start("");
         let (delta_lt_hash, stats, num_jobs_total, should_mix) =
@@ -268,7 +114,191 @@ impl Bank {
 }
 
 // brooks TODO: doc
-fn calc_hash_cost(account: Option<&AccountSharedData>) -> usize {
+pub struct AccountsLtHashAsyncProgress {
+    accumulator: Arc<Mutex<AccountsLtHashAccumulator>>,
+    updates_freelist: Arc<UpdatesFreelist>,
+    num_jobs_pending: Arc<AtomicUsize>,
+    state: Mutex<ProgressState>,
+}
+
+impl AccountsLtHashAsyncProgress {
+    pub fn new() -> Self {
+        let accumulator = AccountsLtHashAccumulator {
+            lt_hash: LtHash::identity(),
+            stats: UpdateStats::default(),
+            first_panic: None,
+        };
+        Self {
+            accumulator: Arc::new(Mutex::new(accumulator)),
+            updates_freelist: Arc::new(UpdatesFreelist::new()),
+            num_jobs_pending: Arc::new(AtomicUsize::new(0)),
+            state: Mutex::new(ProgressState {
+                num_jobs_total: Saturating(0),
+                is_finalized: false,
+            }),
+        }
+    }
+
+    // brooks TODO: doc
+    fn spawn(&self, thread_pool: &'static ThreadPool, updates: Vec<AccountsLtHashUpdate>) {
+        debug_assert!(!updates.is_empty());
+        {
+            let mut state = self.state.lock().unwrap();
+            assert!(!state.is_finalized);
+            state.num_jobs_total += 1;
+            self.num_jobs_pending.fetch_add(1, Ordering::Relaxed);
+        }
+        let accumulator = Arc::clone(&self.accumulator);
+        let num_jobs_pending = Arc::clone(&self.num_jobs_pending);
+        let updates_freelist = Arc::clone(&self.updates_freelist);
+        thread_pool.spawn(move || {
+            let mut updates = updates;
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let start = Instant::now();
+                let num_updates = Saturating(updates.len() as u64);
+                let lt_hash = Self::process_updates(&mut updates);
+                let mut accumulator = accumulator.lock().unwrap_or_else(|err| err.into_inner());
+                accumulator.lt_hash.mix_in(&lt_hash);
+                accumulator.stats.num_updates += num_updates;
+                accumulator.stats.time_async += start.elapsed();
+            }));
+
+            // make sure to clear the updates vec just in case the drain() was interrupted
+            updates.clear();
+            updates_freelist.push(updates);
+
+            if let Err(payload) = result {
+                let mut accumulator = accumulator.lock().unwrap_or_else(|err| err.into_inner());
+                if accumulator.first_panic.is_none() {
+                    accumulator.first_panic = Some(payload);
+                }
+            }
+
+            num_jobs_pending.fetch_sub(1, Ordering::Release);
+        });
+    }
+
+    // brooks TODO: doc
+    fn process_updates(updates: &mut Vec<AccountsLtHashUpdate>) -> LtHash {
+        let mut accum_lt_hash = LtHash::identity();
+        for AccountsLtHashUpdate {
+            address,
+            prev_account,
+            curr_account,
+        } in updates.drain(..)
+        {
+            if let Some(prev_account) = prev_account {
+                let prev_lt_hash = AccountsDb::lt_hash_account(&prev_account, &address);
+                accum_lt_hash.mix_out(&prev_lt_hash.0);
+            }
+            if let Some(curr_account) = curr_account {
+                let curr_lt_hash = AccountsDb::lt_hash_account(&curr_account, &address);
+                accum_lt_hash.mix_in(&curr_lt_hash.0);
+            }
+        }
+        accum_lt_hash
+    }
+
+    // brooks TODO: doc
+    fn finish(&self) -> (LtHash, UpdateStats, Saturating<u64>, bool) {
+        // make sure to lock `state` before spinning on num_jobs_pending
+        // to ensure no new jobs are added
+        let mut state = self.state.lock().unwrap();
+        while self.num_jobs_pending.load(Ordering::Acquire) > 0 {
+            // Spin, do not yield! This is called by Bank::freeze() and we want to be fast.
+        }
+
+        let mut accumulator = self
+            .accumulator
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if let Some(payload) = accumulator.first_panic.take() {
+            resume_unwind(payload);
+        }
+        let was_finalized = state.is_finalized;
+        state.is_finalized = true;
+        (
+            accumulator.lt_hash.clone(),
+            accumulator.stats.clone(),
+            state.num_jobs_total,
+            !was_finalized,
+        )
+    }
+}
+
+// brooks TODO: doc
+#[derive(Default)]
+struct AccountsLtHashBatch {
+    updates: Vec<AccountsLtHashUpdate>,
+    hash_cost: usize,
+}
+
+// brooks TODO: doc
+#[derive(Debug)]
+struct AccountsLtHashUpdate {
+    address: Pubkey,
+    prev_account: Option<AccountSharedData>,
+    curr_account: Option<AccountSharedData>,
+}
+
+// brooks TODO: doc
+struct AccountsLtHashAccumulator {
+    lt_hash: LtHash,
+    stats: UpdateStats,
+    first_panic: Option<Box<dyn Any + Send + 'static>>,
+}
+
+// brooks TODO: doc
+#[derive(Clone, Debug, Default)]
+struct UpdateStats {
+    num_updates: Saturating<u64>,
+    time_async: Duration,
+}
+
+// brooks TODO: doc
+#[derive(Debug)]
+struct ProgressState {
+    num_jobs_total: Saturating<u64>,
+    is_finalized: bool,
+}
+
+// brooks TODO: doc
+#[derive(Debug)]
+struct UpdatesFreelist {
+    list: SegQueue<Vec<AccountsLtHashUpdate>>,
+}
+
+impl UpdatesFreelist {
+    fn new() -> Self {
+        Self {
+            list: SegQueue::new(),
+        }
+    }
+
+    fn push(&self, updates: Vec<AccountsLtHashUpdate>) {
+        // If the capacity is zero, then the Vec never allocated.  In that case, don't waste time
+        // putting it back into the freelist, since there's nothing of value to reuse.
+        if updates.capacity() != 0 {
+            self.list.push(updates);
+        }
+    }
+
+    fn pop(&self) -> Vec<AccountsLtHashUpdate> {
+        let updates = self.list.pop().unwrap_or_default();
+        assert!(updates.is_empty());
+        updates
+    }
+}
+
+// brooks TODO: doc
+#[inline]
+fn calc_hash_cost(account: Option<&impl ReadableAccount>) -> usize {
+    // brooks TODO: doc
+    const ACCOUNT_HASH_METADATA_BYTES: usize = 8 /* lamports */
+    + 1 /* executable */
+    + 32 /* owner */
+    + 32 /* address */;
+
     account.map_or(0, |account| {
         if account.lamports() == 0 {
             0
