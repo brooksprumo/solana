@@ -73,7 +73,7 @@ impl AccountsLtHashAsyncProgress {
     }
 
     fn spawn(&mut self, thread_pool: &'static ThreadPool, updates: Vec<AccountsLtHashUpdate>) {
-        debug_assert!(!self.finalized);
+        assert!(!self.finalized);
         debug_assert!(!updates.is_empty());
         self.num_jobs_pending.fetch_add(1, Ordering::Relaxed);
         self.num_jobs_total += 1;
@@ -153,8 +153,6 @@ impl Bank {
         let mut seen = AHashSet::with_capacity(accounts.len());
         let mut batches: [AccountsLtHashBatch; NUM_REPLAY_HASH_THREADS] =
             array::from_fn(|_| AccountsLtHashBatch::default());
-        // Keep freeze from finalizing while this store is still registering hash work.
-        let mut progress = self.accounts_lt_hash_async_progress.lock().unwrap();
         // process accounts in reverse because we must only count the latest version of each account
         for index in (0..accounts.len()).rev() {
             let address = *accounts.pubkey(index);
@@ -198,9 +196,12 @@ impl Bank {
             });
         }
 
-        for batch in batches {
-            if !batch.updates.is_empty() {
-                progress.spawn(thread_pool, batch.updates);
+        if batches.iter().any(|batch| !batch.updates.is_empty()) {
+            let mut progress = self.accounts_lt_hash_async_progress.lock().unwrap();
+            for batch in batches {
+                if !batch.updates.is_empty() {
+                    progress.spawn(thread_pool, batch.updates);
+                }
             }
         }
     }
