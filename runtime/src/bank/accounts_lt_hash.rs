@@ -17,7 +17,6 @@ use {
             Arc, LazyLock, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
-        time::{Duration, Instant},
     },
 };
 
@@ -58,10 +57,12 @@ impl Bank {
                     let hash_cost = calc_hash_cost(prev_account.as_ref())
                         + calc_hash_cost(curr_account.as_ref());
                     pending_updates.push(PendingUpdate {
-                        address: *address,
-                        prev_account,
-                        curr_account,
                         hash_cost,
+                        update: AccountsLtHashUpdate {
+                            address: *address,
+                            prev_account,
+                            curr_account,
+                        },
                     });
                 }
             }
@@ -83,18 +84,9 @@ impl Bank {
                 .iter_mut()
                 .min_by_key(|batch| batch.hash_cost)
                 .unwrap();
-            let PendingUpdate {
-                address,
-                prev_account,
-                curr_account,
-                hash_cost,
-            } = pending_update;
+            let PendingUpdate { update, hash_cost } = pending_update;
             batch.hash_cost += hash_cost;
-            batch.updates.push(AccountsLtHashUpdate {
-                address,
-                prev_account,
-                curr_account,
-            });
+            batch.updates.push(update);
         }
 
         // Dispatch the batched updates to the replay-hash thread pool.
@@ -151,7 +143,6 @@ impl Bank {
             ("slot", self.slot(), i64),
             ("num_jobs", num_jobs_total.0, i64),
             ("num_updates", stats.num_updates.0, i64),
-            ("async_us", stats.time_async.as_micros(), i64),
             ("finish_us", finish_us, i64),
             (
                 "batched_updates_freelist_num_vecs",
@@ -222,22 +213,19 @@ impl AccountsLtHashAsyncProgress {
         }
         let accumulator = Arc::clone(&self.accumulator);
         let num_jobs_pending = Arc::clone(&self.num_jobs_pending);
-        let updates_freelist = batched_updates_freelist();
         thread_pool.spawn(move || {
             let mut updates = updates;
             let result = catch_unwind(AssertUnwindSafe(|| {
-                let start = Instant::now();
                 let num_updates = Saturating(updates.len() as u64);
                 let lt_hash = Self::process_updates(&mut updates);
                 let mut accumulator = accumulator.lock().unwrap_or_else(|err| err.into_inner());
                 accumulator.lt_hash.mix_in(&lt_hash);
                 accumulator.stats.num_updates += num_updates;
-                accumulator.stats.time_async += start.elapsed();
             }));
 
             // make sure to clear the updates vec just in case the drain() was interrupted
             updates.clear();
-            updates_freelist.push(updates);
+            batched_updates_freelist().push(updates);
 
             if let Err(payload) = result {
                 let mut accumulator = accumulator.lock().unwrap_or_else(|err| err.into_inner());
@@ -316,7 +304,6 @@ struct AccountsLtHashAccumulator {
 #[derive(Clone, Debug, Default)]
 struct UpdateStats {
     num_updates: Saturating<u64>,
-    time_async: Duration,
 }
 
 // brooks TODO: doc
@@ -343,9 +330,7 @@ fn batched_updates_freelist() -> &'static VecFreelist<AccountsLtHashUpdate> {
 // brooks TODO: doc
 #[derive(Debug)]
 struct PendingUpdate {
-    address: Pubkey,
-    prev_account: Option<AccountSharedData>,
-    curr_account: Option<AccountSharedData>,
+    update: AccountsLtHashUpdate,
     hash_cost: usize,
 }
 
@@ -444,6 +429,7 @@ mod tests {
             str::FromStr as _,
             sync::{Arc, mpsc},
             thread,
+            time::{Duration, Instant},
         },
         tempfile::TempDir,
         test_case::{test_case, test_matrix},
