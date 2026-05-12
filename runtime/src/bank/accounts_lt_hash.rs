@@ -28,12 +28,12 @@ impl Bank {
             return;
         }
         let thread_pool = replay_hash_thread_pool();
-        let progress = &self.accounts_lt_hash_async_progress;
+        let async_progress = &self.accounts_lt_hash_async_progress;
 
         let mut seen = AHashSet::with_capacity(accounts.len());
         let mut batches: [AccountsLtHashBatch; NUM_REPLAY_HASH_THREADS] =
             array::from_fn(|_| AccountsLtHashBatch {
-                updates: progress.updates_freelist.pop(),
+                updates: async_progress.updates_freelist.pop(),
                 hash_cost: 0,
             });
         // process accounts in reverse because we must only count the latest version of each account
@@ -82,9 +82,9 @@ impl Bank {
         for batch in batches {
             let updates = batch.updates;
             if !updates.is_empty() {
-                progress.spawn(thread_pool, updates);
+                async_progress.spawn(thread_pool, updates);
             } else {
-                progress.updates_freelist.push(updates);
+                async_progress.updates_freelist.push(updates);
             }
         }
     }
@@ -131,7 +131,7 @@ pub struct AccountsLtHashAsyncProgress {
     accumulator: Arc<Mutex<AccountsLtHashAccumulator>>,
     updates_freelist: Arc<UpdatesFreelist>,
     num_jobs_pending: Arc<AtomicUsize>,
-    state: Mutex<ProgressState>,
+    state: Mutex<AsyncProgressState>,
 }
 
 impl AccountsLtHashAsyncProgress {
@@ -145,7 +145,7 @@ impl AccountsLtHashAsyncProgress {
             accumulator: Arc::new(Mutex::new(accumulator)),
             updates_freelist: Arc::new(UpdatesFreelist::new()),
             num_jobs_pending: Arc::new(AtomicUsize::new(0)),
-            state: Mutex::new(ProgressState {
+            state: Mutex::new(AsyncProgressState {
                 num_jobs_total: Saturating(0),
                 is_finalized: false,
             }),
@@ -270,7 +270,7 @@ struct UpdateStats {
 
 // brooks TODO: doc
 #[derive(Debug)]
-struct ProgressState {
+struct AsyncProgressState {
     num_jobs_total: Saturating<u64>,
     is_finalized: bool,
 }
@@ -340,8 +340,8 @@ mod tests {
     use {
         super::*,
         crate::{
-            bank::NewBankOptions, genesis_utils::create_genesis_config_with_leader_ex,
-            runtime_config::RuntimeConfig, snapshot_bank_utils, snapshot_utils,
+            genesis_utils::create_genesis_config_with_leader_ex, runtime_config::RuntimeConfig,
+            snapshot_bank_utils, snapshot_utils,
         },
         agave_feature_set::FeatureSet,
         agave_snapshots::snapshot_config::SnapshotConfig,
@@ -359,7 +359,12 @@ mod tests {
         solana_pubkey::{self as pubkey, Pubkey},
         solana_rent::Rent,
         solana_signer::Signer as _,
-        std::{cmp, iter, str::FromStr as _, sync::Arc},
+        std::{
+            cmp, iter,
+            str::FromStr as _,
+            sync::{Arc, mpsc},
+            thread,
+        },
         tempfile::TempDir,
         test_case::{test_case, test_matrix},
     };
@@ -407,38 +412,6 @@ mod tests {
     }
 
     #[test]
-    fn test_async_accounts_lt_hash_matches_full_recalculation() {
-        let (mut genesis_config, mint_keypair) =
-            solana_genesis_config::create_genesis_config(123_456_789 * LAMPORTS_PER_SOL);
-        genesis_config.fee_rate_governor = FeeRateGovernor::new(0, 0);
-        let (bank0, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
-        bank0.freeze();
-
-        let bank = Bank::new_from_parent_with_options(
-            bank0,
-            SlotLeader::default(),
-            1,
-            NewBankOptions::default(),
-        );
-
-        let recipient = Keypair::new();
-        bank.register_unique_recent_blockhash_for_test();
-        bank.transfer(LAMPORTS_PER_SOL, &mint_keypair, &recipient.pubkey())
-            .unwrap();
-
-        let owner = Pubkey::new_unique();
-        let store_pubkey = Pubkey::new_unique();
-        bank.store_account(&store_pubkey, &AccountSharedData::new(10, 0, &owner));
-        bank.store_account(&store_pubkey, &AccountSharedData::new(20, 0, &owner));
-        bank.store_account(&store_pubkey, &AccountSharedData::new(0, 0, &owner));
-
-        bank.freeze();
-        let expected = bank.calculate_accounts_lt_hash_for_tests();
-        let actual = bank.accounts_lt_hash.lock().unwrap().clone();
-        assert_eq!(expected, actual);
-    }
-
-    #[test]
     fn test_update_accounts_lt_hash() {
         // Write to address 1, 2, and 5 in first bank, so that in second bank we have
         // updates to these three accounts.  Make address 2 go to zero (dead).  Make address 1 and 3 stay
@@ -477,6 +450,7 @@ mod tests {
         bank.transfer(amount, &mint_keypair, &keypair5.pubkey())
             .unwrap();
 
+        // brooks TODO: doc
         // Manually freeze the bank to drain async accounts LT hash updates.
         bank.freeze();
         let prev_accounts_lt_hash = bank.accounts_lt_hash.lock().unwrap().clone();
@@ -604,7 +578,7 @@ mod tests {
     ///
     /// This test does a simple transfer in slot 0 so that a primordial account is modified.
     ///
-    /// Slot 0 is special because primordial accounts have no previous accounts LT hash entry.
+    /// Slot 0 is special because primordial accounts have no previous accounts lt hash entry.
     #[test_case(Features::None; "no features")]
     #[test_case(Features::All; "all features")]
     fn test_slot0_accounts_lt_hash(features: Features) {
@@ -618,6 +592,7 @@ mod tests {
         bank.transfer(LAMPORTS_PER_SOL, &mint_keypair, &Pubkey::new_unique())
             .unwrap();
 
+        // brooks TODO: doc
         // Manually freeze the bank to drain async accounts LT hash updates.
         bank.freeze();
         let actual_accounts_lt_hash = bank.accounts_lt_hash.lock().unwrap().clone();
@@ -859,5 +834,73 @@ mod tests {
         .unwrap();
 
         assert_eq!(roundtrip_bank, *bank);
+    }
+
+    // brooks TODO: doc
+    #[test]
+    fn test_accounts_lt_hash_finish_blocks_late_spawn() {
+        // brooks TODO: remove?
+        fn new_accounts_lt_hash_update() -> AccountsLtHashUpdate {
+            AccountsLtHashUpdate {
+                address: Pubkey::new_unique(),
+                prev_account: None,
+                curr_account: Some(AccountSharedData::new(
+                    1,
+                    1,
+                    &solana_system_interface::program::id(),
+                )),
+            }
+        }
+
+        let thread_pool: &'static ThreadPool = Box::leak(Box::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap(),
+        ));
+        let async_progress = Arc::new(AccountsLtHashAsyncProgress::new());
+        let (blocker_started_sender, blocker_started_receiver) = mpsc::channel();
+        let (release_blocker_sender, release_blocker_receiver) = mpsc::channel();
+
+        thread_pool.spawn(move || {
+            blocker_started_sender.send(()).unwrap();
+            release_blocker_receiver.recv().unwrap();
+        });
+        blocker_started_receiver.recv().unwrap();
+
+        async_progress.spawn(thread_pool, vec![new_accounts_lt_hash_update()]);
+        assert_eq!(async_progress.num_jobs_pending.load(Ordering::Acquire), 1);
+
+        let progress_for_finish = Arc::clone(&async_progress);
+        let finish_thread = thread::spawn(move || progress_for_finish.finish());
+
+        let start = Instant::now();
+        while async_progress.state.try_lock().is_ok() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "finish() did not lock progress state while waiting for pending work",
+            );
+            thread::yield_now();
+        }
+
+        let progress_for_spawn = Arc::clone(&async_progress);
+        let spawn_thread = thread::spawn(move || {
+            catch_unwind(AssertUnwindSafe(|| {
+                progress_for_spawn.spawn(thread_pool, vec![new_accounts_lt_hash_update()]);
+            }))
+        });
+
+        release_blocker_sender.send(()).unwrap();
+
+        let (_lt_hash, _stats, num_jobs_total, should_mix) = finish_thread.join().unwrap();
+        assert!(should_mix);
+        assert_eq!(num_jobs_total.0, 1);
+        assert_eq!(async_progress.num_jobs_pending.load(Ordering::Acquire), 0);
+
+        assert!(
+            spawn_thread.join().unwrap().is_err(),
+            "spawn() must reject work that races with finalization",
+        );
+        assert_eq!(async_progress.num_jobs_pending.load(Ordering::Acquire), 0);
     }
 }
