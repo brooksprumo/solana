@@ -102,6 +102,8 @@ impl Bank {
                 .mix_in(&delta_lt_hash);
         }
         let finish_us = finish_time.end_as_us();
+        let freelist = &self.accounts_lt_hash_async_progress.updates_freelist;
+        let freelist_capacity = freelist.total_capacity.load(Ordering::Relaxed);
         datapoint_info!(
             "bank-accounts_lt_hash",
             ("slot", self.slot(), i64),
@@ -109,6 +111,17 @@ impl Bank {
             ("num_updates", stats.num_updates.0, i64),
             ("async_us", stats.time_async.as_micros(), i64),
             ("finish_us", finish_us, i64),
+            (
+                "freelist_num_vecs",
+                freelist.num_vecs.load(Ordering::Relaxed),
+                i64
+            ),
+            ("freelist_capacity_elems", freelist_capacity, i64),
+            (
+                "freelist_capacity_bytes",
+                freelist_capacity * size_of::<AccountsLtHashUpdate>(),
+                i64
+            ),
         );
     }
 }
@@ -266,26 +279,40 @@ struct ProgressState {
 #[derive(Debug)]
 struct UpdatesFreelist {
     list: SegQueue<Vec<AccountsLtHashUpdate>>,
+
+    // stats
+    num_vecs: AtomicUsize,
+    total_capacity: AtomicUsize,
 }
 
 impl UpdatesFreelist {
     fn new() -> Self {
         Self {
             list: SegQueue::new(),
+            num_vecs: AtomicUsize::new(0),
+            total_capacity: AtomicUsize::new(0),
         }
     }
 
     fn push(&self, updates: Vec<AccountsLtHashUpdate>) {
         // If the capacity is zero, then the Vec never allocated.  In that case, don't waste time
         // putting it back into the freelist, since there's nothing of value to reuse.
-        if updates.capacity() != 0 {
+        let capacity = updates.capacity();
+        if capacity != 0 {
             self.list.push(updates);
+            self.num_vecs.fetch_add(1, Ordering::Relaxed);
+            self.total_capacity.fetch_add(capacity, Ordering::Relaxed);
         }
     }
 
     fn pop(&self) -> Vec<AccountsLtHashUpdate> {
-        let updates = self.list.pop().unwrap_or_default();
+        let Some(updates) = self.list.pop() else {
+            return Vec::new();
+        };
         assert!(updates.is_empty());
+        self.num_vecs.fetch_sub(1, Ordering::Relaxed);
+        self.total_capacity
+            .fetch_sub(updates.capacity(), Ordering::Relaxed);
         updates
     }
 }
