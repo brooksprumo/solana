@@ -14,7 +14,7 @@ use {
         num::Saturating,
         panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
         sync::{
-            Arc, Mutex,
+            Arc, LazyLock, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
         time::{Duration, Instant},
@@ -22,27 +22,27 @@ use {
 };
 
 impl Bank {
-    // brooks TODO: doc
+    /// Enqueues the accounts lt hash updates for `accounts` to the replay-hash thread pool.
     pub fn enqueue_accounts_lt_hash_updates<'a>(&self, accounts: &impl StorableAccounts<'a>) {
         if accounts.is_empty() {
             return;
         }
-        let thread_pool = replay_hash_thread_pool();
-        let async_progress = &self.accounts_lt_hash_async_progress;
 
+        let async_progress = &self.accounts_lt_hash_async_progress;
+        let updates_freelist = UpdatesFreelist::get();
+        let mut pending_updates = updates_freelist.pop();
         let mut seen = AHashSet::with_capacity(accounts.len());
-        let mut pending_updates = async_progress.updates_freelist.pop();
         // process accounts in reverse because we must only count the latest version of each account
         for index in (0..accounts.len()).rev() {
-            let address = *accounts.pubkey(index);
-            if !seen.insert(address) {
+            let address = accounts.pubkey(index);
+            if !seen.insert(*address) {
                 // we've already enqueued a newer update for the same account; skip this one
                 continue;
             }
             let prev_account = self
                 .rc
                 .accounts
-                .load_with_fixed_root_do_not_populate_read_cache(&self.ancestors, &address)
+                .load_with_fixed_root_do_not_populate_read_cache(&self.ancestors, address)
                 .map(|(account, _slot)| account);
             let curr_account = accounts.account(index, |account| {
                 (account.lamports() != 0).then(|| account.take_account())
@@ -50,37 +50,34 @@ impl Bank {
             match (&prev_account, &curr_account) {
                 (None, None) => {
                     // the account is ephemeral; skip it
-                    continue;
                 }
                 (Some(a), Some(b)) if accounts_equal(a, b) => {
                     // the account was not modified; skip it
-                    continue;
                 }
                 _ => {
                     // the account was modified; enqueue this update
+                    let hash_cost = calc_hash_cost(prev_account.as_ref())
+                        + calc_hash_cost(curr_account.as_ref());
+                    pending_updates.push(AccountsLtHashUpdate {
+                        address: *address,
+                        prev_account,
+                        curr_account,
+                        hash_cost,
+                    });
                 }
             }
-            let hash_cost =
-                calc_hash_cost(prev_account.as_ref()) + calc_hash_cost(curr_account.as_ref());
-            pending_updates.push(AccountsLtHashUpdate {
-                address,
-                prev_account,
-                curr_account,
-                hash_cost,
-            });
         }
 
-        // brooks TODO: doc
-        pending_updates
-            .sort_unstable_by_key(|pending_update| cmp::Reverse(pending_update.hash_cost));
-
-        // XXX new
+        // Split the pending updates in batches; one per replay-hash thread.
+        // Attempt to evenly distribute the hashing work, based on the "hash cost",
+        // which is effectively the number of bytes to hash per update.
         let mut batches: [AccountsLtHashBatch; NUM_REPLAY_HASH_THREADS] =
             array::from_fn(|_| AccountsLtHashBatch {
-                updates: async_progress.updates_freelist.pop(),
+                updates: updates_freelist.pop(),
                 hash_cost: 0,
             });
-
+        pending_updates
+            .sort_unstable_by_key(|pending_update| cmp::Reverse(pending_update.hash_cost));
         for pending_update in pending_updates.drain(..) {
             let batch = batches
                 .iter_mut()
@@ -90,25 +87,39 @@ impl Bank {
             batch.updates.push(pending_update);
         }
 
+        // Dispatch the batched updates to the replay-hash thread pool.
+        // If any of the batches were unused, reclaim them and add them
+        // back to the freelist.
+        let thread_pool = replay_hash_thread_pool();
         for batch in batches {
             let updates = batch.updates;
             if !updates.is_empty() {
                 async_progress.spawn(thread_pool, updates);
             } else {
-                async_progress.updates_freelist.push(updates);
+                updates_freelist.push(updates);
             }
         }
 
-        // brooks TODO: doc
-        async_progress.updates_freelist.push(pending_updates);
+        // Reclaim the pending updates too!
+        updates_freelist.push(pending_updates);
     }
 
-    // brooks TODO: doc
+    /// Updates the accounts lt hash.
+    ///
+    /// When freezing a bank, we compute and update the accounts lt hash.
+    /// For each account modified in this bank, we:
+    /// - mix out its previous state, and
+    /// - mix in its current state
+    ///
+    /// This function waits for any in-flight jobs on the replay-hash threads,
+    /// computes their combined delta lt hash, then mixes it into the bank.
+    ///
+    /// Since this function is non-idempotent, it should only be called once per bank.
     pub(crate) fn finish_accounts_lt_hash_updates(&self) {
         let finish_time = Measure::start("");
-        let (delta_lt_hash, stats, num_jobs_total, should_mix) =
+        let (delta_lt_hash, stats, num_jobs_total, should_mix_in) =
             self.accounts_lt_hash_async_progress.finish();
-        if should_mix {
+        if should_mix_in {
             self.accounts_lt_hash
                 .lock()
                 .unwrap()
@@ -116,7 +127,7 @@ impl Bank {
                 .mix_in(&delta_lt_hash);
         }
         let finish_us = finish_time.end_as_us();
-        let freelist = &self.accounts_lt_hash_async_progress.updates_freelist;
+        let freelist = UpdatesFreelist::get();
         let freelist_capacity = freelist.total_capacity.load(Ordering::Relaxed);
         datapoint_info!(
             "bank-accounts_lt_hash",
@@ -143,7 +154,6 @@ impl Bank {
 // brooks TODO: doc
 pub struct AccountsLtHashAsyncProgress {
     accumulator: Arc<Mutex<AccountsLtHashAccumulator>>,
-    updates_freelist: Arc<UpdatesFreelist>,
     num_jobs_pending: Arc<AtomicUsize>,
     state: Mutex<AsyncProgressState>,
 }
@@ -157,7 +167,6 @@ impl AccountsLtHashAsyncProgress {
         };
         Self {
             accumulator: Arc::new(Mutex::new(accumulator)),
-            updates_freelist: Arc::new(UpdatesFreelist::new()),
             num_jobs_pending: Arc::new(AtomicUsize::new(0)),
             state: Mutex::new(AsyncProgressState {
                 num_jobs_total: Saturating(0),
@@ -177,7 +186,7 @@ impl AccountsLtHashAsyncProgress {
         }
         let accumulator = Arc::clone(&self.accumulator);
         let num_jobs_pending = Arc::clone(&self.num_jobs_pending);
-        let updates_freelist = Arc::clone(&self.updates_freelist);
+        let updates_freelist = UpdatesFreelist::get();
         thread_pool.spawn(move || {
             let mut updates = updates;
             let result = catch_unwind(AssertUnwindSafe(|| {
@@ -302,12 +311,14 @@ struct UpdatesFreelist {
 }
 
 impl UpdatesFreelist {
-    fn new() -> Self {
-        Self {
+    // brooks TODO: doc
+    fn get() -> &'static UpdatesFreelist {
+        static UPDATES_FREELIST: LazyLock<UpdatesFreelist> = LazyLock::new(|| UpdatesFreelist {
             list: SegQueue::new(),
             num_vecs: AtomicUsize::new(0),
             total_capacity: AtomicUsize::new(0),
-        }
+        });
+        &UPDATES_FREELIST
     }
 
     fn push(&self, updates: Vec<AccountsLtHashUpdate>) {
