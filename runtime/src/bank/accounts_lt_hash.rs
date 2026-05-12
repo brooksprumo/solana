@@ -10,7 +10,7 @@ use {
     solana_pubkey::Pubkey,
     std::{
         any::Any,
-        array,
+        array, cmp,
         num::Saturating,
         panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
         sync::{
@@ -31,11 +31,7 @@ impl Bank {
         let async_progress = &self.accounts_lt_hash_async_progress;
 
         let mut seen = AHashSet::with_capacity(accounts.len());
-        let mut batches: [AccountsLtHashBatch; NUM_REPLAY_HASH_THREADS] =
-            array::from_fn(|_| AccountsLtHashBatch {
-                updates: async_progress.updates_freelist.pop(),
-                hash_cost: 0,
-            });
+        let mut pending_updates = async_progress.updates_freelist.pop();
         // process accounts in reverse because we must only count the latest version of each account
         for index in (0..accounts.len()).rev() {
             let address = *accounts.pubkey(index);
@@ -66,17 +62,32 @@ impl Bank {
             }
             let hash_cost =
                 calc_hash_cost(prev_account.as_ref()) + calc_hash_cost(curr_account.as_ref());
-            let batch = batches
-                .iter_mut()
-                .min_by_key(|batch| batch.hash_cost)
-                // SAFETY: batches is a fixed size array that is not empty
-                .unwrap();
-            batch.hash_cost += hash_cost;
-            batch.updates.push(AccountsLtHashUpdate {
+            pending_updates.push(AccountsLtHashUpdate {
                 address,
                 prev_account,
                 curr_account,
+                hash_cost,
             });
+        }
+
+        // brooks TODO: doc
+        pending_updates
+            .sort_unstable_by_key(|pending_update| cmp::Reverse(pending_update.hash_cost));
+
+        // XXX new
+        let mut batches: [AccountsLtHashBatch; NUM_REPLAY_HASH_THREADS] =
+            array::from_fn(|_| AccountsLtHashBatch {
+                updates: async_progress.updates_freelist.pop(),
+                hash_cost: 0,
+            });
+
+        for pending_update in pending_updates.drain(..) {
+            let batch = batches
+                .iter_mut()
+                .min_by_key(|batch| batch.hash_cost)
+                .unwrap();
+            batch.hash_cost += pending_update.hash_cost;
+            batch.updates.push(pending_update);
         }
 
         for batch in batches {
@@ -87,6 +98,9 @@ impl Bank {
                 async_progress.updates_freelist.push(updates);
             }
         }
+
+        // brooks TODO: doc
+        async_progress.updates_freelist.push(pending_updates);
     }
 
     // brooks TODO: doc
@@ -198,6 +212,7 @@ impl AccountsLtHashAsyncProgress {
             address,
             prev_account,
             curr_account,
+            hash_cost: _,
         } in updates.drain(..)
         {
             if let Some(prev_account) = prev_account {
@@ -252,6 +267,7 @@ struct AccountsLtHashUpdate {
     address: Pubkey,
     prev_account: Option<AccountSharedData>,
     curr_account: Option<AccountSharedData>,
+    hash_cost: usize,
 }
 
 // brooks TODO: doc
@@ -841,14 +857,17 @@ mod tests {
     fn test_accounts_lt_hash_finish_blocks_late_spawn() {
         // brooks TODO: remove?
         fn new_accounts_lt_hash_update() -> AccountsLtHashUpdate {
+            let curr_account = Some(AccountSharedData::new(
+                1,
+                1,
+                &solana_system_interface::program::id(),
+            ));
+            let hash_cost = calc_hash_cost(curr_account.as_ref());
             AccountsLtHashUpdate {
                 address: Pubkey::new_unique(),
                 prev_account: None,
-                curr_account: Some(AccountSharedData::new(
-                    1,
-                    1,
-                    &solana_system_interface::program::id(),
-                )),
+                curr_account,
+                hash_cost,
             }
         }
 
