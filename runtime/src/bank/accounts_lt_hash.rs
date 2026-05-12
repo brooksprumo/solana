@@ -28,9 +28,8 @@ impl Bank {
             return;
         }
 
-        let async_progress = &self.accounts_lt_hash_async_progress;
-        let updates_freelist = UpdatesFreelist::get();
-        let mut pending_updates = updates_freelist.pop();
+        let pending_updates_freelist = pending_updates_freelist();
+        let mut pending_updates = pending_updates_freelist.pop();
         let mut seen = AHashSet::with_capacity(accounts.len());
         // process accounts in reverse because we must only count the latest version of each account
         for index in (0..accounts.len()).rev() {
@@ -58,7 +57,7 @@ impl Bank {
                     // the account was modified; enqueue this update
                     let hash_cost = calc_hash_cost(prev_account.as_ref())
                         + calc_hash_cost(curr_account.as_ref());
-                    pending_updates.push(AccountsLtHashUpdate {
+                    pending_updates.push(PendingUpdate {
                         address: *address,
                         prev_account,
                         curr_account,
@@ -71,9 +70,10 @@ impl Bank {
         // Split the pending updates in batches; one per replay-hash thread.
         // Attempt to evenly distribute the hashing work, based on the "hash cost",
         // which is effectively the number of bytes to hash per update.
+        let batched_updates_freelist = batched_updates_freelist();
         let mut batches: [AccountsLtHashBatch; NUM_REPLAY_HASH_THREADS] =
             array::from_fn(|_| AccountsLtHashBatch {
-                updates: updates_freelist.pop(),
+                updates: batched_updates_freelist.pop(),
                 hash_cost: 0,
             });
         pending_updates
@@ -83,25 +83,36 @@ impl Bank {
                 .iter_mut()
                 .min_by_key(|batch| batch.hash_cost)
                 .unwrap();
-            batch.hash_cost += pending_update.hash_cost;
-            batch.updates.push(pending_update);
+            let PendingUpdate {
+                address,
+                prev_account,
+                curr_account,
+                hash_cost,
+            } = pending_update;
+            batch.hash_cost += hash_cost;
+            batch.updates.push(AccountsLtHashUpdate {
+                address,
+                prev_account,
+                curr_account,
+            });
         }
 
         // Dispatch the batched updates to the replay-hash thread pool.
         // If any of the batches were unused, reclaim them and add them
         // back to the freelist.
+        let async_progress = &self.accounts_lt_hash_async_progress;
         let thread_pool = replay_hash_thread_pool();
         for batch in batches {
             let updates = batch.updates;
             if !updates.is_empty() {
                 async_progress.spawn(thread_pool, updates);
             } else {
-                updates_freelist.push(updates);
+                batched_updates_freelist.push(updates);
             }
         }
 
         // Reclaim the pending updates too!
-        updates_freelist.push(pending_updates);
+        pending_updates_freelist.push(pending_updates);
     }
 
     /// Updates the accounts lt hash.
@@ -127,8 +138,14 @@ impl Bank {
                 .mix_in(&delta_lt_hash);
         }
         let finish_us = finish_time.end_as_us();
-        let freelist = UpdatesFreelist::get();
-        let freelist_capacity = freelist.total_capacity.load(Ordering::Relaxed);
+        let batched_updates_freelist = batched_updates_freelist();
+        let batched_updates_freelist_capacity = batched_updates_freelist
+            .total_capacity
+            .load(Ordering::Relaxed);
+        let pending_updates_freelist = pending_updates_freelist();
+        let pending_updates_freelist_capacity = pending_updates_freelist
+            .total_capacity
+            .load(Ordering::Relaxed);
         datapoint_info!(
             "bank-accounts_lt_hash",
             ("slot", self.slot(), i64),
@@ -137,14 +154,33 @@ impl Bank {
             ("async_us", stats.time_async.as_micros(), i64),
             ("finish_us", finish_us, i64),
             (
-                "freelist_num_vecs",
-                freelist.num_vecs.load(Ordering::Relaxed),
+                "batched_updates_freelist_num_vecs",
+                batched_updates_freelist.num_vecs.load(Ordering::Relaxed),
                 i64
             ),
-            ("freelist_capacity_elems", freelist_capacity, i64),
             (
-                "freelist_capacity_bytes",
-                freelist_capacity * size_of::<AccountsLtHashUpdate>(),
+                "batched_updates_freelist_capacity_elems",
+                batched_updates_freelist_capacity,
+                i64
+            ),
+            (
+                "batched_updates_freelist_capacity_bytes",
+                batched_updates_freelist_capacity * size_of::<AccountsLtHashUpdate>(),
+                i64
+            ),
+            (
+                "pending_updates_freelist_num_vecs",
+                pending_updates_freelist.num_vecs.load(Ordering::Relaxed),
+                i64
+            ),
+            (
+                "pending_updates_freelist_capacity_elems",
+                pending_updates_freelist_capacity,
+                i64
+            ),
+            (
+                "pending_updates_freelist_capacity_bytes",
+                pending_updates_freelist_capacity * size_of::<PendingUpdate>(),
                 i64
             ),
         );
@@ -186,7 +222,7 @@ impl AccountsLtHashAsyncProgress {
         }
         let accumulator = Arc::clone(&self.accumulator);
         let num_jobs_pending = Arc::clone(&self.num_jobs_pending);
-        let updates_freelist = UpdatesFreelist::get();
+        let updates_freelist = batched_updates_freelist();
         thread_pool.spawn(move || {
             let mut updates = updates;
             let result = catch_unwind(AssertUnwindSafe(|| {
@@ -217,13 +253,12 @@ impl AccountsLtHashAsyncProgress {
     // brooks TODO: doc
     fn process_updates(updates: &mut Vec<AccountsLtHashUpdate>) -> LtHash {
         let mut accum_lt_hash = LtHash::identity();
-        for AccountsLtHashUpdate {
-            address,
-            prev_account,
-            curr_account,
-            hash_cost: _,
-        } in updates.drain(..)
-        {
+        for update in updates.drain(..) {
+            let AccountsLtHashUpdate {
+                address,
+                prev_account,
+                curr_account,
+            } = update;
             if let Some(prev_account) = prev_account {
                 let prev_lt_hash = AccountsDb::lt_hash_account(&prev_account, &address);
                 accum_lt_hash.mix_out(&prev_lt_hash.0);
@@ -271,15 +306,6 @@ struct AccountsLtHashBatch {
 }
 
 // brooks TODO: doc
-#[derive(Debug)]
-struct AccountsLtHashUpdate {
-    address: Pubkey,
-    prev_account: Option<AccountSharedData>,
-    curr_account: Option<AccountSharedData>,
-    hash_cost: usize,
-}
-
-// brooks TODO: doc
 struct AccountsLtHashAccumulator {
     lt_hash: LtHash,
     stats: UpdateStats,
@@ -302,45 +328,72 @@ struct AsyncProgressState {
 
 // brooks TODO: doc
 #[derive(Debug)]
-struct UpdatesFreelist {
-    list: SegQueue<Vec<AccountsLtHashUpdate>>,
+struct AccountsLtHashUpdate {
+    address: Pubkey,
+    prev_account: Option<AccountSharedData>,
+    curr_account: Option<AccountSharedData>,
+}
+
+// brooks TODO: doc
+fn batched_updates_freelist() -> &'static VecFreelist<AccountsLtHashUpdate> {
+    static FREELIST: LazyLock<VecFreelist<AccountsLtHashUpdate>> = LazyLock::new(VecFreelist::new);
+    &FREELIST
+}
+
+// brooks TODO: doc
+#[derive(Debug)]
+struct PendingUpdate {
+    address: Pubkey,
+    prev_account: Option<AccountSharedData>,
+    curr_account: Option<AccountSharedData>,
+    hash_cost: usize,
+}
+
+// brooks TODO: doc
+fn pending_updates_freelist() -> &'static VecFreelist<PendingUpdate> {
+    static FREELIST: LazyLock<VecFreelist<PendingUpdate>> = LazyLock::new(VecFreelist::new);
+    &FREELIST
+}
+
+// brooks TODO: doc
+#[derive(Debug)]
+struct VecFreelist<T> {
+    list: SegQueue<Vec<T>>,
 
     // stats
     num_vecs: AtomicUsize,
     total_capacity: AtomicUsize,
 }
 
-impl UpdatesFreelist {
-    // brooks TODO: doc
-    fn get() -> &'static UpdatesFreelist {
-        static UPDATES_FREELIST: LazyLock<UpdatesFreelist> = LazyLock::new(|| UpdatesFreelist {
+impl<T> VecFreelist<T> {
+    fn new() -> Self {
+        Self {
             list: SegQueue::new(),
             num_vecs: AtomicUsize::new(0),
             total_capacity: AtomicUsize::new(0),
-        });
-        &UPDATES_FREELIST
+        }
     }
 
-    fn push(&self, updates: Vec<AccountsLtHashUpdate>) {
+    fn push(&self, vec: Vec<T>) {
         // If the capacity is zero, then the Vec never allocated.  In that case, don't waste time
         // putting it back into the freelist, since there's nothing of value to reuse.
-        let capacity = updates.capacity();
+        let capacity = vec.capacity();
         if capacity != 0 {
-            self.list.push(updates);
+            self.list.push(vec);
             self.num_vecs.fetch_add(1, Ordering::Relaxed);
             self.total_capacity.fetch_add(capacity, Ordering::Relaxed);
         }
     }
 
-    fn pop(&self) -> Vec<AccountsLtHashUpdate> {
-        let Some(updates) = self.list.pop() else {
+    fn pop(&self) -> Vec<T> {
+        let Some(vec) = self.list.pop() else {
             return Vec::new();
         };
-        assert!(updates.is_empty());
+        assert!(vec.is_empty());
         self.num_vecs.fetch_sub(1, Ordering::Relaxed);
         self.total_capacity
-            .fetch_sub(updates.capacity(), Ordering::Relaxed);
-        updates
+            .fetch_sub(vec.capacity(), Ordering::Relaxed);
+        vec
     }
 }
 
@@ -873,12 +926,10 @@ mod tests {
                 1,
                 &solana_system_interface::program::id(),
             ));
-            let hash_cost = calc_hash_cost(curr_account.as_ref());
             AccountsLtHashUpdate {
                 address: Pubkey::new_unique(),
                 prev_account: None,
                 curr_account,
-                hash_cost,
             }
         }
 
