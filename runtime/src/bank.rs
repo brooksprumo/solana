@@ -999,7 +999,7 @@ pub struct Bank {
     /// The value is only meaningful after freezing.
     accounts_lt_hash: Mutex<AccountsLtHash>,
 
-    /// Pending async account LT hash work for this bank.
+    /// Track progress of the asynchronous accounts lt hashing for this Bank.
     accounts_lt_hash_async_progress: AccountsLtHashAsyncProgress,
 
     /// The unique identifier for the corresponding block for this bank.

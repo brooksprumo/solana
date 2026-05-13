@@ -178,7 +178,7 @@ impl Bank {
     }
 }
 
-// brooks TODO: doc
+/// Struct for tracking progress of the asynchronous accounts lt hashing for a Bank.
 pub struct AccountsLtHashAsyncProgress {
     accumulator: Arc<Mutex<AccountsLtHashAccumulator>>,
     num_jobs_pending: Arc<AtomicUsize>,
@@ -186,6 +186,7 @@ pub struct AccountsLtHashAsyncProgress {
 }
 
 impl AccountsLtHashAsyncProgress {
+    /// Creates a new AccountsLtHashAsyncProgress variable, which is suitable for a new Bank.
     pub fn new() -> Self {
         let accumulator = AccountsLtHashAccumulator {
             lt_hash: LtHash::identity(),
@@ -202,7 +203,9 @@ impl AccountsLtHashAsyncProgress {
         }
     }
 
-    // brooks TODO: doc
+    /// Enqueues `updates` into `thread_pool` for asynchronous processing.
+    ///
+    /// Panics if `updates` is empty, or if `self` was already finalized.
     fn spawn(&self, thread_pool: &'static ThreadPool, updates: Vec<AccountsLtHashUpdate>) {
         debug_assert!(!updates.is_empty());
         {
@@ -217,7 +220,7 @@ impl AccountsLtHashAsyncProgress {
             let mut updates = updates;
             let result = catch_unwind(AssertUnwindSafe(|| {
                 let num_updates = Saturating(updates.len() as u64);
-                let lt_hash = Self::process_updates(&mut updates);
+                let lt_hash = Self::process(&mut updates);
                 let mut accumulator = accumulator.lock().unwrap_or_else(|err| err.into_inner());
                 accumulator.lt_hash.mix_in(&lt_hash);
                 accumulator.stats.num_updates += num_updates;
@@ -238,8 +241,8 @@ impl AccountsLtHashAsyncProgress {
         });
     }
 
-    // brooks TODO: doc
-    fn process_updates(updates: &mut Vec<AccountsLtHashUpdate>) -> LtHash {
+    /// Processes `updates` and returns their overall accounts lt hash.
+    fn process(updates: &mut Vec<AccountsLtHashUpdate>) -> LtHash {
         let mut accum_lt_hash = LtHash::identity();
         for update in updates.drain(..) {
             let AccountsLtHashUpdate {
@@ -259,7 +262,13 @@ impl AccountsLtHashAsyncProgress {
         accum_lt_hash
     }
 
-    // brooks TODO: doc
+    /// Finalizes the asynchronous accounts lt hash updates.
+    ///
+    /// This fn waits for all pending jobs to complete, then returns:
+    /// * the overall accounts lt hash
+    /// * the stats from all the updates
+    /// * the number of asynchronous jobs
+    /// * if this was the first time finish() was called
     fn finish(&self) -> (LtHash, UpdateStats, Saturating<u64>, bool) {
         // make sure to lock `state` before spinning on num_jobs_pending
         // to ensure no new jobs are added
@@ -286,34 +295,34 @@ impl AccountsLtHashAsyncProgress {
     }
 }
 
-// brooks TODO: doc
+/// A batch of accounts lt hash updates to process.
 #[derive(Default)]
 struct AccountsLtHashBatch {
     updates: Vec<AccountsLtHashUpdate>,
     hash_cost: usize,
 }
 
-// brooks TODO: doc
+/// The struct to accumulate results from processing a batch of updates.
 struct AccountsLtHashAccumulator {
     lt_hash: LtHash,
     stats: UpdateStats,
     first_panic: Option<Box<dyn Any + Send + 'static>>,
 }
 
-// brooks TODO: doc
+/// Stats from processing a batch of updates.
 #[derive(Clone, Debug, Default)]
 struct UpdateStats {
     num_updates: Saturating<u64>,
 }
 
-// brooks TODO: doc
+/// The state of the asynchronous progress itself.
 #[derive(Debug)]
 struct AsyncProgressState {
     num_jobs_total: Saturating<u64>,
     is_finalized: bool,
 }
 
-// brooks TODO: doc
+/// A single accounts lt hash update to process.
 #[derive(Debug)]
 struct AccountsLtHashUpdate {
     address: Pubkey,
@@ -321,26 +330,26 @@ struct AccountsLtHashUpdate {
     curr_account: Option<AccountSharedData>,
 }
 
-// brooks TODO: doc
+/// Get the freelist of vectors to use for batching updates.
 fn batched_updates_freelist() -> &'static VecFreelist<AccountsLtHashUpdate> {
     static FREELIST: LazyLock<VecFreelist<AccountsLtHashUpdate>> = LazyLock::new(VecFreelist::new);
     &FREELIST
 }
 
-// brooks TODO: doc
+/// A pending update, used to put into batches for processing.
 #[derive(Debug)]
 struct PendingUpdate {
     update: AccountsLtHashUpdate,
     hash_cost: usize,
 }
 
-// brooks TODO: doc
+/// Get the freelist of vectors to use for holding pending updates.
 fn pending_updates_freelist() -> &'static VecFreelist<PendingUpdate> {
     static FREELIST: LazyLock<VecFreelist<PendingUpdate>> = LazyLock::new(VecFreelist::new);
     &FREELIST
 }
 
-// brooks TODO: doc
+/// Freelist of vectors, to avoid repeat allocations/deallocations.
 #[derive(Debug)]
 struct VecFreelist<T> {
     list: SegQueue<Vec<T>>,
@@ -351,6 +360,7 @@ struct VecFreelist<T> {
 }
 
 impl<T> VecFreelist<T> {
+    /// Creates a new, empty, freelist.
     fn new() -> Self {
         Self {
             list: SegQueue::new(),
@@ -359,17 +369,25 @@ impl<T> VecFreelist<T> {
         }
     }
 
+    /// Pushes `vec` on to the freelist (IFF its capacity is greater than zero).
+    ///
+    /// Panics if `vec` is not empty.
     fn push(&self, vec: Vec<T>) {
         // If the capacity is zero, then the Vec never allocated.  In that case, don't waste time
         // putting it back into the freelist, since there's nothing of value to reuse.
         let capacity = vec.capacity();
         if capacity != 0 {
+            assert!(vec.is_empty());
             self.list.push(vec);
             self.num_vecs.fetch_add(1, Ordering::Relaxed);
             self.total_capacity.fetch_add(capacity, Ordering::Relaxed);
         }
     }
 
+    /// Pops a vec off the freelist and returns it.
+    ///
+    /// The returned vec will always be empty.
+    /// If the freelist is empty, a new vec will be returned.
     fn pop(&self) -> Vec<T> {
         let Some(vec) = self.list.pop() else {
             return Vec::new();
@@ -382,10 +400,11 @@ impl<T> VecFreelist<T> {
     }
 }
 
-// brooks TODO: doc
+/// Calculates the cost of hashing an account.
+///
+/// Which is an approximation based on the number of bytes to hash.
 #[inline]
 fn calc_hash_cost(account: Option<&impl ReadableAccount>) -> usize {
-    // brooks TODO: doc
     const ACCOUNT_HASH_METADATA_BYTES: usize = 8 /* lamports */
     + 1 /* executable */
     + 32 /* owner */
@@ -427,7 +446,7 @@ mod tests {
         std::{
             cmp, iter,
             str::FromStr as _,
-            sync::{Arc, mpsc},
+            sync::Arc,
             thread,
             time::{Duration, Instant},
         },
@@ -516,8 +535,7 @@ mod tests {
         bank.transfer(amount, &mint_keypair, &keypair5.pubkey())
             .unwrap();
 
-        // brooks TODO: doc
-        // Manually freeze the bank to drain async accounts LT hash updates.
+        // manually freeze the bank to trigger updating the accounts lt hash
         bank.freeze();
         let prev_accounts_lt_hash = bank.accounts_lt_hash.lock().unwrap().clone();
 
@@ -572,18 +590,19 @@ mod tests {
         // store account 5 into this new bank, unchanged
         bank.store_account(&keypair5.pubkey(), prev_account5.as_ref().unwrap());
 
-        // brooks TODO: doc
-        // Freeze the bank to drain async accounts LT hash updates.
+        // freeze the bank to trigger updating the accounts lt hash
         bank.freeze();
 
         let post_accounts_lt_hash = bank.accounts_lt_hash.lock().unwrap().clone();
-        // brooks TODO: doc
+
+        // ensure the bank's accounts lt hash is only updated once,
+        // even if finish() is called multiple times
         bank.finish_accounts_lt_hash_updates();
         assert_eq!(
-            post_accounts_lt_hash,
             *bank.accounts_lt_hash.lock().unwrap(),
-            "finishing accounts LT hash updates twice must not mix the delta twice",
+            post_accounts_lt_hash,
         );
+
         let post_mint = bank.get_account_with_fixed_root(&mint_keypair.pubkey());
         let post_account1 = bank.get_account_with_fixed_root(&keypair1.pubkey());
         let post_account2 = bank.get_account_with_fixed_root(&keypair2.pubkey());
@@ -658,8 +677,7 @@ mod tests {
         bank.transfer(LAMPORTS_PER_SOL, &mint_keypair, &Pubkey::new_unique())
             .unwrap();
 
-        // brooks TODO: doc
-        // Manually freeze the bank to drain async accounts LT hash updates.
+        // manually freeze the bank to trigger updating the accounts lt hash
         bank.freeze();
         let actual_accounts_lt_hash = bank.accounts_lt_hash.lock().unwrap().clone();
 
@@ -902,16 +920,11 @@ mod tests {
         assert_eq!(roundtrip_bank, *bank);
     }
 
-    // brooks TODO: doc
+    /// Ensure that spawn() and finish() do not race.
     #[test]
-    fn test_accounts_lt_hash_finish_blocks_late_spawn() {
-        // brooks TODO: remove?
+    fn test_finish_prevents_subsequent_spawn() {
         fn new_accounts_lt_hash_update() -> AccountsLtHashUpdate {
-            let curr_account = Some(AccountSharedData::new(
-                1,
-                1,
-                &solana_system_interface::program::id(),
-            ));
+            let curr_account = Some(AccountSharedData::new(42, 0, &Pubkey::default()));
             AccountsLtHashUpdate {
                 address: Pubkey::new_unique(),
                 prev_account: None,
@@ -919,55 +932,64 @@ mod tests {
             }
         }
 
+        // spin up a thread pool that'll process the async updates
         let thread_pool: &'static ThreadPool = Box::leak(Box::new(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(1)
                 .build()
                 .unwrap(),
         ));
-        let async_progress = Arc::new(AccountsLtHashAsyncProgress::new());
-        let (blocker_started_sender, blocker_started_receiver) = mpsc::channel();
-        let (release_blocker_sender, release_blocker_receiver) = mpsc::channel();
 
+        // create some channels that'll initially block the thread pool,
+        // then unblock later after spawn() and finish() have been called
+        let (block_sender, block_receiver) = crossbeam_channel::unbounded();
+        let (unblock_sender, unblock_receiver) = crossbeam_channel::unbounded();
         thread_pool.spawn(move || {
-            blocker_started_sender.send(()).unwrap();
-            release_blocker_receiver.recv().unwrap();
+            block_sender.send(()).unwrap();
+            unblock_receiver.recv().unwrap();
         });
-        blocker_started_receiver.recv().unwrap();
+        block_receiver.recv().unwrap();
 
+        // send updates to be processed asynchronously
+        let async_progress = Arc::new(AccountsLtHashAsyncProgress::new());
         async_progress.spawn(thread_pool, vec![new_accounts_lt_hash_update()]);
         assert_eq!(async_progress.num_jobs_pending.load(Ordering::Acquire), 1);
 
-        let progress_for_finish = Arc::clone(&async_progress);
-        let finish_thread = thread::spawn(move || progress_for_finish.finish());
+        // call finish() to prevent additional async updates from being processed
+        let finish_thread = thread::spawn({
+            let async_progress = Arc::clone(&async_progress);
+            move || async_progress.finish()
+        });
 
+        // wait and ensure finish() has started
         let start = Instant::now();
         while async_progress.state.try_lock().is_ok() {
-            assert!(
-                start.elapsed() < Duration::from_secs(5),
-                "finish() did not lock progress state while waiting for pending work",
-            );
+            assert!(start.elapsed() < Duration::from_secs(1));
             thread::yield_now();
         }
 
-        let progress_for_spawn = Arc::clone(&async_progress);
-        let spawn_thread = thread::spawn(move || {
-            catch_unwind(AssertUnwindSafe(|| {
-                progress_for_spawn.spawn(thread_pool, vec![new_accounts_lt_hash_update()]);
-            }))
+        // Send more async updates, which is not allowed since finish() already ran.
+        // We do this in another thread and catch the panic to not abort the test.
+        let spawn_thread = thread::spawn({
+            let async_progress = Arc::clone(&async_progress);
+            move || {
+                catch_unwind(AssertUnwindSafe(|| {
+                    async_progress.spawn(thread_pool, vec![new_accounts_lt_hash_update()]);
+                }))
+            }
         });
 
-        release_blocker_sender.send(()).unwrap();
+        // unblock the thread pool, which allows the async job to finally be processed
+        unblock_sender.send(()).unwrap();
 
+        // ensure after finish() completes that only a single job ran
         let (_lt_hash, _stats, num_jobs_total, should_mix) = finish_thread.join().unwrap();
         assert!(should_mix);
         assert_eq!(num_jobs_total.0, 1);
         assert_eq!(async_progress.num_jobs_pending.load(Ordering::Acquire), 0);
 
-        assert!(
-            spawn_thread.join().unwrap().is_err(),
-            "spawn() must reject work that races with finalization",
-        );
+        // and ensure the second spawn() fails
+        assert!(spawn_thread.join().unwrap().is_err());
         assert_eq!(async_progress.num_jobs_pending.load(Ordering::Acquire), 0);
     }
 }
