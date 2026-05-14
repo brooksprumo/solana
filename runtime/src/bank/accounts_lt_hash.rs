@@ -10,7 +10,7 @@ use {
     solana_pubkey::Pubkey,
     std::{
         any::Any,
-        array, cmp,
+        cmp, iter,
         num::Saturating,
         panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
         sync::{
@@ -68,15 +68,20 @@ impl Bank {
             }
         }
 
-        // Split the pending updates in batches; one per replay-hash thread.
+        // Split the pending updates in batches; minimum one per replay-hash thread.
         // Attempt to evenly distribute the hashing work, based on the "hash cost",
         // which is effectively the number of bytes to hash per update.
+        let num_updates = pending_updates.len();
+        let num_batches = num_updates.div_ceil(MAX_BATCHED_UPDATES_PER_VEC);
+        let num_batches = cmp::max(num_batches, NUM_REPLAY_HASH_THREADS);
         let batched_updates_freelist = batched_updates_freelist();
-        let mut batches: [AccountsLtHashBatch; NUM_REPLAY_HASH_THREADS] =
-            array::from_fn(|_| AccountsLtHashBatch {
-                updates: batched_updates_freelist.pop(),
-                hash_cost: 0,
-            });
+        let mut batches: Box<_> = iter::repeat_with(|| AccountsLtHashBatch {
+            updates: batched_updates_freelist.pop(),
+            hash_cost: 0,
+        })
+        .take(num_batches)
+        .collect();
+
         pending_updates
             .sort_unstable_by_key(|pending_update| cmp::Reverse(pending_update.hash_cost));
         for pending_update in pending_updates.drain(..) {
@@ -329,6 +334,17 @@ struct AccountsLtHashUpdate {
     prev_account: Option<AccountSharedData>,
     curr_account: Option<AccountSharedData>,
 }
+
+// brooks TODO: doc
+//│ 23 │/// The number of lt hash updates to batch up before sending to the async thread pool.                                      │    │
+//│ 24 │///                                                                                                                         │    │
+//│ 25 │/// The 14 KiB number is the current largest size of jemalloc's "small slab" bins,                                          │    │
+//│ 26 │/// which should help with reuse.                                                                                           │    │
+//│ 27 │const MAX_BATCH_SIZE: usize = 14 * 1024 / size_of::<AccountsLtHashUpdate>();                                                │    │
+const MAX_BATCHED_UPDATES_VEC_BYTES: usize = 14 * 1024;
+const MAX_BATCHED_UPDATES_PER_VEC: usize =
+    MAX_BATCHED_UPDATES_VEC_BYTES / size_of::<AccountsLtHashUpdate>();
+const _: () = assert!(MAX_BATCHED_UPDATES_PER_VEC > 0);
 
 /// Get the freelist of vectors to use for batching updates.
 fn batched_updates_freelist() -> &'static VecFreelist<AccountsLtHashUpdate> {
