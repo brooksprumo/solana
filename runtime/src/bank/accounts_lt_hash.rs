@@ -28,7 +28,7 @@ impl Bank {
         }
 
         let pending_updates_freelist = pending_updates_freelist();
-        let mut pending_updates = pending_updates_freelist.pop();
+        let mut pending_updates = pending_updates_freelist.pop().unwrap_or_default();
         let mut seen = AHashSet::with_capacity(accounts.len());
         // process accounts in reverse because we must only count the latest version of each account
         for index in (0..accounts.len()).rev() {
@@ -76,7 +76,9 @@ impl Bank {
         let num_batches = cmp::max(num_batches, NUM_REPLAY_HASH_THREADS);
         let batched_updates_freelist = batched_updates_freelist();
         let mut batches: Box<_> = iter::repeat_with(|| AccountsLtHashBatch {
-            updates: batched_updates_freelist.pop(),
+            updates: batched_updates_freelist
+                .pop()
+                .unwrap_or_else(|| Vec::with_capacity(MAX_BATCHED_UPDATES_PER_VEC)),
             hash_cost: 0,
         })
         .take(num_batches)
@@ -403,16 +405,13 @@ impl<T> VecFreelist<T> {
     /// Pops a vec off the freelist and returns it.
     ///
     /// The returned vec will always be empty.
-    /// If the freelist is empty, a new vec will be returned.
-    fn pop(&self) -> Vec<T> {
-        let Some(vec) = self.list.pop() else {
-            return Vec::new();
-        };
+    fn pop(&self) -> Option<Vec<T>> {
+        let vec = self.list.pop()?;
         assert!(vec.is_empty());
         self.num_vecs.fetch_sub(1, Ordering::Relaxed);
         self.total_capacity
             .fetch_sub(vec.capacity(), Ordering::Relaxed);
-        vec
+        Some(vec)
     }
 }
 
