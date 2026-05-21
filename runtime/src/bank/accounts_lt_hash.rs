@@ -143,18 +143,10 @@ impl Bank {
                 .mix_in(&delta_lt_hash);
         }
         let finish_us = finish_time.end_as_us();
-        let batched_updates_freelist = batched_updates_freelist();
-        let batched_updates_freelist_capacity = batched_updates_freelist
-            .total_capacity
-            .load(Ordering::Relaxed);
-        let pending_updates_freelist = pending_updates_freelist();
-        let pending_updates_freelist_capacity = pending_updates_freelist
-            .total_capacity
-            .load(Ordering::Relaxed);
-        let seen_accounts_freelist = seen_accounts_freelist();
-        let seen_accounts_freelist_capacity = seen_accounts_freelist
-            .total_capacity
-            .load(Ordering::Relaxed);
+
+        let batched_updates_freelist_stats = batched_updates_freelist().stats();
+        let pending_updates_freelist_stats = pending_updates_freelist().stats();
+        let seen_accounts_freelist_stats = seen_accounts_freelist().stats();
         datapoint_info!(
             "bank-accounts_lt_hash",
             ("slot", self.slot(), i64),
@@ -163,53 +155,47 @@ impl Bank {
             ("finish_us", finish_us, i64),
             (
                 "batched_updates_freelist_num_containers",
-                batched_updates_freelist
-                    .num_containers
-                    .load(Ordering::Relaxed),
+                batched_updates_freelist_stats.num_containers,
                 i64
             ),
             (
                 "batched_updates_freelist_capacity_elems",
-                batched_updates_freelist_capacity,
+                batched_updates_freelist_stats.capacity_elems,
                 i64
             ),
             (
                 "batched_updates_freelist_capacity_bytes",
-                batched_updates_freelist_capacity * size_of::<AccountsLtHashUpdate>(),
+                batched_updates_freelist_stats.capacity_bytes,
                 i64
             ),
             (
                 "pending_updates_freelist_num_containers",
-                pending_updates_freelist
-                    .num_containers
-                    .load(Ordering::Relaxed),
+                pending_updates_freelist_stats.num_containers,
                 i64
             ),
             (
                 "pending_updates_freelist_capacity_elems",
-                pending_updates_freelist_capacity,
+                pending_updates_freelist_stats.capacity_elems,
                 i64
             ),
             (
                 "pending_updates_freelist_capacity_bytes",
-                pending_updates_freelist_capacity * size_of::<PendingUpdate>(),
+                pending_updates_freelist_stats.capacity_bytes,
                 i64
             ),
             (
                 "seen_accounts_freelist_num_containers",
-                seen_accounts_freelist
-                    .num_containers
-                    .load(Ordering::Relaxed),
+                seen_accounts_freelist_stats.num_containers,
                 i64
             ),
             (
                 "seen_accounts_freelist_capacity_elems",
-                seen_accounts_freelist_capacity,
+                seen_accounts_freelist_stats.capacity_elems,
                 i64
             ),
             (
                 "seen_accounts_freelist_capacity_bytes",
-                seen_accounts_freelist_capacity * size_of::<Pubkey>(),
+                seen_accounts_freelist_stats.capacity_bytes,
                 i64
             ),
         );
@@ -450,15 +436,38 @@ impl<C: Container> ContainerFreelist<C> {
             .fetch_sub(container.capacity(), Ordering::Relaxed);
         Some(container)
     }
+
+    /// Returns a snapshot of the freelist's stats.
+    fn stats(&self) -> FreelistStats {
+        let capacity_elems = self.total_capacity.load(Ordering::Relaxed);
+        FreelistStats {
+            num_containers: self.num_containers.load(Ordering::Relaxed),
+            capacity_elems,
+            capacity_bytes: capacity_elems * size_of::<C::ElemT>(),
+        }
+    }
+}
+
+/// A snapshot of a freelist's stats.
+#[derive(Debug)]
+struct FreelistStats {
+    /// the number of containers held by the freelist
+    num_containers: usize,
+    /// the capacity, in elements, across all the containers in the freelist
+    capacity_elems: usize,
+    /// the capacity, in bytes, across all the containers in the freelist
+    capacity_bytes: usize,
 }
 
 /// Methods that a container must implement to be used by ContainerFreelist.
 trait Container {
+    type ElemT;
     fn is_empty(&self) -> bool;
     fn capacity(&self) -> usize;
 }
 
 impl<T> Container for Vec<T> {
+    type ElemT = T;
     fn is_empty(&self) -> bool {
         self.is_empty()
     }
@@ -468,6 +477,7 @@ impl<T> Container for Vec<T> {
 }
 
 impl<T> Container for ahash::HashSet<T> {
+    type ElemT = T;
     fn is_empty(&self) -> bool {
         self.is_empty()
     }
