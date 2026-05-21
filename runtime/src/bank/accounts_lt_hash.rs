@@ -1,6 +1,5 @@
 use {
     super::{Bank, NUM_REPLAY_HASH_THREADS, replay_hash_thread_pool},
-    ahash::AHashSet,
     crossbeam_queue::SegQueue,
     rayon::ThreadPool,
     solana_account::{AccountSharedData, ReadableAccount, accounts_equal},
@@ -29,11 +28,14 @@ impl Bank {
 
         let pending_updates_freelist = pending_updates_freelist();
         let mut pending_updates = pending_updates_freelist.pop().unwrap_or_default();
-        let mut seen = AHashSet::with_capacity(accounts.len());
+
+        let seen_accounts_freelist = seen_accounts_freelist();
+        let mut seen_accounts = seen_accounts_freelist.pop().unwrap_or_default();
+
         // process accounts in reverse because we must only count the latest version of each account
         for index in (0..accounts.len()).rev() {
             let address = accounts.pubkey(index);
-            if !seen.insert(*address) {
+            if !seen_accounts.insert(*address) {
                 // we've already enqueued a newer update for the same account; skip this one
                 continue;
             }
@@ -72,13 +74,13 @@ impl Bank {
         // Attempt to evenly distribute the hashing work, based on the "hash cost",
         // which is effectively the number of bytes to hash per update.
         let num_updates = pending_updates.len();
-        let num_batches = num_updates.div_ceil(MAX_BATCHED_UPDATES_PER_VEC);
+        let num_batches = num_updates.div_ceil(MAX_UPDATES_PER_BATCH);
         let num_batches = cmp::max(num_batches, NUM_REPLAY_HASH_THREADS);
         let batched_updates_freelist = batched_updates_freelist();
         let mut batches: Box<_> = iter::repeat_with(|| AccountsLtHashBatch {
             updates: batched_updates_freelist
                 .pop()
-                .unwrap_or_else(|| Vec::with_capacity(MAX_BATCHED_UPDATES_PER_VEC)),
+                .unwrap_or_else(|| Vec::with_capacity(MAX_UPDATES_PER_BATCH)),
             hash_cost: 0,
         })
         .take(num_batches)
@@ -112,6 +114,10 @@ impl Bank {
 
         // Reclaim the pending updates too!
         pending_updates_freelist.push(pending_updates);
+
+        // Reclaim the seen accounts hashset too!
+        seen_accounts.clear();
+        seen_accounts_freelist.push(seen_accounts);
     }
 
     /// Updates the accounts lt hash.
@@ -145,6 +151,10 @@ impl Bank {
         let pending_updates_freelist_capacity = pending_updates_freelist
             .total_capacity
             .load(Ordering::Relaxed);
+        let seen_accounts_freelist = seen_accounts_freelist();
+        let seen_accounts_freelist_capacity = seen_accounts_freelist
+            .total_capacity
+            .load(Ordering::Relaxed);
         datapoint_info!(
             "bank-accounts_lt_hash",
             ("slot", self.slot(), i64),
@@ -152,8 +162,10 @@ impl Bank {
             ("num_updates", stats.num_updates.0, i64),
             ("finish_us", finish_us, i64),
             (
-                "batched_updates_freelist_num_vecs",
-                batched_updates_freelist.num_vecs.load(Ordering::Relaxed),
+                "batched_updates_freelist_num_containers",
+                batched_updates_freelist
+                    .num_containers
+                    .load(Ordering::Relaxed),
                 i64
             ),
             (
@@ -167,8 +179,10 @@ impl Bank {
                 i64
             ),
             (
-                "pending_updates_freelist_num_vecs",
-                pending_updates_freelist.num_vecs.load(Ordering::Relaxed),
+                "pending_updates_freelist_num_containers",
+                pending_updates_freelist
+                    .num_containers
+                    .load(Ordering::Relaxed),
                 i64
             ),
             (
@@ -179,6 +193,23 @@ impl Bank {
             (
                 "pending_updates_freelist_capacity_bytes",
                 pending_updates_freelist_capacity * size_of::<PendingUpdate>(),
+                i64
+            ),
+            (
+                "seen_accounts_freelist_num_containers",
+                seen_accounts_freelist
+                    .num_containers
+                    .load(Ordering::Relaxed),
+                i64
+            ),
+            (
+                "seen_accounts_freelist_capacity_elems",
+                seen_accounts_freelist_capacity,
+                i64
+            ),
+            (
+                "seen_accounts_freelist_capacity_bytes",
+                seen_accounts_freelist_capacity * size_of::<Pubkey>(),
                 i64
             ),
         );
@@ -337,16 +368,11 @@ struct AccountsLtHashUpdate {
     curr_account: Option<AccountSharedData>,
 }
 
-// brooks TODO: doc
-//│ 23 │/// The number of lt hash updates to batch up before sending to the async thread pool.                                      │    │
-//│ 24 │///                                                                                                                         │    │
-//│ 25 │/// The 14 KiB number is the current largest size of jemalloc's "small slab" bins,                                          │    │
-//│ 26 │/// which should help with reuse.                                                                                           │    │
-//│ 27 │const MAX_BATCH_SIZE: usize = 14 * 1024 / size_of::<AccountsLtHashUpdate>();                                                │    │
-const MAX_BATCHED_UPDATES_VEC_BYTES: usize = 14 * 1024;
-const MAX_BATCHED_UPDATES_PER_VEC: usize =
-    MAX_BATCHED_UPDATES_VEC_BYTES / size_of::<AccountsLtHashUpdate>();
-const _: () = assert!(MAX_BATCHED_UPDATES_PER_VEC > 0);
+/// The number of lt hash updates to batch up before sending to the async thread pool.
+///
+/// The 14 KiB number is the current largest size of jemalloc's "small slab" bins.
+const MAX_UPDATES_PER_BATCH: usize = (14 * 1024) / size_of::<AccountsLtHashUpdate>();
+const _: () = assert!(MAX_UPDATES_PER_BATCH > 0);
 
 /// Get the freelist of vectors to use for batching updates.
 fn batched_updates_freelist() -> &'static VecFreelist<AccountsLtHashUpdate> {
@@ -367,51 +393,86 @@ fn pending_updates_freelist() -> &'static VecFreelist<PendingUpdate> {
     &FREELIST
 }
 
-/// Freelist of vectors, to avoid repeat allocations/deallocations.
+/// Get the freelist of hashsets to use for seen accounts.
+fn seen_accounts_freelist() -> &'static HashSetFreelist<Pubkey> {
+    static FREELIST: LazyLock<HashSetFreelist<Pubkey>> = LazyLock::new(HashSetFreelist::new);
+    &FREELIST
+}
+
+type VecFreelist<T> = ContainerFreelist<Vec<T>>;
+type HashSetFreelist<T> = ContainerFreelist<ahash::HashSet<T>>;
+
+/// Freelist of containers, to avoid repeat allocations/deallocations.
 #[derive(Debug)]
-struct VecFreelist<T> {
-    list: SegQueue<Vec<T>>,
+struct ContainerFreelist<C> {
+    list: SegQueue<C>,
 
     // stats
-    num_vecs: AtomicUsize,
+    num_containers: AtomicUsize,
     total_capacity: AtomicUsize,
 }
 
-impl<T> VecFreelist<T> {
+impl<C> ContainerFreelist<C> {
     /// Creates a new, empty, freelist.
     fn new() -> Self {
         Self {
             list: SegQueue::new(),
-            num_vecs: AtomicUsize::new(0),
+            num_containers: AtomicUsize::new(0),
             total_capacity: AtomicUsize::new(0),
         }
     }
+}
 
-    /// Pushes `vec` on to the freelist (IFF its capacity is greater than zero).
+impl<C: Container> ContainerFreelist<C> {
+    /// Pushes `container` on to the freelist (IFF its capacity is greater than zero).
     ///
-    /// Panics if `vec` is not empty.
-    fn push(&self, vec: Vec<T>) {
-        // If the capacity is zero, then the Vec never allocated.  In that case, don't waste time
-        // putting it back into the freelist, since there's nothing of value to reuse.
-        let capacity = vec.capacity();
+    /// Panics if `container` is not empty.
+    fn push(&self, container: C) {
+        // If the capacity is zero, then the container never allocated.  In that case, don't
+        // waste time putting it back into the freelist, since there's nothing of value to reuse.
+        let capacity = container.capacity();
         if capacity != 0 {
-            assert!(vec.is_empty());
-            self.list.push(vec);
-            self.num_vecs.fetch_add(1, Ordering::Relaxed);
+            assert!(container.is_empty());
+            self.list.push(container);
+            self.num_containers.fetch_add(1, Ordering::Relaxed);
             self.total_capacity.fetch_add(capacity, Ordering::Relaxed);
         }
     }
 
-    /// Pops a vec off the freelist and returns it.
+    /// Pops a container off the freelist and returns it.
     ///
-    /// The returned vec will always be empty.
-    fn pop(&self) -> Option<Vec<T>> {
-        let vec = self.list.pop()?;
-        assert!(vec.is_empty());
-        self.num_vecs.fetch_sub(1, Ordering::Relaxed);
+    /// The returned container will always be empty.
+    fn pop(&self) -> Option<C> {
+        let container = self.list.pop()?;
+        assert!(container.is_empty());
+        self.num_containers.fetch_sub(1, Ordering::Relaxed);
         self.total_capacity
-            .fetch_sub(vec.capacity(), Ordering::Relaxed);
-        Some(vec)
+            .fetch_sub(container.capacity(), Ordering::Relaxed);
+        Some(container)
+    }
+}
+
+/// Methods that a container must implement to be used by ContainerFreelist.
+trait Container {
+    fn is_empty(&self) -> bool;
+    fn capacity(&self) -> usize;
+}
+
+impl<T> Container for Vec<T> {
+    fn is_empty(&self) -> bool {
+        self.is_empty()
+    }
+    fn capacity(&self) -> usize {
+        self.capacity()
+    }
+}
+
+impl<T> Container for ahash::HashSet<T> {
+    fn is_empty(&self) -> bool {
+        self.is_empty()
+    }
+    fn capacity(&self) -> usize {
+        self.capacity()
     }
 }
 
