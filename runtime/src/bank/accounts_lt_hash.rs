@@ -362,7 +362,8 @@ const _: () = assert!(MAX_UPDATES_PER_BATCH > 0);
 
 /// Get the freelist of vectors to use for batching updates.
 fn batched_updates_freelist() -> &'static VecFreelist<AccountsLtHashUpdate> {
-    static FREELIST: LazyLock<VecFreelist<AccountsLtHashUpdate>> = LazyLock::new(VecFreelist::new);
+    static FREELIST: LazyLock<VecFreelist<AccountsLtHashUpdate>> =
+        LazyLock::new(|| VecFreelist::new(None));
     &FREELIST
 }
 
@@ -375,13 +376,15 @@ struct PendingUpdate {
 
 /// Get the freelist of vectors to use for holding pending updates.
 fn pending_updates_freelist() -> &'static VecFreelist<PendingUpdate> {
-    static FREELIST: LazyLock<VecFreelist<PendingUpdate>> = LazyLock::new(VecFreelist::new);
+    static FREELIST: LazyLock<VecFreelist<PendingUpdate>> =
+        LazyLock::new(|| VecFreelist::new(None));
     &FREELIST
 }
 
 /// Get the freelist of hashsets to use for seen accounts.
 fn seen_accounts_freelist() -> &'static HashSetFreelist<Pubkey> {
-    static FREELIST: LazyLock<HashSetFreelist<Pubkey>> = LazyLock::new(HashSetFreelist::new);
+    static FREELIST: LazyLock<HashSetFreelist<Pubkey>> =
+        LazyLock::new(|| HashSetFreelist::new(None));
     &FREELIST
 }
 
@@ -393,31 +396,41 @@ type HashSetFreelist<T> = ContainerFreelist<ahash::HashSet<T>>;
 struct ContainerFreelist<C> {
     list: SegQueue<C>,
 
+    /// the maximum capacity, in elements, this freelist will hold
+    max_capacity: Option<usize>,
+
     // stats
     num_containers: AtomicUsize,
     total_capacity: AtomicUsize,
 }
 
-impl<C> ContainerFreelist<C> {
+impl<C: Container> ContainerFreelist<C> {
     /// Creates a new, empty, freelist.
-    fn new() -> Self {
+    fn new(max_bytes: Option<usize>) -> Self {
+        let max_capacity = max_bytes.map(|max_bytes| max_bytes / size_of::<C::ElemT>());
         Self {
             list: SegQueue::new(),
+            max_capacity,
             num_containers: AtomicUsize::new(0),
             total_capacity: AtomicUsize::new(0),
         }
     }
-}
 
-impl<C: Container> ContainerFreelist<C> {
     /// Pushes `container` on to the freelist (IFF its capacity is greater than zero).
     ///
     /// Panics if `container` is not empty.
     fn push(&self, container: C) {
         // If the capacity is zero, then the container never allocated.  In that case, don't
         // waste time putting it back into the freelist, since there's nothing of value to reuse.
+        //
+        // Else, check if pushing the container would exceed the max capacity of the freelist.
+        // If so, also do not put it back into the freelist.
         let capacity = container.capacity();
-        if capacity != 0 {
+        if capacity != 0
+            && self.max_capacity.is_none_or(|max_capacity| {
+                self.total_capacity.load(Ordering::Relaxed) + capacity <= max_capacity
+            })
+        {
             assert!(container.is_empty());
             self.list.push(container);
             self.num_containers.fetch_add(1, Ordering::Relaxed);
@@ -449,7 +462,7 @@ impl<C: Container> ContainerFreelist<C> {
 }
 
 /// A snapshot of a freelist's stats.
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 struct FreelistStats {
     /// the number of containers held by the freelist
     num_containers: usize,
@@ -462,6 +475,8 @@ struct FreelistStats {
 /// Methods that a container must implement to be used by ContainerFreelist.
 trait Container {
     type ElemT;
+    const _CHECK_ELEM_SIZE: () = assert!(size_of::<Self::ElemT>() > 0);
+
     fn is_empty(&self) -> bool;
     fn capacity(&self) -> usize;
 }
@@ -1078,4 +1093,40 @@ mod tests {
         assert!(spawn_thread.join().unwrap().is_err());
         assert_eq!(async_progress.num_jobs_pending.load(Ordering::Acquire), 0);
     }
+
+    /// Ensure ContainerFreelist respects max size.
+    #[test]
+    fn test_container_freelist_max_capacity() {
+        let max_capacity = 77;
+        let max_bytes = max_capacity * size_of::<u64>();
+        let mut freelist = VecFreelist::<u64>::new(Some(max_bytes));
+
+        // pushing a vec that is too big will not actually push
+        freelist.push(Vec::with_capacity(max_capacity + 1));
+        let stats0 = freelist.stats();
+        assert_eq!(stats0.num_containers, 0);
+        assert_eq!(stats0.capacity_elems, 0);
+        assert_eq!(stats0.capacity_bytes, 0);
+
+        // pushing a vec that is not too big will actually push
+        freelist.push(Vec::with_capacity(max_capacity));
+        let stats1 = freelist.stats();
+        assert_eq!(stats1.num_containers, 1);
+        assert_eq!(stats1.capacity_elems, max_capacity);
+        assert_eq!(stats1.capacity_bytes, max_bytes);
+
+        // pushing a vec that would exceed capacity will not push
+        freelist.push(Vec::with_capacity(1));
+        assert_eq!(freelist.stats(), stats1);
+
+        // ...but, if we remove the limit, push should work again
+        freelist.max_capacity = None;
+        freelist.push(Vec::with_capacity(1));
+        let stats2 = freelist.stats();
+        assert_eq!(stats2.num_containers, 2);
+        assert_eq!(stats2.capacity_elems, max_capacity + 1);
+        assert_eq!(stats2.capacity_bytes, max_bytes + size_of::<u64>());
+    }
+
+    // brooks TODO: add a test for the batching updates, and checking the hash_cost is correct/even
 }
