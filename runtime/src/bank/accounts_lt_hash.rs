@@ -19,6 +19,10 @@ use {
     },
 };
 
+const MAX_BYTES_BATCHED_UPDATES_FREELIST: usize = 50_000_000;
+const MAX_BYTES_PENDING_UPDATES_FREELIST: usize = 30_000_000;
+const MAX_BYTES_SEEN_ACCOUNTS_FREELIST: usize = 10_000_000;
+
 impl Bank {
     /// Enqueues the accounts lt hash updates for `accounts` to the replay-hash thread pool.
     pub fn enqueue_accounts_lt_hash_updates<'a>(&self, accounts: &impl StorableAccounts<'a>) {
@@ -360,7 +364,7 @@ const _: () = assert!(MAX_UPDATES_PER_BATCH > 0);
 /// Get the freelist of vectors to use for batching updates.
 fn batched_updates_freelist() -> &'static VecFreelist<AccountsLtHashUpdate> {
     static FREELIST: LazyLock<VecFreelist<AccountsLtHashUpdate>> =
-        LazyLock::new(|| VecFreelist::new(None));
+        LazyLock::new(|| VecFreelist::new(Some(MAX_BYTES_BATCHED_UPDATES_FREELIST)));
     &FREELIST
 }
 
@@ -374,14 +378,14 @@ struct PendingUpdate {
 /// Get the freelist of vectors to use for holding pending updates.
 fn pending_updates_freelist() -> &'static VecFreelist<PendingUpdate> {
     static FREELIST: LazyLock<VecFreelist<PendingUpdate>> =
-        LazyLock::new(|| VecFreelist::new(None));
+        LazyLock::new(|| VecFreelist::new(Some(MAX_BYTES_PENDING_UPDATES_FREELIST)));
     &FREELIST
 }
 
 /// Get the freelist of hashsets to use for seen accounts.
 fn seen_accounts_freelist() -> &'static HashSetFreelist<Pubkey> {
     static FREELIST: LazyLock<HashSetFreelist<Pubkey>> =
-        LazyLock::new(|| HashSetFreelist::new(None));
+        LazyLock::new(|| HashSetFreelist::new(Some(MAX_BYTES_SEEN_ACCOUNTS_FREELIST)));
     &FREELIST
 }
 
