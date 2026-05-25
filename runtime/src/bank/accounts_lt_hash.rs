@@ -116,7 +116,6 @@ impl Bank {
         pending_updates_freelist.push(pending_updates);
 
         // Reclaim the seen accounts hashset too!
-        seen_accounts.clear();
         seen_accounts_freelist.push(seen_accounts);
     }
 
@@ -250,8 +249,6 @@ impl AccountsLtHashAsyncProgress {
                 accumulator.stats.num_updates += num_updates;
             }));
 
-            // make sure to clear the updates vec just in case the drain() was interrupted
-            updates.clear();
             batched_updates_freelist().push(updates);
 
             if let Err(payload) = result {
@@ -417,9 +414,7 @@ impl<C: Container> ContainerFreelist<C> {
     }
 
     /// Pushes `container` on to the freelist (IFF its capacity is greater than zero).
-    ///
-    /// Panics if `container` is not empty.
-    fn push(&self, container: C) {
+    fn push(&self, mut container: C) {
         // If the capacity is zero, then the container never allocated.  In that case, don't
         // waste time putting it back into the freelist, since there's nothing of value to reuse.
         //
@@ -431,7 +426,7 @@ impl<C: Container> ContainerFreelist<C> {
                 self.total_capacity.load(Ordering::Relaxed) + capacity <= max_capacity
             })
         {
-            assert!(container.is_empty());
+            container.clear();
             self.list.push(container);
             self.num_containers.fetch_add(1, Ordering::Relaxed);
             self.total_capacity.fetch_add(capacity, Ordering::Relaxed);
@@ -479,6 +474,7 @@ trait Container {
 
     fn is_empty(&self) -> bool;
     fn capacity(&self) -> usize;
+    fn clear(&mut self);
 }
 
 impl<T> Container for Vec<T> {
@@ -489,6 +485,9 @@ impl<T> Container for Vec<T> {
     fn capacity(&self) -> usize {
         self.capacity()
     }
+    fn clear(&mut self) {
+        self.clear();
+    }
 }
 
 impl<T> Container for ahash::HashSet<T> {
@@ -498,6 +497,9 @@ impl<T> Container for ahash::HashSet<T> {
     }
     fn capacity(&self) -> usize {
         self.capacity()
+    }
+    fn clear(&mut self) {
+        self.clear();
     }
 }
 
