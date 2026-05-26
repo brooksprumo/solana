@@ -85,7 +85,7 @@ impl Bank {
             updates: batched_updates_freelist
                 .pop()
                 .unwrap_or_else(|| Vec::with_capacity(MAX_UPDATES_PER_BATCH)),
-            hash_cost: 0,
+            hash_cost: Saturating(0),
         })
         .take(num_batches)
         .collect();
@@ -313,7 +313,7 @@ impl AccountsLtHashAsyncProgress {
 #[derive(Default)]
 struct AccountsLtHashBatch {
     updates: Vec<AccountsLtHashUpdate>,
-    hash_cost: usize,
+    hash_cost: Saturating<u64>,
 }
 
 /// The struct to accumulate results from processing a batch of updates.
@@ -361,7 +361,7 @@ fn batched_updates_freelist() -> &'static VecFreelist<AccountsLtHashUpdate> {
 #[derive(Debug)]
 struct PendingUpdate {
     update: AccountsLtHashUpdate,
-    hash_cost: usize,
+    hash_cost: Saturating<u64>,
 }
 
 /// Get the freelist of vectors to use for holding pending updates.
@@ -500,19 +500,20 @@ impl<T> Container for ahash::HashSet<T> {
 ///
 /// Which is an approximation based on the number of bytes to hash.
 #[inline]
-fn calc_hash_cost(account: Option<&impl ReadableAccount>) -> usize {
-    const ACCOUNT_HASH_METADATA_BYTES: usize = 8 /* lamports */
+fn calc_hash_cost(account: Option<&impl ReadableAccount>) -> Saturating<u64> {
+    const ACCOUNT_HASH_METADATA_BYTES: u64 = 8 /* lamports */
     + 1 /* executable */
     + 32 /* owner */
     + 32 /* address */;
 
-    account.map_or(0, |account| {
+    let hash_cost = account.map_or(0, |account| {
         if account.lamports() == 0 {
             0
         } else {
-            account.data().len() + ACCOUNT_HASH_METADATA_BYTES
+            ACCOUNT_HASH_METADATA_BYTES.saturating_add(account.data().len() as u64)
         }
-    })
+    });
+    Saturating(hash_cost)
 }
 
 /// Splits `pending_updates` into `batches`.
@@ -1154,7 +1155,7 @@ mod tests {
                     prev_account: None,
                     curr_account: None,
                 },
-                hash_cost,
+                hash_cost: Saturating(hash_cost),
             })
             .collect();
         let mut batches: [AccountsLtHashBatch; 4] =
@@ -1165,7 +1166,7 @@ mod tests {
         // sort to make assertions deterministic
         batches.sort_unstable_by_key(|batch| batch.hash_cost);
 
-        let batch_costs: Vec<_> = batches.iter().map(|batch| batch.hash_cost).collect();
+        let batch_costs: Vec<_> = batches.iter().map(|batch| batch.hash_cost.0).collect();
         assert_eq!(batch_costs, vec![22, 23, 333, 123_456_789]);
 
         let batch_lens: Vec<_> = batches.iter().map(|batch| batch.updates.len()).collect();
