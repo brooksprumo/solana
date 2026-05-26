@@ -89,18 +89,7 @@ impl Bank {
         })
         .take(num_batches)
         .collect();
-
-        pending_updates
-            .sort_unstable_by_key(|pending_update| cmp::Reverse(pending_update.hash_cost));
-        for pending_update in pending_updates.drain(..) {
-            let batch = batches
-                .iter_mut()
-                .min_by_key(|batch| batch.hash_cost)
-                .unwrap();
-            let PendingUpdate { update, hash_cost } = pending_update;
-            batch.hash_cost += hash_cost;
-            batch.updates.push(update);
-        }
+        batch_pending_updates(&mut pending_updates, &mut batches);
 
         // Dispatch the batched updates to the replay-hash thread pool.
         // If any of the batches were unused, reclaim them and add them
@@ -526,6 +515,26 @@ fn calc_hash_cost(account: Option<&impl ReadableAccount>) -> usize {
     })
 }
 
+/// Splits `pending_updates` into `batches`.
+///
+/// Updates are greedily/best-effort evenly distributed into batches based "hash cost".
+fn batch_pending_updates(
+    pending_updates: &mut Vec<PendingUpdate>,
+    batches: &mut [AccountsLtHashBatch],
+) {
+    debug_assert!(!batches.is_empty());
+    pending_updates.sort_unstable_by_key(|pending_update| cmp::Reverse(pending_update.hash_cost));
+    for pending_update in pending_updates.drain(..) {
+        let batch = batches
+            .iter_mut()
+            .min_by_key(|batch| batch.hash_cost)
+            .unwrap();
+        let PendingUpdate { update, hash_cost } = pending_update;
+        batch.hash_cost += hash_cost;
+        batch.updates.push(update);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use {
@@ -551,7 +560,7 @@ mod tests {
         solana_rent::Rent,
         solana_signer::Signer as _,
         std::{
-            cmp, iter,
+            array, cmp, iter,
             str::FromStr as _,
             sync::Arc,
             thread,
@@ -1134,5 +1143,32 @@ mod tests {
         assert_eq!(stats2.capacity_bytes, max_bytes + size_of::<u64>());
     }
 
-    // brooks TODO: add a test for the batching updates, and checking the hash_cost is correct/even
+    /// Ensure batching the pending updates is fair.
+    #[test]
+    fn test_batch_pending_updates() {
+        let mut pending_updates: Vec<_> = [1, 4, 333, 2, 3, 5, 123_456_789, 8, 7, 9, 6]
+            .into_iter()
+            .map(|hash_cost| PendingUpdate {
+                update: AccountsLtHashUpdate {
+                    address: Pubkey::new_unique(),
+                    prev_account: None,
+                    curr_account: None,
+                },
+                hash_cost,
+            })
+            .collect();
+        let mut batches: [AccountsLtHashBatch; 4] =
+            array::from_fn(|_| AccountsLtHashBatch::default());
+
+        batch_pending_updates(&mut pending_updates, &mut batches);
+
+        // sort to make assertions deterministic
+        batches.sort_unstable_by_key(|batch| batch.hash_cost);
+
+        let batch_costs: Vec<_> = batches.iter().map(|batch| batch.hash_cost).collect();
+        assert_eq!(batch_costs, vec![22, 23, 333, 123_456_789]);
+
+        let batch_lens: Vec<_> = batches.iter().map(|batch| batch.updates.len()).collect();
+        assert_eq!(batch_lens, vec![4, 5, 1, 1]);
+    }
 }
