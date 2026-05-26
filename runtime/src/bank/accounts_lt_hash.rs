@@ -427,13 +427,13 @@ impl<C: Container> ContainerFreelist<C> {
         let capacity = container.capacity();
         if capacity != 0
             && self.max_capacity.is_none_or(|max_capacity| {
-                self.total_capacity.load(Ordering::Relaxed) + capacity <= max_capacity
+                self.total_capacity.load(Ordering::Acquire) + capacity <= max_capacity
             })
         {
             container.clear();
             self.list.push(container);
             self.num_containers.fetch_add(1, Ordering::Relaxed);
-            self.total_capacity.fetch_add(capacity, Ordering::Relaxed);
+            self.total_capacity.fetch_add(capacity, Ordering::Release);
         }
     }
 
@@ -445,7 +445,7 @@ impl<C: Container> ContainerFreelist<C> {
         assert!(container.is_empty());
         self.num_containers.fetch_sub(1, Ordering::Relaxed);
         self.total_capacity
-            .fetch_sub(container.capacity(), Ordering::Relaxed);
+            .fetch_sub(container.capacity(), Ordering::Release);
         Some(container)
     }
 
