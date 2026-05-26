@@ -408,15 +408,26 @@ impl<C: Container> ContainerFreelist<C> {
 
     /// Pushes `container` on to the freelist (IFF its capacity is greater than zero).
     fn push(&self, mut container: C) {
-        // If the capacity is zero, then the container never allocated.  In that case, don't
-        // waste time putting it back into the freelist, since there's nothing of value to reuse.
+        // If the capacity is zero, then the container never allocated.
+        // In that case, don't waste time putting it back into the freelist,
+        // since there's nothing of value to reuse.
         //
         // Else, check if pushing the container would exceed the max capacity of the freelist.
         // If so, also do not put it back into the freelist.
         let capacity = container.capacity();
         if capacity != 0
             && self.max_capacity.is_none_or(|max_capacity| {
-                self.total_capacity.load(Ordering::Acquire) + capacity <= max_capacity
+                // only check the `total_capacity` atomic if a max capacity is set
+                if let Some(new_total_capacity) = self
+                    .total_capacity
+                    .load(Ordering::Acquire)
+                    .checked_add(capacity)
+                {
+                    new_total_capacity <= max_capacity
+                } else {
+                    // if the total capacity would overflow, do not push
+                    false
+                }
             })
         {
             container.clear();
