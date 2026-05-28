@@ -1,7 +1,7 @@
 use {
-    super::{Bank, NUM_REPLAY_HASH_THREADS, replay_hash_thread_pool},
+    super::Bank,
     crossbeam_queue::SegQueue,
-    rayon::ThreadPool,
+    rayon::{ThreadPool, ThreadPoolBuilder},
     solana_account::{AccountSharedData, ReadableAccount, accounts_equal},
     solana_accounts_db::{accounts_db::AccountsDb, storable_accounts::StorableAccounts},
     solana_lattice_hash::lt_hash::LtHash,
@@ -19,12 +19,16 @@ use {
     },
 };
 
+/// Number of threads for the async accounts hasher thread pool.
+const NUM_ACCOUNTS_HASHER_THREADS: usize = 4;
+
+// Maximum size, in bytes, for the various freelists.
 const MAX_BYTES_BATCHED_UPDATES_FREELIST: usize = 50_000_000;
 const MAX_BYTES_PENDING_UPDATES_FREELIST: usize = 30_000_000;
 const MAX_BYTES_SEEN_ACCOUNTS_FREELIST: usize = 10_000_000;
 
 impl Bank {
-    /// Enqueues the accounts lt hash updates for `accounts` to the replay-hash thread pool.
+    /// Enqueues the accounts lt hash updates for `accounts` to the accounts hasher thread pool.
     pub fn enqueue_accounts_lt_hash_updates<'a>(&self, accounts: &impl StorableAccounts<'a>) {
         if accounts.is_empty() {
             return;
@@ -74,12 +78,12 @@ impl Bank {
             }
         }
 
-        // Split the pending updates in batches; minimum one per replay-hash thread.
+        // Split the pending updates in batches; minimum one per accounts hasher thread.
         // Attempt to evenly distribute the hashing work, based on the "hash cost",
         // which is effectively the number of bytes to hash per update.
         let num_updates = pending_updates.len();
         let num_batches = num_updates.div_ceil(MAX_UPDATES_PER_BATCH);
-        let num_batches = cmp::max(num_batches, NUM_REPLAY_HASH_THREADS);
+        let num_batches = cmp::max(num_batches, NUM_ACCOUNTS_HASHER_THREADS);
         let batched_updates_freelist = batched_updates_freelist();
         let mut batches: Box<_> = iter::repeat_with(|| AccountsLtHashBatch {
             updates: batched_updates_freelist
@@ -91,11 +95,11 @@ impl Bank {
         .collect();
         batch_pending_updates(&mut pending_updates, &mut batches);
 
-        // Dispatch the batched updates to the replay-hash thread pool.
+        // Dispatch the batched updates to the accounts hasher thread pool.
         // If any of the batches were unused, reclaim them and add them
         // back to the freelist.
         let async_progress = &self.accounts_lt_hash_async_progress;
-        let thread_pool = replay_hash_thread_pool();
+        let thread_pool = accounts_hasher_thread_pool();
         for batch in batches {
             let updates = batch.updates;
             if !updates.is_empty() {
@@ -119,7 +123,7 @@ impl Bank {
     /// - mix out its previous state, and
     /// - mix in its current state
     ///
-    /// This function waits for any in-flight jobs on the replay-hash threads,
+    /// This function waits for any in-flight jobs on the accounts hasher threads,
     /// computes their combined delta lt hash, then mixes it into the bank.
     ///
     /// Since this function is non-idempotent, it should only be called once per bank.
@@ -545,6 +549,20 @@ fn batch_pending_updates(
         batch.hash_cost += hash_cost;
         batch.updates.push(update);
     }
+}
+
+/// Returns the thread pool for asynchronous accounts hashing.
+///
+/// Note, the thread pool will be created on first call.
+fn accounts_hasher_thread_pool() -> &'static ThreadPool {
+    static THREAD_POOL: LazyLock<ThreadPool> = LazyLock::new(|| {
+        ThreadPoolBuilder::new()
+            .num_threads(NUM_ACCOUNTS_HASHER_THREADS)
+            .thread_name(|i| format!("solAcctsHashr{i:02}"))
+            .build()
+            .expect("new accounts hasher rayon threadpool")
+    });
+    &THREAD_POOL
 }
 
 #[cfg(test)]

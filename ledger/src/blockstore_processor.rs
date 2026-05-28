@@ -32,7 +32,7 @@ use {
     solana_metrics::datapoint_error,
     solana_pubkey::Pubkey,
     solana_runtime::{
-        bank::{Bank, PreCommitResult, TransactionBalancesSet, replay_hash_thread_pool},
+        bank::{Bank, PreCommitResult, TransactionBalancesSet},
         bank_forks::BankForks,
         bank_utils,
         block_component_processor::BlockComponentProcessorError,
@@ -72,7 +72,7 @@ use {
         ops::Index,
         path::PathBuf,
         result,
-        sync::{Arc, Mutex, RwLock, atomic::AtomicBool},
+        sync::{Arc, Mutex, OnceLock, RwLock, atomic::AtomicBool},
         time::{Duration, Instant},
         vec::Drain,
     },
@@ -161,6 +161,18 @@ fn create_thread_pool(num_threads: usize) -> ThreadPool {
         .thread_name(|i| format!("solReplayTx{i:02}"))
         .build()
         .expect("new rayon threadpool")
+}
+
+fn transaction_hash_verify_thread_pool() -> &'static ThreadPool {
+    const TX_HASH_VERIFY_THREAD_POOL_SIZE: usize = 4;
+    static TX_HASH_VERIFY_THREAD_POOL: OnceLock<ThreadPool> = OnceLock::new();
+    TX_HASH_VERIFY_THREAD_POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(TX_HASH_VERIFY_THREAD_POOL_SIZE)
+            .thread_name(|i| format!("solReplayHash{i:02}"))
+            .build()
+            .expect("new transaction hash verify rayon threadpool")
+    })
 }
 
 pub fn execute_batch<'a>(
@@ -2035,7 +2047,7 @@ fn confirm_slot_entries(
     } = match entry::validate_and_hash_transactions(
         entries,
         num_txs,
-        replay_hash_thread_pool(),
+        transaction_hash_verify_thread_pool(),
         validate_and_hash_transaction,
     ) {
         Ok(txs) => txs,

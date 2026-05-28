@@ -83,7 +83,7 @@ use {
     ahash::AHashSet,
     log::*,
     partitioned_epoch_rewards::PartitionedRewardsCalculation,
-    rayon::{ThreadPool, ThreadPoolBuilder},
+    rayon::ThreadPool,
     serde::{Deserialize, Serialize},
     solana_account::{
         Account, AccountSharedData, InheritableAccountFields, ReadableAccount, WritableAccount,
@@ -264,22 +264,6 @@ static NANOSECOND_CLOCK_ACCOUNT: LazyLock<Pubkey> = LazyLock::new(|| {
         Pubkey::find_program_address(&[b"alpenclock"], &agave_feature_set::alpenglow::id());
     pubkey
 });
-
-/// Number of threads for the replay hashing thread pool
-pub const NUM_REPLAY_HASH_THREADS: usize = 4;
-
-/// Thread pool for replay hashing
-pub fn replay_hash_thread_pool() -> &'static ThreadPool {
-    static REPLAY_HASH_THREAD_POOL: LazyLock<ThreadPool> = LazyLock::new(|| {
-        ThreadPoolBuilder::new()
-            .num_threads(NUM_REPLAY_HASH_THREADS)
-            .thread_name(|i| format!("solReplayHash{i:02}"))
-            .build()
-            .expect("new replay hash rayon threadpool")
-    });
-
-    &REPLAY_HASH_THREAD_POOL
-}
 
 pub type BankStatusCache = StatusCache<Result<()>>;
 #[cfg_attr(
