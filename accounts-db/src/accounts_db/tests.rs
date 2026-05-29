@@ -1155,6 +1155,13 @@ fn test_shrink_zero_lamport_single_ref_account() {
             expected_alive_count,
             "{latest_full_snapshot_slot:?}"
         );
+        assert_eq!(
+            accounts
+                .get_and_assert_single_storage(slot)
+                .num_zero_lamport_single_ref_accounts(),
+            expected_alive_count - 1,
+            "{latest_full_snapshot_slot:?}"
+        );
 
         // other account should still be alive
         assert!(accounts.contains(&pubkey2), "{latest_full_snapshot_slot:?}");
@@ -1289,7 +1296,7 @@ fn test_alive_bytes_after_shrink_with_zero_lamport_single_ref_accounts() {
             let (indexed_slot, acct_info) = slot_list.first().unwrap();
             assert_eq!(*indexed_slot, slot);
             assert!(acct_info.is_zero_lamport());
-            accounts_db.zero_lamport_single_ref_found(*indexed_slot, acct_info.offset());
+            accounts_db.zero_lamport_single_ref_found(*indexed_slot, *acct_info);
             AccountsIndexScanResult::KeepInMemory
         },
         None,
@@ -1322,6 +1329,120 @@ fn test_alive_bytes_after_shrink_with_zero_lamport_single_ref_accounts() {
     for pubkey in &dead_pubkeys {
         assert!(!accounts_db.contains(pubkey));
     }
+}
+
+/// Ensure that `shrink` marks zero lamport single ref accounts in the new storage.
+#[test]
+fn test_shrink_marks_zero_lamport_single_ref_account_in_new_storage() {
+    let accounts_db = AccountsDb::new_single_for_tests();
+    let slot0 = 0;
+    let slot1 = slot0 + 1;
+    // latest full snapshot must be older than the slot(s) we plan to shrink,
+    // otherwise zero lamport single ref accounts will be purged
+    accounts_db.set_latest_full_snapshot_slot(slot0);
+
+    let obsolete_pubkey = Pubkey::new_unique();
+    let obsolete_zero_lamport_pubkey = Pubkey::new_unique();
+    let zero_lamport_single_ref_pubkey = Pubkey::new_unique();
+    let zero_lamport_multi_ref_pubkey = Pubkey::new_unique();
+    let alive_pubkey = Pubkey::new_unique();
+    let closed_account = AccountSharedData::new(0, 0, &Pubkey::default());
+    let open_account = AccountSharedData::new(1, 0, &Pubkey::default());
+
+    let (_temp_dirs, paths) = get_temp_accounts_paths(1).unwrap();
+    let storage1 = Arc::new(AccountStorageEntry::new(
+        &paths[0],
+        slot1,
+        10,
+        DEFAULT_FILE_SIZE,
+        AccountsFileProvider::AppendVec,
+    ));
+    append_single_account_with_default_hash(
+        &storage1,
+        &obsolete_pubkey,
+        &open_account,
+        true,
+        Some(&accounts_db.accounts_index),
+    );
+    append_single_account_with_default_hash(
+        &storage1,
+        &obsolete_zero_lamport_pubkey,
+        &closed_account,
+        true,
+        Some(&accounts_db.accounts_index),
+    );
+    append_single_account_with_default_hash(
+        &storage1,
+        &zero_lamport_single_ref_pubkey,
+        &closed_account,
+        true,
+        Some(&accounts_db.accounts_index),
+    );
+    append_single_account_with_default_hash(
+        &storage1,
+        &zero_lamport_multi_ref_pubkey,
+        &closed_account,
+        true,
+        Some(&accounts_db.accounts_index),
+    );
+    append_single_account_with_default_hash(
+        &storage1,
+        &alive_pubkey,
+        &open_account,
+        true,
+        Some(&accounts_db.accounts_index),
+    );
+    insert_store(&accounts_db, Arc::clone(&storage1));
+    accounts_db.add_root(slot1);
+
+    assert_eq!(storage1.num_zero_lamport_single_ref_accounts(), 0);
+
+    let slot2 = slot1 + 1;
+    accounts_db.store_for_tests((
+        slot2,
+        [(&zero_lamport_multi_ref_pubkey, &closed_account)].as_slice(),
+    ));
+    accounts_db.add_root(slot2);
+    accounts_db.flush_rooted_accounts_cache_without_clean();
+
+    let ancestors = Ancestors::from(vec![slot2]);
+    for pubkey in [obsolete_pubkey, obsolete_zero_lamport_pubkey] {
+        let account_info = accounts_db
+            .accounts_index
+            .get_with_and_then(&pubkey, &ancestors, false, |account_info| account_info)
+            .unwrap();
+        accounts_db.remove_dead_accounts(
+            [account_info].iter(),
+            None,
+            MarkAccountsObsolete::Yes(slot1),
+        );
+    }
+
+    accounts_db.shrink_slot_forced(slot1);
+
+    let new_storage1 = accounts_db.get_and_assert_single_storage(slot1);
+    let new_zero_lamport_single_ref_info = accounts_db
+        .accounts_index
+        .get_with_and_then(
+            &zero_lamport_single_ref_pubkey,
+            &ancestors,
+            false,
+            |(_slot, account_info)| account_info,
+        )
+        .unwrap();
+
+    assert_ne!(new_storage1.id(), storage1.id());
+    assert_eq!(new_storage1.count(), 3);
+    assert_eq!(
+        new_zero_lamport_single_ref_info.store_id(),
+        new_storage1.id(),
+    );
+    assert_eq!(new_storage1.num_zero_lamport_single_ref_accounts(), 1);
+    let new_storage_zlsr_offsets = new_storage1
+        .zero_lamport_single_ref_offsets()
+        .read()
+        .unwrap();
+    assert!(new_storage_zlsr_offsets.contains(&new_zero_lamport_single_ref_info.offset()));
 }
 
 #[test]
@@ -3574,7 +3695,7 @@ define_accounts_db_test!(
 
                 let (slot, acct_info) = slot_list.first().unwrap();
                 assert_eq!(*slot, 0);
-                accounts_db.zero_lamport_single_ref_found(*slot, acct_info.offset());
+                accounts_db.zero_lamport_single_ref_found(*slot, *acct_info);
                 AccountsIndexScanResult::OnlyKeepInMemoryIfDirty
             },
             None,

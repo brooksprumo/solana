@@ -138,6 +138,8 @@ pub(crate) struct AliveAccounts<'a> {
     /// slot the accounts are currently stored in
     pub(crate) slot: Slot,
     pub(crate) accounts: Vec<&'a AccountFromStorage>,
+    /// Indices into `accounts` for accounts known to be zero-lamport single-ref.
+    pub(crate) zero_lamport_single_ref_account_indices: Vec<usize>,
     pub(crate) bytes: usize,
 }
 
@@ -160,6 +162,7 @@ pub(crate) trait ShrinkCollectRefs<'a>: Sync + Send {
         ref_count: RefCount,
         account: &'a AccountFromStorage,
         slot_list: &[(Slot, AccountInfo)],
+        is_zero_lamport_single_ref: bool,
     );
     fn len(&self) -> usize;
     fn alive_bytes(&self) -> usize;
@@ -169,11 +172,19 @@ pub(crate) trait ShrinkCollectRefs<'a>: Sync + Send {
 impl<'a> ShrinkCollectRefs<'a> for AliveAccounts<'a> {
     fn collect(&mut self, mut other: Self) {
         self.bytes = self.bytes.saturating_add(other.bytes);
+        let account_index_offset = self.accounts.len();
         self.accounts.append(&mut other.accounts);
+        self.zero_lamport_single_ref_account_indices.extend(
+            other
+                .zero_lamport_single_ref_account_indices
+                .into_iter()
+                .map(|index| index + account_index_offset),
+        );
     }
     fn with_capacity(capacity: usize, slot: Slot) -> Self {
         Self {
             accounts: Vec::with_capacity(capacity),
+            zero_lamport_single_ref_account_indices: Vec::new(),
             bytes: 0,
             slot,
         }
@@ -183,8 +194,14 @@ impl<'a> ShrinkCollectRefs<'a> for AliveAccounts<'a> {
         _ref_count: RefCount,
         account: &'a AccountFromStorage,
         _slot_list: &[(Slot, AccountInfo)],
+        is_zero_lamport_single_ref: bool,
     ) {
+        let account_index = self.accounts.len();
         self.accounts.push(account);
+        if is_zero_lamport_single_ref {
+            self.zero_lamport_single_ref_account_indices
+                .push(account_index);
+        }
         self.bytes = self.bytes.saturating_add(account.stored_size());
     }
     fn len(&self) -> usize {
@@ -217,6 +234,7 @@ impl<'a> ShrinkCollectRefs<'a> for ShrinkCollectAliveSeparatedByRefs<'a> {
         ref_count: RefCount,
         account: &'a AccountFromStorage,
         slot_list: &[(Slot, AccountInfo)],
+        is_zero_lamport_single_ref: bool,
     ) {
         let other = if ref_count == 1 {
             &mut self.one_ref
@@ -232,7 +250,7 @@ impl<'a> ShrinkCollectRefs<'a> for ShrinkCollectAliveSeparatedByRefs<'a> {
             // We would expect clean to get rid of the entry for THIS slot at some point, but clean hasn't done that yet.
             &mut self.many_refs_old_alive
         };
-        other.add(ref_count, account, slot_list);
+        other.add(ref_count, account, slot_list, is_zero_lamport_single_ref);
     }
     fn len(&self) -> usize {
         self.one_ref
@@ -2404,10 +2422,9 @@ impl AccountsDb {
             |pubkey, slots_refs| {
                 let stored_account = &accounts[index];
                 let mut do_populate_accounts_for_shrink = |ref_count, slot_list| {
-                    if stored_account.is_zero_lamport()
-                        && ref_count == 1
-                        && can_purge_zero_lamport_single_ref
-                    {
+                    let is_zero_lamport = stored_account.is_zero_lamport();
+                    let is_zero_lamport_single_ref = is_zero_lamport && ref_count == 1;
+                    if is_zero_lamport_single_ref && can_purge_zero_lamport_single_ref {
                         // only do this if our slot is prior to the latest full snapshot
                         // we found a zero lamport account that is the only instance of this account. We can delete it completely.
                         zero_lamport_single_ref_pubkeys.push(pubkey);
@@ -2416,8 +2433,13 @@ impl AccountsDb {
                             [*pubkey].into_iter(),
                         );
                     } else {
-                        all_are_zero_lamports &= stored_account.is_zero_lamport();
-                        alive_accounts.add(ref_count, stored_account, slot_list);
+                        all_are_zero_lamports &= is_zero_lamport;
+                        alive_accounts.add(
+                            ref_count,
+                            stored_account,
+                            slot_list,
+                            is_zero_lamport_single_ref,
+                        );
                         alive += 1;
                     }
                 };
@@ -2663,6 +2685,24 @@ impl AccountsDb {
         });
     }
 
+    /// After shrink or pack, check if `store` should be visited by
+    /// `clean` or `shrink` based on its zero lamport accounts.
+    fn handle_rewritten_storage_zero_lamport_accounts(
+        &self,
+        store: Arc<AccountStorageEntry>,
+        are_all_accounts_zero_lamports: bool,
+        stats: &ShrinkStats,
+    ) {
+        let num_zero_lamport_single_ref_accounts = store.num_zero_lamport_single_ref_accounts();
+        if are_all_accounts_zero_lamports && num_zero_lamport_single_ref_accounts != store.count() {
+            self.dirty_stores.insert(store.slot(), Arc::clone(&store));
+        }
+
+        self.maybe_add_to_clean_or_shrink_candidates_based_on_zero_lamport_single_ref_accounts(
+            store, true, stats,
+        );
+    }
+
     /// common code from shrink and combine_ancient_slots
     /// get rid of all original store_ids in the slot
     pub(crate) fn remove_old_stores_shrink<'a, T: ShrinkCollectRefs<'a>>(
@@ -2684,18 +2724,33 @@ impl AccountsDb {
             false,
         );
 
+        let maybe_shrunk_store = shrink_in_progress
+            .as_ref()
+            .map(|shrink_in_progress| Arc::clone(shrink_in_progress.new_storage()));
+
         // Purge old, overwritten storage entries
         // This has the side effect of dropping `shrink_in_progress`, which removes the old storage completely. The
         // index has to be correct before we drop the old storage.
         let dead_storages = self.mark_dirty_dead_stores(
             shrink_collect.slot,
-            // If all accounts are zero lamports, then we want to mark the entire OLD append vec as dirty.
+            // If all accounts are zero lamports and there is no replacement storage, then we want
+            // to mark the entire old append vec as dirty. If shrink rewrote the storage, mark the
+            // replacement after `shrink_in_progress` is dropped.
             // otherwise, we'll call 'add_uncleaned_pubkeys_after_shrink' just on the unref'd keys below.
-            shrink_collect.all_are_zero_lamports,
+            shrink_collect.all_are_zero_lamports && maybe_shrunk_store.is_none(),
             shrink_in_progress,
             shrink_can_be_active,
         );
         let dead_storages_len = dead_storages.len();
+
+        if let Some(shrunk_store) = maybe_shrunk_store {
+            debug_assert_eq!(shrunk_store.slot(), shrink_collect.slot);
+            self.handle_rewritten_storage_zero_lamport_accounts(
+                shrunk_store,
+                shrink_collect.all_are_zero_lamports,
+                stats,
+            );
+        }
 
         if !shrink_collect.all_are_zero_lamports {
             self.add_uncleaned_pubkeys_after_shrink(
@@ -2732,10 +2787,7 @@ impl AccountsDb {
                         if slot_list.len() == 1 && ref_count == 2 {
                             if let Some((slot_alive, acct_info)) = slot_list.first() {
                                 if acct_info.is_zero_lamport() && !acct_info.is_cached() {
-                                    self.zero_lamport_single_ref_found(
-                                        *slot_alive,
-                                        acct_info.offset(),
-                                    );
+                                    self.zero_lamport_single_ref_found(*slot_alive, *acct_info);
                                 }
                             }
                         }
@@ -2762,51 +2814,66 @@ impl AccountsDb {
         );
     }
 
+    /// Check if `store` should be visited by `clean` or `shrink`
+    /// based on its zero lamport single ref accounts.
+    fn maybe_add_to_clean_or_shrink_candidates_based_on_zero_lamport_single_ref_accounts(
+        &self,
+        store: Arc<AccountStorageEntry>,
+        replace_dirty_store: bool,
+        stats: &ShrinkStats,
+    ) {
+        if store.num_zero_lamport_single_ref_accounts() == 0 {
+            return;
+        }
+
+        let slot = store.slot();
+        if store.num_zero_lamport_single_ref_accounts() == store.count() {
+            // all accounts in this storage could be dead; have `clean` visit again
+            if replace_dirty_store {
+                self.dirty_stores.insert(slot, store);
+            } else {
+                self.dirty_stores.entry(slot).or_insert(store);
+            }
+            stats
+                .num_dead_slots_added_to_clean
+                .fetch_add(1, Ordering::Relaxed);
+        } else if self.is_shrinking_productive(&store) && self.is_candidate_for_shrink(&store) {
+            // `store` might be eligible for shrinking now
+            let is_new = self.shrink_candidate_slots.lock().unwrap().insert(slot);
+            if is_new {
+                stats
+                    .num_slots_with_zero_lamport_accounts_added_to_shrink
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        } else {
+            stats
+                .marking_zero_dead_accounts_in_non_shrinkable_store
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// This function handles the case when zero lamport single ref accounts are found during shrink.
-    pub(crate) fn zero_lamport_single_ref_found(&self, slot: Slot, offset: Offset) {
+    pub(crate) fn zero_lamport_single_ref_found(&self, slot: Slot, account_info: AccountInfo) {
+        debug_assert!(!account_info.is_cached());
         // This function can be called when a zero lamport single ref account is
-        // found during shrink. Therefore, we can't use the safe version of
-        // `get_slot_storage_entry` because shrink_in_progress map may not be
-        // empty. We have to use the unsafe version to avoid to assert failure.
-        // However, there is a possibility that the storage entry that we get is
-        // an old one, which is being shrunk away, because multiple slots can be
-        // shrunk away in parallel by thread pool. If this happens, any zero
-        // lamport single ref offset marked on the storage will be lost when the
-        // storage is dropped. However, this is not a problem, because after the
-        // storage being shrunk, the new storage will not have any zero lamport
-        // single ref account anyway. Therefore, we don't need to worry about
-        // marking zero lamport single ref offset on the new storage.
+        // found during shrink. Look up the exact storage from the account index
+        // entry's info (slot and store id), so a concurrent shrink of the same
+        // slot marks the correct storage the index entry points to.
         if let Some(store) = self
             .storage
-            .get_slot_storage_entry_shrinking_in_progress_ok(slot)
+            .get_account_storage_entry(slot, account_info.store_id())
         {
-            if store.insert_zero_lamport_single_ref_account_offset(offset) {
+            debug_assert_eq!(store.slot(), slot);
+            if store.insert_zero_lamport_single_ref_account_offset(account_info.offset()) {
                 // this wasn't previously marked as zero lamport single ref
                 self.shrink_stats
                     .num_zero_lamport_single_ref_accounts_found
                     .fetch_add(1, Ordering::Relaxed);
-
-                if store.num_zero_lamport_single_ref_accounts() == store.count() {
-                    // all accounts in this storage can be dead
-                    self.dirty_stores.entry(slot).or_insert(store);
-                    self.shrink_stats
-                        .num_dead_slots_added_to_clean
-                        .fetch_add(1, Ordering::Relaxed);
-                } else if self.is_shrinking_productive(&store)
-                    && self.is_candidate_for_shrink(&store)
-                {
-                    // this store might be eligible for shrinking now
-                    let is_new = self.shrink_candidate_slots.lock().unwrap().insert(slot);
-                    if is_new {
-                        self.shrink_stats
-                            .num_slots_with_zero_lamport_accounts_added_to_shrink
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                } else {
-                    self.shrink_stats
-                        .marking_zero_dead_accounts_in_non_shrinkable_store
-                        .fetch_add(1, Ordering::Relaxed);
-                }
+                self.maybe_add_to_clean_or_shrink_candidates_based_on_zero_lamport_single_ref_accounts(
+                    store,
+                    false,
+                    &self.shrink_stats,
+                );
             }
         }
     }
@@ -2893,6 +2960,9 @@ impl AccountsDb {
         stats_sub.store_accounts_timing = self.store_accounts_for_shrink(
             storable_accounts,
             shrink_in_progress.new_storage(),
+            &shrink_collect
+                .alive_accounts
+                .zero_lamport_single_ref_account_indices,
             UpdateIndexThreadSelection::PoolWithThreshold,
         );
 
@@ -5064,7 +5134,7 @@ impl AccountsDb {
     /// The element of the returned vector is guaranteed to be non-empty.
     fn update_index_stored_accounts<'a>(
         &self,
-        infos: Vec<AccountInfo>,
+        infos: &[AccountInfo],
         accounts: &impl StorableAccounts<'a>,
         reclaim: UpsertReclaim,
         update_index_thread_selection: UpdateIndexThreadSelection,
@@ -5145,7 +5215,7 @@ impl AccountsDb {
     /// not touched, since shrink only changes `(store_id, offset)` and they index by pubkey.
     fn update_index_for_shrink<'a>(
         &self,
-        infos: Vec<AccountInfo>,
+        infos: &[AccountInfo],
         accounts: &impl StorableAccounts<'a>,
         update_index_thread_selection: UpdateIndexThreadSelection,
         thread_pool: &ThreadPool,
@@ -5406,10 +5476,7 @@ impl AccountsDb {
                             if slot_list.len() == 1 && ref_count == 2 {
                                 if let Some((slot_alive, acct_info)) = slot_list.first() {
                                     if acct_info.is_zero_lamport() && !acct_info.is_cached() {
-                                        self.zero_lamport_single_ref_found(
-                                            *slot_alive,
-                                            acct_info.offset(),
-                                        );
+                                        self.zero_lamport_single_ref_found(*slot_alive, *acct_info);
                                     }
                                 }
                             }
@@ -5572,6 +5639,45 @@ impl AccountsDb {
         self.report_store_timings();
     }
 
+    /// This fn marks zero lamport single ref (ZLSR) accounts in the newly shrunk `storage`.
+    ///
+    /// Returns the number of newly marked ZLSR accounts.
+    fn mark_zero_lamport_single_ref_accounts_for_shrink(
+        &self,
+        storage: &AccountStorageEntry,
+        account_infos: &[AccountInfo],
+        zero_lamport_single_ref_account_indices: &[usize],
+    ) -> u64 {
+        if zero_lamport_single_ref_account_indices.is_empty() {
+            return 0;
+        }
+
+        let mut zero_lamport_single_ref_offsets =
+            Vec::with_capacity(zero_lamport_single_ref_account_indices.len());
+        for &index in zero_lamport_single_ref_account_indices {
+            debug_assert!(index < account_infos.len());
+            let Some(account_info) = account_infos.get(index) else {
+                // there had better be an account_info at `index`, otherwise we have a bug
+                panic!(
+                    "account info missing for zero lamport single ref account index {index} when \
+                     marking zlsr accounts in newly shrunk storage! storage slot.id: {}.{}, num \
+                     zlsr: {}, num account infos: {}",
+                    storage.slot(),
+                    storage.id(),
+                    zero_lamport_single_ref_account_indices.len(),
+                    account_infos.len(),
+                );
+            };
+            debug_assert!(!account_info.is_cached());
+            debug_assert!(account_info.is_zero_lamport());
+            debug_assert_eq!(account_info.store_id(), storage.id());
+            zero_lamport_single_ref_offsets.push(account_info.offset());
+        }
+
+        storage
+            .batch_insert_zero_lamport_single_ref_account_offsets(&zero_lamport_single_ref_offsets)
+    }
+
     /// Stores accounts in the storage and updates the index.
     /// This function is intended for accounts that are being shrunk (moving from one store to another)
     /// - `UpsertReclaims` is set to `IgnoreReclaims`. If the slot in `accounts` differs from the new slot,
@@ -5581,6 +5687,7 @@ impl AccountsDb {
         &self,
         accounts: impl StorableAccounts<'a>,
         storage: &AccountStorageEntry,
+        zero_lamport_single_ref_account_indices: &[usize],
         update_index_thread_selection: UpdateIndexThreadSelection,
     ) -> StoreAccountsTiming {
         let slot = accounts.target_slot();
@@ -5608,12 +5715,18 @@ impl AccountsDb {
 
         let update_index_time = Measure::start("update_index");
         self.update_index_for_shrink(
-            infos,
+            &infos,
             &accounts,
             update_index_thread_selection,
             &self.thread_pool_background,
         );
         let update_index_us = update_index_time.end_as_us();
+
+        self.mark_zero_lamport_single_ref_accounts_for_shrink(
+            storage,
+            &infos,
+            zero_lamport_single_ref_account_indices,
+        );
 
         stats
             .flush_read_cache_us
@@ -5661,12 +5774,12 @@ impl AccountsDb {
 
         let mark_zero_lamport_time = Measure::start("mark_zero_lamport");
         let num_zero_lamport_single_ref_accounts_marked =
-            self.mark_zero_lamport_single_ref_accounts(&infos, storage, reclaim_handling);
+            self.mark_zero_lamport_single_ref_accounts_for_flush(&infos, storage, reclaim_handling);
         let mark_zero_lamport_us = mark_zero_lamport_time.end_as_us();
 
         let update_index_time = Measure::start("update_index");
         let reclaims = self.update_index_stored_accounts(
-            infos,
+            &infos,
             &accounts,
             reclaim_handling,
             update_index_thread_selection,
@@ -5871,7 +5984,7 @@ impl AccountsDb {
     /// Marks zero lamport single reference accounts in the storage during store_accounts_for_flush
     ///
     /// Returns the number of accounts marked.
-    fn mark_zero_lamport_single_ref_accounts(
+    fn mark_zero_lamport_single_ref_accounts_for_flush(
         &self,
         account_infos: &[AccountInfo],
         storage: &AccountStorageEntry,

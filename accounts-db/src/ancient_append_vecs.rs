@@ -554,6 +554,7 @@ impl AccountsDb {
         &'b self,
         bytes: u64,
         accounts_to_write: impl StorableAccounts<'a>,
+        zero_lamport_single_ref_account_indices: &[usize],
         write_ancient_accounts: &mut WriteAncientAccounts<'b>,
     ) {
         let target_slot = accounts_to_write.target_slot();
@@ -567,6 +568,7 @@ impl AccountsDb {
             measure_us!(self.store_accounts_for_shrink(
                 accounts_to_write,
                 shrink_in_progress.new_storage(),
+                zero_lamport_single_ref_account_indices,
                 UpdateIndexThreadSelection::PoolWithThreshold
             ));
 
@@ -750,15 +752,16 @@ impl AccountsDb {
                 reopen = true;
             }
 
+            // Remove the slot from the shrink candidates.  If the new packed storage still has any
+            // zero lamport single ref accounts, `remove_old_stores_shrink()` will re-add as needed.
+            self.shrink_candidate_slots.lock().unwrap().remove(&slot);
+
             self.remove_old_stores_shrink(
                 &shrink_collect,
                 &self.shrink_ancient_stats.shrink_stats,
                 shrink_in_progress,
                 true,
             );
-
-            // If the slot is dead, remove the need to shrink the storage as the storage entries will be purged.
-            self.shrink_candidate_slots.lock().unwrap().remove(&slot);
 
             if reopen {
                 // 'shrink_in_progress' is dead now. We can safely 'reopen' the new storage for 'slot'.
@@ -933,6 +936,7 @@ impl AccountsDb {
         let PackedAncientStorage {
             bytes: bytes_total,
             accounts: accounts_to_write,
+            zero_lamport_single_ref_account_indices,
         } = packed;
         let accounts_to_write = StorableAccountsBySlot::new(target_slot, accounts_to_write, self);
 
@@ -943,7 +947,12 @@ impl AccountsDb {
             .shrink_stats
             .num_slots_shrunk
             .fetch_add(1, Ordering::Relaxed);
-        self.write_ancient_accounts(*bytes_total, accounts_to_write, write_ancient_accounts)
+        self.write_ancient_accounts(
+            *bytes_total,
+            accounts_to_write,
+            zero_lamport_single_ref_account_indices,
+            write_ancient_accounts,
+        )
     }
 
     /// For each slot and alive accounts in 'accounts_to_combine'
@@ -961,6 +970,9 @@ impl AccountsDb {
             let packed = PackedAncientStorage {
                 bytes: alive_accounts.bytes as u64,
                 accounts: vec![(alive_accounts.slot, &alive_accounts.accounts[..])],
+                zero_lamport_single_ref_account_indices: alive_accounts
+                    .zero_lamport_single_ref_account_indices
+                    .clone(),
             };
 
             self.write_one_packed_storage(&packed, alive_accounts.slot, write_ancient_accounts);
@@ -999,6 +1011,8 @@ struct AccountsToCombine<'a> {
 struct PackedAncientStorage<'a> {
     /// accounts to move into this storage, along with the slot the accounts are currently stored in
     accounts: Vec<(Slot, &'a [&'a AccountFromStorage])>,
+    /// Indices into the `accounts`, as if it were flattened.
+    zero_lamport_single_ref_account_indices: Vec<usize>,
     /// total bytes required to hold 'accounts'
     bytes: u64,
 }
@@ -1022,6 +1036,8 @@ impl<'a> PackedAncientStorage<'a> {
         loop {
             let mut bytes_total = 0usize;
             let mut accounts_to_write = Vec::default();
+            let mut zero_lamport_single_ref_account_indices = Vec::new();
+            let mut next_account_index = 0usize;
 
             // walk through each set of alive accounts to pack the current new storage up to ideal_size
             let mut full = false;
@@ -1065,13 +1081,30 @@ impl<'a> PackedAncientStorage<'a> {
                 }
 
                 if partial_inner_index < partial_inner_index_max_exclusive {
+                    let accounts_inner = &alive_accounts.accounts
+                        [partial_inner_index..partial_inner_index_max_exclusive];
+                    if !alive_accounts
+                        .zero_lamport_single_ref_account_indices
+                        .is_empty()
+                    {
+                        zero_lamport_single_ref_account_indices.extend(
+                            alive_accounts
+                                .zero_lamport_single_ref_account_indices
+                                .iter()
+                                .filter(|index| {
+                                    **index >= partial_inner_index
+                                        && **index < partial_inner_index_max_exclusive
+                                })
+                                .map(|index| next_account_index + *index - partial_inner_index),
+                        );
+                    }
                     // these accounts belong in the current packed storage we're working on
                     accounts_to_write.push((
                         alive_accounts.slot,
                         // maybe all alive accounts from the current or could be partial
-                        &alive_accounts.accounts
-                            [partial_inner_index..partial_inner_index_max_exclusive],
+                        accounts_inner,
                     ));
+                    next_account_index += accounts_inner.len();
                 }
                 // start next storage with the account we ended with
                 // this could be the end of the current alive accounts or could be anywhere within that vec
@@ -1085,6 +1118,7 @@ impl<'a> PackedAncientStorage<'a> {
             result.push(PackedAncientStorage {
                 bytes: bytes_total as u64,
                 accounts: accounts_to_write,
+                zero_lamport_single_ref_account_indices,
             });
         }
         result
@@ -1121,7 +1155,7 @@ mod tests {
         crate::{
             account_info::{AccountInfo, StorageLocation},
             accounts_db::{
-                ShrinkCollectRefs,
+                ShrinkCollectRefs, get_temp_accounts_paths,
                 tests::{
                     CAN_RANDOMLY_SHRINK_FALSE, append_single_account_with_default_hash,
                     compare_all_accounts, create_db_with_storages_and_index,
@@ -1129,6 +1163,7 @@ mod tests {
                     get_all_accounts, remove_account_for_tests,
                 },
             },
+            accounts_file::AccountsFileProvider,
             accounts_index::{
                 AccountsIndexScanResult, ReclaimsSlotList, RefCount, ScanFilter, UpsertReclaim,
             },
@@ -1235,6 +1270,7 @@ mod tests {
         let packed_contents = vec![PackedAncientStorage {
             bytes: 0,
             accounts: vec![(slots.start, &accounts[..])],
+            zero_lamport_single_ref_account_indices: Vec::new(),
         }];
         db.write_packed_storages(&accounts_to_combine, packed_contents);
     }
@@ -1269,6 +1305,7 @@ mod tests {
                     .zip(slots_vec.iter().cloned())
                     .map(|(accounts, slot)| AliveAccounts {
                         accounts: accounts.stored_accounts.iter().collect::<Vec<_>>(),
+                        zero_lamport_single_ref_account_indices: Vec::new(),
                         bytes: accounts
                             .stored_accounts
                             .iter()
@@ -1348,6 +1385,7 @@ mod tests {
                     .zip(slots_vec.iter().cloned())
                     .map(|((_slot, accounts), slot)| AliveAccounts {
                         accounts: accounts.stored_accounts.iter().collect::<Vec<_>>(),
+                        zero_lamport_single_ref_account_indices: Vec::new(),
                         bytes: accounts
                             .stored_accounts
                             .iter()
@@ -1458,6 +1496,7 @@ mod tests {
                     .zip(slots_vec.iter().cloned())
                     .map(|((_slot, accounts), slot)| AliveAccounts {
                         accounts: accounts.stored_accounts.iter().collect::<Vec<_>>(),
+                        zero_lamport_single_ref_account_indices: Vec::new(),
                         bytes: accounts
                             .stored_accounts
                             .iter()
@@ -3207,11 +3246,16 @@ mod tests {
                                 TestWriteAncient::AncientAccounts => db.write_ancient_accounts(
                                     bytes,
                                     accounts_to_write,
+                                    &[],
                                     &mut write_ancient_accounts,
                                 ),
 
                                 TestWriteAncient::OnePackedStorage => {
-                                    let packed = PackedAncientStorage { accounts, bytes };
+                                    let packed = PackedAncientStorage {
+                                        accounts,
+                                        zero_lamport_single_ref_account_indices: Vec::new(),
+                                        bytes,
+                                    };
                                     db.write_one_packed_storage(
                                         &packed,
                                         target_slot,
@@ -3219,7 +3263,11 @@ mod tests {
                                     );
                                 }
                                 TestWriteAncient::PackedStorages => {
-                                    let packed = PackedAncientStorage { accounts, bytes };
+                                    let packed = PackedAncientStorage {
+                                        accounts,
+                                        zero_lamport_single_ref_account_indices: Vec::new(),
+                                        bytes,
+                                    };
 
                                     let accounts_to_combine = AccountsToCombine {
                                         // target slots are supposed to be read in reverse order, so test that
@@ -3622,7 +3670,7 @@ mod tests {
                         0 => {
                             // empty slot list (ignored anyway) because ref_count = 1
                             let slot_list = vec![];
-                            alive_accounts.add(1, &account, &slot_list);
+                            alive_accounts.add(1, &account, &slot_list, false);
                             assert!(!alive_accounts.one_ref.accounts.is_empty());
                             assert!(alive_accounts.many_refs_old_alive.accounts.is_empty());
                             assert!(
@@ -3638,7 +3686,7 @@ mod tests {
                                 slot,
                                 AccountInfo::new(StorageLocation::Cached, lamports == 0),
                             )];
-                            alive_accounts.add(2, &account, &slot_list);
+                            alive_accounts.add(2, &account, &slot_list, false);
                             assert!(alive_accounts.one_ref.accounts.is_empty());
                             assert!(alive_accounts.many_refs_old_alive.accounts.is_empty());
                             assert!(
@@ -3660,7 +3708,7 @@ mod tests {
                                     AccountInfo::new(StorageLocation::Cached, lamports == 0),
                                 ),
                             ];
-                            alive_accounts.add(2, &account, &slot_list);
+                            alive_accounts.add(2, &account, &slot_list, false);
                             assert!(alive_accounts.one_ref.accounts.is_empty());
                             assert!(!alive_accounts.many_refs_old_alive.accounts.is_empty());
                             assert!(
@@ -3682,7 +3730,7 @@ mod tests {
                                     AccountInfo::new(StorageLocation::Cached, lamports == 0),
                                 ),
                             ];
-                            alive_accounts.add(2, &account, &slot_list);
+                            alive_accounts.add(2, &account, &slot_list, false);
                             assert!(alive_accounts.one_ref.accounts.is_empty());
                             assert!(alive_accounts.many_refs_old_alive.accounts.is_empty());
                             assert!(
@@ -3725,6 +3773,7 @@ mod tests {
             bytes: 1,
             slot,
             accounts: Vec::default(),
+            zero_lamport_single_ref_account_indices: Vec::new(),
         }];
         assert!(!AccountsDb::many_ref_accounts_can_be_moved(
             &many_refs_newest,
@@ -3745,6 +3794,7 @@ mod tests {
             bytes: tuning.ideal_storage_size.get() as usize,
             slot,
             accounts: Vec::default(),
+            zero_lamport_single_ref_account_indices: Vec::new(),
         }];
         assert!(!AccountsDb::many_ref_accounts_can_be_moved(
             &many_refs_newest,
@@ -3873,5 +3923,98 @@ mod tests {
         let max_resulting_storages = tuning.max_resulting_storages.get();
         let expected_all_infos_len = max_resulting_storages * ideal_storage_size / data_size;
         assert_eq!(infos.all_infos.len(), expected_all_infos_len as usize);
+    }
+
+    /// Ensure that `pack` marks zero lamport single ref accounts in the new storage.
+    ///
+    /// Note that this is highly unlikely in practice, as it would require the
+    /// latest full snapshot slot to be *older* than the ancient storages being packed.
+    /// With defaul/normal setup/configuration, this does not happen.
+    #[test]
+    fn test_pack_marks_zero_lamport_single_ref_account() {
+        let accounts_db = AccountsDb::new_single_for_tests();
+        let slot0 = 0;
+        let slot1 = 1;
+        let slot2 = 2;
+        // latest full snapshot must be older than the slot(s) we plan to pack,
+        // otherwise zero lamport single ref accounts will be purged
+        accounts_db.set_latest_full_snapshot_slot(slot0);
+
+        let alive_pubkey = Pubkey::new_unique();
+        let zero_lamport_single_ref_pubkey = Pubkey::new_unique();
+        let open_account = AccountSharedData::new(1, 0, &Pubkey::default());
+        let closed_account = AccountSharedData::new(0, 0, &Pubkey::default());
+
+        let (_temp_dirs, paths) = get_temp_accounts_paths(1).unwrap();
+        let storage1 = Arc::new(AccountStorageEntry::new(
+            &paths[0],
+            slot1,
+            10,
+            2048,
+            AccountsFileProvider::AppendVec,
+        ));
+        append_single_account_with_default_hash(
+            &storage1,
+            &alive_pubkey,
+            &open_account,
+            true,
+            Some(&accounts_db.accounts_index),
+        );
+        accounts_db.storage.insert(Arc::clone(&storage1));
+        accounts_db.accounts_index.add_root(slot1);
+
+        let storage2 = Arc::new(AccountStorageEntry::new(
+            &paths[0],
+            slot2,
+            11,
+            4096,
+            AccountsFileProvider::AppendVec,
+        ));
+        // note: put the zlsr account in storage 2 to exercise the packing logic that tracks
+        // the flattened zlsr offsets across the accounts from multiple storages
+        append_single_account_with_default_hash(
+            &storage2,
+            &zero_lamport_single_ref_pubkey,
+            &closed_account,
+            true,
+            Some(&accounts_db.accounts_index),
+        );
+        accounts_db.storage.insert(Arc::clone(&storage2));
+        accounts_db.accounts_index.add_root(slot2);
+
+        combine_ancient_slots_packed_for_tests(&accounts_db, vec![slot1, slot2]);
+
+        let alive_slot_list = accounts_db
+            .accounts_index
+            .get_and_then(&alive_pubkey, |entry| {
+                let entry = entry.expect("alive account should still be indexed");
+                (false, entry.slot_list_read_lock().clone_list())
+            });
+        assert_eq!(alive_slot_list.len(), 1);
+        let (_slot, alive_account_info) = alive_slot_list[0];
+
+        let zlsr_slot_list =
+            accounts_db
+                .accounts_index
+                .get_and_then(&zero_lamport_single_ref_pubkey, |entry| {
+                    let entry = entry.expect("zlsr account should still be indexed");
+                    (false, entry.slot_list_read_lock().clone_list())
+                });
+        assert_eq!(zlsr_slot_list.len(), 1);
+        let (new_slot, zlsr_account_info) = zlsr_slot_list[0];
+
+        assert_eq!(alive_account_info.store_id(), zlsr_account_info.store_id());
+        let new_storage = accounts_db
+            .storage
+            .get_account_storage_entry(new_slot, zlsr_account_info.store_id())
+            .expect("new storage should exist");
+
+        let new_storage_zlsr_offsets = new_storage
+            .zero_lamport_single_ref_offsets()
+            .read()
+            .unwrap();
+        assert_eq!(new_storage.num_zero_lamport_single_ref_accounts(), 1);
+        assert!(new_storage_zlsr_offsets.contains(&zlsr_account_info.offset()));
+        assert!(!new_storage_zlsr_offsets.contains(&alive_account_info.offset()));
     }
 }

@@ -320,6 +320,7 @@ impl<'a> SnapshotMinimizer<'a> {
             self.accounts_db().store_accounts_for_shrink(
                 storable_accounts,
                 new_storage,
+                &[],
                 UpdateIndexThreadSelection::Inline,
             );
 
