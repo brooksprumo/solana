@@ -1,6 +1,6 @@
 use {
     super::Bank,
-    crossbeam_queue::SegQueue,
+    crossbeam_queue::ArrayQueue,
     rayon::{ThreadPool, ThreadPoolBuilder},
     solana_account::{AccountSharedData, ReadableAccount, accounts_equal},
     solana_accounts_db::{accounts_db::AccountsDb, storable_accounts::StorableAccounts},
@@ -339,8 +339,11 @@ const _: () = assert!(MAX_UPDATES_PER_BATCH > 0);
 
 /// Get the freelist of vectors to use for batching updates.
 fn batched_updates_freelist() -> &'static VecFreelist<AccountsLtHashUpdate> {
-    static FREELIST: LazyLock<VecFreelist<AccountsLtHashUpdate>> =
-        LazyLock::new(|| VecFreelist::new(Some(MAX_BYTES_BATCHED_UPDATES_FREELIST)));
+    // Derived empirically while observing an unstaked node on mnb.
+    const MAX_CONTAINERS: usize = 2_000;
+    static FREELIST: LazyLock<VecFreelist<AccountsLtHashUpdate>> = LazyLock::new(|| {
+        VecFreelist::new(MAX_CONTAINERS, Some(MAX_BYTES_BATCHED_UPDATES_FREELIST))
+    });
     &FREELIST
 }
 
@@ -353,15 +356,21 @@ struct PendingUpdate {
 
 /// Get the freelist of vectors to use for holding pending updates.
 fn pending_updates_freelist() -> &'static VecFreelist<PendingUpdate> {
-    static FREELIST: LazyLock<VecFreelist<PendingUpdate>> =
-        LazyLock::new(|| VecFreelist::new(Some(MAX_BYTES_PENDING_UPDATES_FREELIST)));
+    // Derived empirically while observing an unstaked node on mnb.
+    const MAX_CONTAINERS: usize = 50;
+    static FREELIST: LazyLock<VecFreelist<PendingUpdate>> = LazyLock::new(|| {
+        VecFreelist::new(MAX_CONTAINERS, Some(MAX_BYTES_PENDING_UPDATES_FREELIST))
+    });
     &FREELIST
 }
 
 /// Get the freelist of hashsets to use for seen accounts.
 fn seen_accounts_freelist() -> &'static HashSetFreelist<Pubkey> {
-    static FREELIST: LazyLock<HashSetFreelist<Pubkey>> =
-        LazyLock::new(|| HashSetFreelist::new(Some(MAX_BYTES_SEEN_ACCOUNTS_FREELIST)));
+    // Derived empirically while observing an unstaked node on mnb.
+    const MAX_CONTAINERS: usize = 50;
+    static FREELIST: LazyLock<HashSetFreelist<Pubkey>> = LazyLock::new(|| {
+        HashSetFreelist::new(MAX_CONTAINERS, Some(MAX_BYTES_SEEN_ACCOUNTS_FREELIST))
+    });
     &FREELIST
 }
 
@@ -371,7 +380,7 @@ type HashSetFreelist<T> = ContainerFreelist<ahash::HashSet<T>>;
 /// Freelist of containers, to avoid repeat allocations/deallocations.
 #[derive(Debug)]
 struct ContainerFreelist<C> {
-    list: SegQueue<C>,
+    list: ArrayQueue<C>,
 
     /// the maximum capacity, in elements, this freelist will hold
     max_capacity: Option<usize>,
@@ -383,10 +392,18 @@ struct ContainerFreelist<C> {
 
 impl<C: Container> ContainerFreelist<C> {
     /// Creates a new, empty, freelist.
-    fn new(max_bytes: Option<usize>) -> Self {
+    ///
+    /// max_containers:
+    /// * The maximum number of containers this freelist can hold.
+    ///
+    /// max_bytes:
+    /// * The maximum number of bytes this freelist can hold.
+    /// * This value corresponds to the total capacity across all the containers in the freelist.
+    /// * If `None`, there is no maximum.
+    fn new(max_containers: usize, max_bytes: Option<usize>) -> Self {
         let max_capacity = max_bytes.map(|max_bytes| max_bytes / size_of::<C::ElemT>());
         Self {
-            list: SegQueue::new(),
+            list: ArrayQueue::new(max_containers),
             max_capacity,
             num_containers: AtomicUsize::new(0),
             total_capacity: AtomicUsize::new(0),
@@ -418,9 +435,13 @@ impl<C: Container> ContainerFreelist<C> {
             })
         {
             container.clear();
-            self.list.push(container);
-            self.num_containers.fetch_add(1, Ordering::Relaxed);
-            self.total_capacity.fetch_add(capacity, Ordering::Release);
+            let result = self.list.push(container);
+            if result.is_ok() {
+                // pushing the container may fail if the freelist is full,
+                // so only update the stats once we know push succeeded
+                self.num_containers.fetch_add(1, Ordering::Relaxed);
+                self.total_capacity.fetch_add(capacity, Ordering::Release);
+            }
         }
     }
 
@@ -1125,7 +1146,7 @@ mod tests {
     fn test_container_freelist_max_capacity() {
         let max_capacity = 77;
         let max_bytes = max_capacity * size_of::<u64>();
-        let mut freelist = VecFreelist::<u64>::new(Some(max_bytes));
+        let mut freelist = VecFreelist::<u64>::new(10, Some(max_bytes));
 
         // pushing a vec that is too big will not actually push
         freelist.push(Vec::with_capacity(max_capacity + 1));
