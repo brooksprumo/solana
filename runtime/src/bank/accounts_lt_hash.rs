@@ -8,10 +8,8 @@ use {
     solana_measure::measure::Measure,
     solana_pubkey::Pubkey,
     std::{
-        any::Any,
         cmp, iter,
         num::Saturating,
-        panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
         sync::{
             Arc, LazyLock, Mutex,
             atomic::{AtomicUsize, Ordering},
@@ -211,7 +209,6 @@ impl AccountsLtHashAsyncProgress {
         let accumulator = AccountsLtHashAccumulator {
             lt_hash: LtHash::identity(),
             stats: UpdateStats::default(),
-            first_panic: None,
         };
         Self {
             accumulator: Arc::new(Mutex::new(accumulator)),
@@ -238,22 +235,15 @@ impl AccountsLtHashAsyncProgress {
         let num_jobs_pending = Arc::clone(&self.num_jobs_pending);
         thread_pool.spawn(move || {
             let mut updates = updates;
-            let result = catch_unwind(AssertUnwindSafe(|| {
-                let num_updates = Saturating(updates.len() as u64);
-                let lt_hash = Self::process(&mut updates);
-                let mut accumulator = accumulator.lock().unwrap_or_else(|err| err.into_inner());
+            let num_updates = Saturating(updates.len() as u64);
+            let lt_hash = Self::process(&mut updates);
+            {
+                let mut accumulator = accumulator.lock().unwrap();
                 accumulator.lt_hash.mix_in(&lt_hash);
                 accumulator.stats.num_updates += num_updates;
-            }));
+            }
 
             batched_updates_freelist().push(updates);
-
-            if let Err(payload) = result {
-                let mut accumulator = accumulator.lock().unwrap_or_else(|err| err.into_inner());
-                if accumulator.first_panic.is_none() {
-                    accumulator.first_panic = Some(payload);
-                }
-            }
 
             num_jobs_pending.fetch_sub(1, Ordering::Release);
         });
@@ -295,13 +285,7 @@ impl AccountsLtHashAsyncProgress {
             // Spin, do not yield! This is called by Bank::freeze() and we want to be fast.
         }
 
-        let mut accumulator = self
-            .accumulator
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        if let Some(payload) = accumulator.first_panic.take() {
-            resume_unwind(payload);
-        }
+        let accumulator = self.accumulator.lock().unwrap();
         let was_finalized = state.is_finalized;
         state.is_finalized = true;
         (
@@ -324,7 +308,6 @@ struct AccountsLtHashBatch {
 struct AccountsLtHashAccumulator {
     lt_hash: LtHash,
     stats: UpdateStats,
-    first_panic: Option<Box<dyn Any + Send + 'static>>,
 }
 
 /// Stats from processing a batch of updates.
@@ -1115,13 +1098,11 @@ mod tests {
         }
 
         // Send more async updates, which is not allowed since finish() already ran.
-        // We do this in another thread and catch the panic to not abort the test.
+        // We do this in another thread and check its JoinHandle for the error.
         let spawn_thread = thread::spawn({
             let async_progress = Arc::clone(&async_progress);
             move || {
-                catch_unwind(AssertUnwindSafe(|| {
-                    async_progress.spawn(thread_pool, vec![new_accounts_lt_hash_update()]);
-                }))
+                async_progress.spawn(thread_pool, vec![new_accounts_lt_hash_update()]);
             }
         });
 
@@ -1135,7 +1116,7 @@ mod tests {
         assert_eq!(async_progress.num_jobs_pending.load(Ordering::Acquire), 0);
 
         // and ensure the second spawn() fails
-        assert!(spawn_thread.join().unwrap().is_err());
+        assert!(spawn_thread.join().is_err());
         assert_eq!(async_progress.num_jobs_pending.load(Ordering::Acquire), 0);
     }
 
