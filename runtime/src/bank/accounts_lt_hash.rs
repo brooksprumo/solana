@@ -5,7 +5,6 @@ use {
     solana_account::{AccountSharedData, ReadableAccount, accounts_equal},
     solana_accounts_db::{accounts_db::AccountsDb, storable_accounts::StorableAccounts},
     solana_lattice_hash::lt_hash::LtHash,
-    solana_measure::measure::Measure,
     solana_pubkey::Pubkey,
     std::{
         cmp, iter,
@@ -14,6 +13,7 @@ use {
             Arc, LazyLock, Mutex,
             atomic::{AtomicU64, AtomicUsize, Ordering},
         },
+        time::Instant,
     },
 };
 
@@ -126,14 +126,14 @@ impl Bank {
     ///
     /// Since this function is non-idempotent, it should only be called once per bank.
     pub(crate) fn finish_accounts_lt_hash_updates(&self) {
-        let finish_time = Measure::start("");
+        let timer = Instant::now();
         let (delta_lt_hash, stats, num_jobs_total) = self.accounts_lt_hash_async_progress.finish();
         self.accounts_lt_hash
             .lock()
             .unwrap()
             .0
             .mix_in(&delta_lt_hash);
-        let finish_us = finish_time.end_as_us();
+        let finish_time = timer.elapsed();
 
         let batched_updates_freelist_stats = batched_updates_freelist().stats();
         let pending_updates_freelist_stats = pending_updates_freelist().stats();
@@ -143,7 +143,7 @@ impl Bank {
             ("slot", self.slot(), i64),
             ("num_jobs", num_jobs_total, i64),
             ("num_updates", stats.num_updates.0, i64),
-            ("finish_us", finish_us, i64),
+            ("finish_us", finish_time.as_micros(), i64),
             (
                 "batched_updates_freelist_num_containers",
                 batched_updates_freelist_stats.num_containers,
