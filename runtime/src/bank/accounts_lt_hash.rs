@@ -12,7 +12,7 @@ use {
         num::Saturating,
         sync::{
             Arc, LazyLock, Mutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicU64, AtomicUsize, Ordering},
         },
     },
 };
@@ -127,15 +127,12 @@ impl Bank {
     /// Since this function is non-idempotent, it should only be called once per bank.
     pub(crate) fn finish_accounts_lt_hash_updates(&self) {
         let finish_time = Measure::start("");
-        let (delta_lt_hash, stats, num_jobs_total, should_mix_in) =
-            self.accounts_lt_hash_async_progress.finish();
-        if should_mix_in {
-            self.accounts_lt_hash
-                .lock()
-                .unwrap()
-                .0
-                .mix_in(&delta_lt_hash);
-        }
+        let (delta_lt_hash, stats, num_jobs_total) = self.accounts_lt_hash_async_progress.finish();
+        self.accounts_lt_hash
+            .lock()
+            .unwrap()
+            .0
+            .mix_in(&delta_lt_hash);
         let finish_us = finish_time.end_as_us();
 
         let batched_updates_freelist_stats = batched_updates_freelist().stats();
@@ -144,7 +141,7 @@ impl Bank {
         datapoint_info!(
             "bank-accounts_lt_hash",
             ("slot", self.slot(), i64),
-            ("num_jobs", num_jobs_total.0, i64),
+            ("num_jobs", num_jobs_total, i64),
             ("num_updates", stats.num_updates.0, i64),
             ("finish_us", finish_us, i64),
             (
@@ -200,7 +197,7 @@ impl Bank {
 pub struct AccountsLtHashAsyncProgress {
     accumulator: Arc<Mutex<AccountsLtHashAccumulator>>,
     num_jobs_pending: Arc<AtomicUsize>,
-    state: Mutex<AsyncProgressState>,
+    num_jobs_total: Arc<AtomicU64>,
 }
 
 impl AccountsLtHashAsyncProgress {
@@ -213,10 +210,7 @@ impl AccountsLtHashAsyncProgress {
         Self {
             accumulator: Arc::new(Mutex::new(accumulator)),
             num_jobs_pending: Arc::new(AtomicUsize::new(0)),
-            state: Mutex::new(AsyncProgressState {
-                num_jobs_total: Saturating(0),
-                is_finalized: false,
-            }),
+            num_jobs_total: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -225,12 +219,8 @@ impl AccountsLtHashAsyncProgress {
     /// Panics if `updates` is empty, or if `self` was already finalized.
     fn spawn(&self, thread_pool: &'static ThreadPool, updates: Vec<AccountsLtHashUpdate>) {
         debug_assert!(!updates.is_empty());
-        {
-            let mut state = self.state.lock().unwrap();
-            assert!(!state.is_finalized);
-            state.num_jobs_total += 1;
-            self.num_jobs_pending.fetch_add(1, Ordering::Relaxed);
-        }
+        self.num_jobs_pending.fetch_add(1, Ordering::Release);
+        self.num_jobs_total.fetch_add(1, Ordering::Relaxed);
         let accumulator = Arc::clone(&self.accumulator);
         let num_jobs_pending = Arc::clone(&self.num_jobs_pending);
         thread_pool.spawn(move || {
@@ -276,23 +266,16 @@ impl AccountsLtHashAsyncProgress {
     /// * the overall accounts lt hash
     /// * the stats from all the updates
     /// * the number of asynchronous jobs
-    /// * if this was the first time finish() was called
-    fn finish(&self) -> (LtHash, UpdateStats, Saturating<u64>, bool) {
-        // make sure to lock `state` before spinning on num_jobs_pending
-        // to ensure no new jobs are added
-        let mut state = self.state.lock().unwrap();
+    fn finish(&self) -> (LtHash, UpdateStats, u64) {
         while self.num_jobs_pending.load(Ordering::Acquire) > 0 {
             // Spin, do not yield! This is called by Bank::freeze() and we want to be fast.
         }
 
         let accumulator = self.accumulator.lock().unwrap();
-        let was_finalized = state.is_finalized;
-        state.is_finalized = true;
         (
             accumulator.lt_hash.clone(),
             accumulator.stats.clone(),
-            state.num_jobs_total,
-            !was_finalized,
+            self.num_jobs_total.load(Ordering::Relaxed),
         )
     }
 }
@@ -314,13 +297,6 @@ struct AccountsLtHashAccumulator {
 #[derive(Clone, Debug, Default)]
 struct UpdateStats {
     num_updates: Saturating<u64>,
-}
-
-/// The state of the asynchronous progress itself.
-#[derive(Debug)]
-struct AsyncProgressState {
-    num_jobs_total: Saturating<u64>,
-    is_finalized: bool,
 }
 
 /// A single accounts lt hash update to process.
@@ -593,13 +569,7 @@ mod tests {
         solana_pubkey::{self as pubkey, Pubkey},
         solana_rent::Rent,
         solana_signer::Signer as _,
-        std::{
-            array, cmp, iter,
-            str::FromStr as _,
-            sync::Arc,
-            thread,
-            time::{Duration, Instant},
-        },
+        std::{array, cmp, iter, str::FromStr as _, sync::Arc},
         tempfile::TempDir,
         test_case::{test_case, test_matrix},
     };
@@ -744,14 +714,6 @@ mod tests {
         bank.freeze();
 
         let post_accounts_lt_hash = bank.accounts_lt_hash.lock().unwrap().clone();
-
-        // ensure the bank's accounts lt hash is only updated once,
-        // even if finish() is called multiple times
-        bank.finish_accounts_lt_hash_updates();
-        assert_eq!(
-            *bank.accounts_lt_hash.lock().unwrap(),
-            post_accounts_lt_hash,
-        );
 
         let post_mint = bank.get_account_with_fixed_root(&mint_keypair.pubkey());
         let post_account1 = bank.get_account_with_fixed_root(&keypair1.pubkey());
@@ -1068,77 +1030,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(roundtrip_bank, *bank);
-    }
-
-    /// Ensure that spawn() and finish() do not race.
-    #[test]
-    fn test_finish_prevents_subsequent_spawn() {
-        fn new_accounts_lt_hash_update() -> AccountsLtHashUpdate {
-            let curr_account = Some(AccountSharedData::new(42, 0, &Pubkey::default()));
-            AccountsLtHashUpdate {
-                address: Pubkey::new_unique(),
-                prev_account: None,
-                curr_account,
-            }
-        }
-
-        // spin up a thread pool that'll process the async updates
-        let thread_pool: &'static ThreadPool = Box::leak(Box::new(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(1)
-                .build()
-                .unwrap(),
-        ));
-
-        // create some channels that'll initially block the thread pool,
-        // then unblock later after spawn() and finish() have been called
-        let (block_sender, block_receiver) = crossbeam_channel::unbounded();
-        let (unblock_sender, unblock_receiver) = crossbeam_channel::unbounded();
-        thread_pool.spawn(move || {
-            block_sender.send(()).unwrap();
-            unblock_receiver.recv().unwrap();
-        });
-        block_receiver.recv().unwrap();
-
-        // send updates to be processed asynchronously
-        let async_progress = Arc::new(AccountsLtHashAsyncProgress::new());
-        async_progress.spawn(thread_pool, vec![new_accounts_lt_hash_update()]);
-        assert_eq!(async_progress.num_jobs_pending.load(Ordering::Acquire), 1);
-
-        // call finish() to prevent additional async updates from being processed
-        let finish_thread = thread::spawn({
-            let async_progress = Arc::clone(&async_progress);
-            move || async_progress.finish()
-        });
-
-        // wait and ensure finish() has started
-        let start = Instant::now();
-        while async_progress.state.try_lock().is_ok() {
-            assert!(start.elapsed() < Duration::from_secs(1));
-            thread::yield_now();
-        }
-
-        // Send more async updates, which is not allowed since finish() already ran.
-        // We do this in another thread and check its JoinHandle for the error.
-        let spawn_thread = thread::spawn({
-            let async_progress = Arc::clone(&async_progress);
-            move || {
-                async_progress.spawn(thread_pool, vec![new_accounts_lt_hash_update()]);
-            }
-        });
-
-        // unblock the thread pool, which allows the async job to finally be processed
-        unblock_sender.send(()).unwrap();
-
-        // ensure after finish() completes that only a single job ran
-        let (_lt_hash, _stats, num_jobs_total, should_mix) = finish_thread.join().unwrap();
-        assert!(should_mix);
-        assert_eq!(num_jobs_total.0, 1);
-        assert_eq!(async_progress.num_jobs_pending.load(Ordering::Acquire), 0);
-
-        // and ensure the second spawn() fails
-        assert!(spawn_thread.join().is_err());
-        assert_eq!(async_progress.num_jobs_pending.load(Ordering::Acquire), 0);
     }
 
     /// Ensure ContainerFreelist respects max size.
