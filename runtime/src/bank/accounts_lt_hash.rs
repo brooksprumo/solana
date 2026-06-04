@@ -241,36 +241,15 @@ impl AccountsLtHashAsyncProgress {
                 };
                 Self::collect_available_results(&result_receiver, &mut result);
 
-                // brooks TODO: doc
+                // brooks TODO: doc safety, and also to send before decrementing jobs
                 // Send before decrementing pending jobs, so finish() cannot observe zero
                 // pending jobs until every result is available to drain.
-                result_sender.send(result).unwrap();
+                result_sender.try_send(result).unwrap();
                 num_jobs_pending.fetch_sub(1, Ordering::Release);
 
                 batched_updates_freelist().try_push(updates);
             }
         });
-    }
-
-    /// Processes `updates` and returns their overall accounts lt hash.
-    fn process(updates: &mut Vec<AccountsLtHashUpdate>) -> LtHash {
-        let mut accum_lt_hash = LtHash::identity();
-        for update in updates.drain(..) {
-            let AccountsLtHashUpdate {
-                address,
-                prev_account,
-                curr_account,
-            } = update;
-            if let Some(prev_account) = prev_account {
-                let prev_lt_hash = AccountsDb::lt_hash_account(&prev_account, &address);
-                accum_lt_hash.mix_out(&prev_lt_hash.0);
-            }
-            if let Some(curr_account) = curr_account {
-                let curr_lt_hash = AccountsDb::lt_hash_account(&curr_account, &address);
-                accum_lt_hash.mix_in(&curr_lt_hash.0);
-            }
-        }
-        accum_lt_hash
     }
 
     // brooks TODO: doc
@@ -297,8 +276,30 @@ impl AccountsLtHashAsyncProgress {
         )
     }
 
+    /// Processes `updates` and returns their overall accounts lt hash.
+    fn process(updates: &mut Vec<AccountsLtHashUpdate>) -> LtHash {
+        let mut accum_lt_hash = LtHash::identity();
+        for update in updates.drain(..) {
+            let AccountsLtHashUpdate {
+                address,
+                prev_account,
+                curr_account,
+            } = update;
+            if let Some(prev_account) = prev_account {
+                let prev_lt_hash = AccountsDb::lt_hash_account(&prev_account, &address);
+                accum_lt_hash.mix_out(&prev_lt_hash.0);
+            }
+            if let Some(curr_account) = curr_account {
+                let curr_lt_hash = AccountsDb::lt_hash_account(&curr_account, &address);
+                accum_lt_hash.mix_in(&curr_lt_hash.0);
+            }
+        }
+        accum_lt_hash
+    }
+
     // brooks TODO: doc
     /// Drains currently available results and mixes them into `accumulator`.
+    #[inline]
     fn collect_available_results(
         result_receiver: &Receiver<AccountsLtHashAccumulator>,
         accumulator: &mut AccountsLtHashAccumulator,
