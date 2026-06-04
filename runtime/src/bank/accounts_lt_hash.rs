@@ -241,10 +241,12 @@ impl AccountsLtHashAsyncProgress {
                 };
                 Self::collect_available_results(&results_receiver, &mut result);
 
-                // brooks TODO: doc safety, and also to send before decrementing jobs
-                // Send before decrementing pending jobs, so finish() cannot observe zero
-                // pending jobs until every result is available to drain.
+                // SAFETY: Sending never errors since channel cannot be disconnected nor full.
                 results_sender.try_send(result).unwrap();
+
+                // Decrement the number of pending jobs happens *after* sending the result
+                // to the channel.  This ensures `wait_for_all_results()` cannot observe
+                // zero pending jobs until all results are available to drain.
                 num_jobs_pending.fetch_sub(1, Ordering::Release);
 
                 batched_updates_freelist().try_push(updates);
@@ -297,8 +299,8 @@ impl AccountsLtHashAsyncProgress {
         accum_lt_hash
     }
 
-    // brooks TODO: doc
-    /// Drains currently available results and mixes them into `accumulator`.
+    /// Drains all available results from `results_receiver`, and then
+    /// accumulates them into `accumulator`.
     #[inline]
     fn collect_available_results(
         results_receiver: &Receiver<AccountsLtHashAccumulator>,
@@ -311,7 +313,6 @@ impl AccountsLtHashAsyncProgress {
 }
 
 /// A batch of accounts lt hash updates to process.
-// brooks TODO: remove Default
 #[derive(Default)]
 struct AccountsLtHashBatch {
     updates: Vec<AccountsLtHashUpdate>,
@@ -319,6 +320,7 @@ struct AccountsLtHashBatch {
 }
 
 /// The struct to accumulate results from processing a batch of updates.
+#[derive(Debug)]
 struct AccountsLtHashAccumulator {
     lt_hash: LtHash,
     stats: UpdateStats,
