@@ -254,10 +254,7 @@ impl AccountsLtHashAsyncProgress {
         });
     }
 
-    // brooks TODO: doc
-    /// Finalizes the asynchronous accounts lt hash updates.
-    ///
-    /// This fn waits for all pending jobs to complete, then returns:
+    /// Waits for all pending jobs to complete, then returns:
     /// * the overall accounts lt hash
     /// * the stats from all the updates
     /// * the number of asynchronous jobs
@@ -754,7 +751,6 @@ mod tests {
         bank.freeze();
 
         let post_accounts_lt_hash = bank.accounts_lt_hash.lock().unwrap().clone();
-
         let post_mint = bank.get_account_with_fixed_root(&mint_keypair.pubkey());
         let post_account1 = bank.get_account_with_fixed_root(&keypair1.pubkey());
         let post_account2 = bank.get_account_with_fixed_root(&keypair2.pubkey());
@@ -1005,8 +1001,9 @@ mod tests {
         )
         .unwrap();
 
-        // Correctly restoring the accounts lt hash in Bank::new_from_snapshot() depends on the
-        // bank already being frozen so pending per-slot LT hash updates cannot be replayed.
+        // Correctly calculating the accounts lt hash in Bank::new_from_snapshot() depends on the
+        // bank being frozen.  This is so we don't call `update_accounts_lt_hash()` twice on the
+        // same bank!
         assert!(roundtrip_bank.is_frozen());
 
         assert_eq!(roundtrip_bank, *bank);
