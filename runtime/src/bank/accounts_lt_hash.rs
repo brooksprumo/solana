@@ -204,8 +204,12 @@ pub struct AccountsLtHashAsyncProgress {
 impl AccountsLtHashAsyncProgress {
     /// Creates a new AccountsLtHashAsyncProgress variable, which is suitable for a new Bank.
     pub fn new() -> Self {
-        // brooks TODO: bound channel
-        let (results_sender, results_receiver) = crossbeam_channel::unbounded();
+        // Since (1) there is a fixed number of accounts hasher threads, and (2) each thread
+        // drains all pending results from the channel before sending theirs, then the
+        // results channel should never have more than NUM_ACCOUNTS_HASHER_THREADS messages.
+        // The `* 2` doubling is just-in-case padding.
+        const CHANNEL_CAPACITY: usize = NUM_ACCOUNTS_HASHER_THREADS * 2;
+        let (results_sender, results_receiver) = crossbeam_channel::bounded(CHANNEL_CAPACITY);
         Self {
             results_sender,
             results_receiver,
