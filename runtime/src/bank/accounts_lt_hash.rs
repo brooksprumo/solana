@@ -228,8 +228,8 @@ impl AccountsLtHashAsyncProgress {
         self.num_jobs_pending.fetch_add(1, Ordering::Release);
         self.num_jobs_total.fetch_add(1, Ordering::Relaxed);
         thread_pool.spawn({
-            let result_sender = self.results_sender.clone();
-            let result_receiver = self.results_receiver.clone();
+            let results_sender = self.results_sender.clone();
+            let results_receiver = self.results_receiver.clone();
             let num_jobs_pending = Arc::clone(&self.num_jobs_pending);
             move || {
                 let mut updates = updates;
@@ -239,12 +239,12 @@ impl AccountsLtHashAsyncProgress {
                     lt_hash,
                     stats: UpdateStats { num_updates },
                 };
-                Self::collect_available_results(&result_receiver, &mut result);
+                Self::collect_available_results(&results_receiver, &mut result);
 
                 // brooks TODO: doc safety, and also to send before decrementing jobs
                 // Send before decrementing pending jobs, so finish() cannot observe zero
                 // pending jobs until every result is available to drain.
-                result_sender.try_send(result).unwrap();
+                results_sender.try_send(result).unwrap();
                 num_jobs_pending.fetch_sub(1, Ordering::Release);
 
                 batched_updates_freelist().try_push(updates);
@@ -301,10 +301,10 @@ impl AccountsLtHashAsyncProgress {
     /// Drains currently available results and mixes them into `accumulator`.
     #[inline]
     fn collect_available_results(
-        result_receiver: &Receiver<AccountsLtHashAccumulator>,
+        results_receiver: &Receiver<AccountsLtHashAccumulator>,
         accumulator: &mut AccountsLtHashAccumulator,
     ) {
-        while let Ok(result) = result_receiver.try_recv() {
+        while let Ok(result) = results_receiver.try_recv() {
             accumulator.accumulate(result);
         }
     }
