@@ -1,5 +1,6 @@
 use {
     super::Bank,
+    crossbeam_channel::{Receiver, Sender},
     crossbeam_queue::ArrayQueue,
     rayon::{ThreadPool, ThreadPoolBuilder},
     solana_account::{AccountSharedData, ReadableAccount, accounts_equal},
@@ -10,7 +11,7 @@ use {
         cmp, iter,
         num::Saturating,
         sync::{
-            Arc, LazyLock, Mutex,
+            Arc, LazyLock,
             atomic::{AtomicU64, AtomicUsize, Ordering},
         },
         time::Instant,
@@ -33,10 +34,10 @@ impl Bank {
         }
 
         let pending_updates_freelist = pending_updates_freelist();
-        let mut pending_updates = pending_updates_freelist.pop().unwrap_or_default();
+        let mut pending_updates = pending_updates_freelist.try_pop().unwrap_or_default();
 
         let seen_accounts_freelist = seen_accounts_freelist();
-        let mut seen_accounts = seen_accounts_freelist.pop().unwrap_or_default();
+        let mut seen_accounts = seen_accounts_freelist.try_pop().unwrap_or_default();
 
         // process accounts in reverse because we must only count the latest version of each account
         for index in (0..accounts.len()).rev() {
@@ -85,7 +86,7 @@ impl Bank {
         let batched_updates_freelist = batched_updates_freelist();
         let mut batches: Box<_> = iter::repeat_with(|| AccountsLtHashBatch {
             updates: batched_updates_freelist
-                .pop()
+                .try_pop()
                 .unwrap_or_else(|| Vec::with_capacity(MAX_UPDATES_PER_BATCH)),
             hash_cost: Saturating(0),
         })
@@ -103,15 +104,15 @@ impl Bank {
             if !updates.is_empty() {
                 async_progress.spawn(thread_pool, updates);
             } else {
-                batched_updates_freelist.push(updates);
+                batched_updates_freelist.try_push(updates);
             }
         }
 
         // Reclaim the pending updates too!
-        pending_updates_freelist.push(pending_updates);
+        pending_updates_freelist.try_push(pending_updates);
 
         // Reclaim the seen accounts hashset too!
-        seen_accounts_freelist.push(seen_accounts);
+        seen_accounts_freelist.try_push(seen_accounts);
     }
 
     /// Updates the accounts lt hash.
@@ -123,11 +124,10 @@ impl Bank {
     ///
     /// This function waits for any in-flight jobs on the accounts hasher threads,
     /// computes their combined delta lt hash, then mixes it into the bank.
-    ///
-    /// Since this function is non-idempotent, it should only be called once per bank.
     pub(crate) fn finish_accounts_lt_hash_updates(&self) {
         let timer = Instant::now();
-        let (delta_lt_hash, stats, num_jobs_total) = self.accounts_lt_hash_async_progress.finish();
+        let (delta_lt_hash, stats, num_jobs_total) =
+            self.accounts_lt_hash_async_progress.wait_for_all_results();
         self.accounts_lt_hash
             .lock()
             .unwrap()
@@ -195,47 +195,56 @@ impl Bank {
 
 /// Struct for tracking progress of the asynchronous accounts lt hashing for a Bank.
 pub struct AccountsLtHashAsyncProgress {
-    accumulator: Arc<Mutex<AccountsLtHashAccumulator>>,
+    results_sender: Sender<AccountsLtHashAccumulator>,
+    results_receiver: Receiver<AccountsLtHashAccumulator>,
     num_jobs_pending: Arc<AtomicUsize>,
-    num_jobs_total: Arc<AtomicU64>,
+    num_jobs_total: AtomicU64,
 }
 
 impl AccountsLtHashAsyncProgress {
     /// Creates a new AccountsLtHashAsyncProgress variable, which is suitable for a new Bank.
     pub fn new() -> Self {
-        let accumulator = AccountsLtHashAccumulator {
-            lt_hash: LtHash::identity(),
-            stats: UpdateStats::default(),
-        };
+        // brooks TODO: bound channel
+        let (results_sender, results_receiver) = crossbeam_channel::unbounded();
         Self {
-            accumulator: Arc::new(Mutex::new(accumulator)),
+            results_sender,
+            results_receiver,
             num_jobs_pending: Arc::new(AtomicUsize::new(0)),
-            num_jobs_total: Arc::new(AtomicU64::new(0)),
+            num_jobs_total: AtomicU64::new(0),
         }
     }
 
     /// Enqueues `updates` into `thread_pool` for asynchronous processing.
     ///
-    /// Panics if `updates` is empty, or if `self` was already finalized.
+    /// Note: `updates` must not be empty.
+    /// * in debug-mode, the fn will panic.
+    /// * in release-mode, `updates` will be dropped and not pushed back onto the freelist.
     fn spawn(&self, thread_pool: &'static ThreadPool, updates: Vec<AccountsLtHashUpdate>) {
         debug_assert!(!updates.is_empty());
         self.num_jobs_pending.fetch_add(1, Ordering::Release);
         self.num_jobs_total.fetch_add(1, Ordering::Relaxed);
-        let accumulator = Arc::clone(&self.accumulator);
-        let num_jobs_pending = Arc::clone(&self.num_jobs_pending);
-        thread_pool.spawn(move || {
-            let mut updates = updates;
-            let num_updates = Saturating(updates.len() as u64);
-            let lt_hash = Self::process(&mut updates);
-            {
-                let mut accumulator = accumulator.lock().unwrap();
-                accumulator.lt_hash.mix_in(&lt_hash);
-                accumulator.stats.num_updates += num_updates;
+        thread_pool.spawn({
+            let result_sender = self.results_sender.clone();
+            let result_receiver = self.results_receiver.clone();
+            let num_jobs_pending = Arc::clone(&self.num_jobs_pending);
+            move || {
+                let mut updates = updates;
+                let num_updates = Saturating(updates.len() as u64);
+                let lt_hash = Self::process(&mut updates);
+                let mut result = AccountsLtHashAccumulator {
+                    lt_hash,
+                    stats: UpdateStats { num_updates },
+                };
+                Self::collect_available_results(&result_receiver, &mut result);
+
+                // brooks TODO: doc
+                // Send before decrementing pending jobs, so finish() cannot observe zero
+                // pending jobs until every result is available to drain.
+                result_sender.send(result).unwrap();
+                num_jobs_pending.fetch_sub(1, Ordering::Release);
+
+                batched_updates_freelist().try_push(updates);
             }
-
-            batched_updates_freelist().push(updates);
-
-            num_jobs_pending.fetch_sub(1, Ordering::Release);
         });
     }
 
@@ -260,27 +269,44 @@ impl AccountsLtHashAsyncProgress {
         accum_lt_hash
     }
 
+    // brooks TODO: doc
     /// Finalizes the asynchronous accounts lt hash updates.
     ///
     /// This fn waits for all pending jobs to complete, then returns:
     /// * the overall accounts lt hash
     /// * the stats from all the updates
     /// * the number of asynchronous jobs
-    fn finish(&self) -> (LtHash, UpdateStats, u64) {
+    fn wait_for_all_results(&self) -> (LtHash, UpdateStats, u64) {
         while self.num_jobs_pending.load(Ordering::Acquire) > 0 {
             // Spin, do not yield! This is called by Bank::freeze() and we want to be fast.
         }
 
-        let accumulator = self.accumulator.lock().unwrap();
+        let mut accumulator = AccountsLtHashAccumulator {
+            lt_hash: LtHash::identity(),
+            stats: UpdateStats::default(),
+        };
+        Self::collect_available_results(&self.results_receiver, &mut accumulator);
         (
-            accumulator.lt_hash.clone(),
-            accumulator.stats.clone(),
+            accumulator.lt_hash,
+            accumulator.stats,
             self.num_jobs_total.load(Ordering::Relaxed),
         )
+    }
+
+    // brooks TODO: doc
+    /// Drains currently available results and mixes them into `accumulator`.
+    fn collect_available_results(
+        result_receiver: &Receiver<AccountsLtHashAccumulator>,
+        accumulator: &mut AccountsLtHashAccumulator,
+    ) {
+        while let Ok(result) = result_receiver.try_recv() {
+            accumulator.accumulate(result);
+        }
     }
 }
 
 /// A batch of accounts lt hash updates to process.
+// brooks TODO: remove Default
 #[derive(Default)]
 struct AccountsLtHashBatch {
     updates: Vec<AccountsLtHashUpdate>,
@@ -293,8 +319,15 @@ struct AccountsLtHashAccumulator {
     stats: UpdateStats,
 }
 
+impl AccountsLtHashAccumulator {
+    fn accumulate(&mut self, other: Self) {
+        self.lt_hash.mix_in(&other.lt_hash);
+        self.stats.num_updates += other.stats.num_updates;
+    }
+}
+
 /// Stats from processing a batch of updates.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 struct UpdateStats {
     num_updates: Saturating<u64>,
 }
@@ -387,7 +420,7 @@ impl<C: Container> ContainerFreelist<C> {
     }
 
     /// Pushes `container` on to the freelist (IFF its capacity is greater than zero).
-    fn push(&self, mut container: C) {
+    fn try_push(&self, mut container: C) {
         // If the capacity is zero, then the container never allocated.
         // In that case, don't waste time putting it back into the freelist,
         // since there's nothing of value to reuse.
@@ -424,7 +457,7 @@ impl<C: Container> ContainerFreelist<C> {
     /// Pops a container off the freelist and returns it.
     ///
     /// The returned container will always be empty.
-    fn pop(&self) -> Option<C> {
+    fn try_pop(&self) -> Option<C> {
         let container = self.list.pop()?;
         assert!(container.is_empty());
         self.num_containers.fetch_sub(1, Ordering::Relaxed);
@@ -1040,26 +1073,26 @@ mod tests {
         let mut freelist = VecFreelist::<u64>::new(10, Some(max_bytes));
 
         // pushing a vec that is too big will not actually push
-        freelist.push(Vec::with_capacity(max_capacity + 1));
+        freelist.try_push(Vec::with_capacity(max_capacity + 1));
         let stats0 = freelist.stats();
         assert_eq!(stats0.num_containers, 0);
         assert_eq!(stats0.capacity_elems, 0);
         assert_eq!(stats0.capacity_bytes, 0);
 
         // pushing a vec that is not too big will actually push
-        freelist.push(Vec::with_capacity(max_capacity));
+        freelist.try_push(Vec::with_capacity(max_capacity));
         let stats1 = freelist.stats();
         assert_eq!(stats1.num_containers, 1);
         assert_eq!(stats1.capacity_elems, max_capacity);
         assert_eq!(stats1.capacity_bytes, max_bytes);
 
         // pushing a vec that would exceed capacity will not push
-        freelist.push(Vec::with_capacity(1));
+        freelist.try_push(Vec::with_capacity(1));
         assert_eq!(freelist.stats(), stats1);
 
         // ...but, if we remove the limit, push should work again
         freelist.max_capacity = None;
-        freelist.push(Vec::with_capacity(1));
+        freelist.try_push(Vec::with_capacity(1));
         let stats2 = freelist.stats();
         assert_eq!(stats2.num_containers, 2);
         assert_eq!(stats2.capacity_elems, max_capacity + 1);
