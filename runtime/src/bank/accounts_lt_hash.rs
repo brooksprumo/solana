@@ -8,8 +8,6 @@ use {
     solana_lattice_hash::lt_hash::LtHash,
     solana_pubkey::Pubkey,
     std::{
-        cmp, iter,
-        num::Saturating,
         sync::{
             Arc, LazyLock,
             atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -21,9 +19,7 @@ use {
 /// Number of threads for the async accounts hasher thread pool.
 const NUM_ACCOUNTS_HASHER_THREADS: usize = 4;
 
-// Maximum size, in bytes, for the various freelists.
-const MAX_BYTES_BATCHED_UPDATES_FREELIST: usize = 50_000_000;
-const MAX_BYTES_PENDING_UPDATES_FREELIST: usize = 30_000_000;
+// Maximum size, in bytes, for the seen-accounts freelist.
 const MAX_BYTES_SEEN_ACCOUNTS_FREELIST: usize = 10_000_000;
 
 impl Bank {
@@ -33,11 +29,10 @@ impl Bank {
             return;
         }
 
-        let pending_updates_freelist = pending_updates_freelist();
-        let mut pending_updates = pending_updates_freelist.try_pop().unwrap_or_default();
-
         let seen_accounts_freelist = seen_accounts_freelist();
         let mut seen_accounts = seen_accounts_freelist.try_pop().unwrap_or_default();
+        let async_progress = &self.accounts_lt_hash_async_progress;
+        let thread_pool = accounts_hasher_thread_pool();
 
         // process accounts in reverse because we must only count the latest version of each account
         for index in (0..accounts.len()).rev() {
@@ -56,62 +51,26 @@ impl Bank {
             });
             match (&prev_account, &curr_account) {
                 (None, None) => {
-                    // the account is ephemeral; skip it
+                    // the account was ephemeral; skip it
                 }
                 (Some(a), Some(b)) if accounts_equal(a, b) => {
                     // the account was not modified; skip it
                 }
                 _ => {
                     // the account was modified; enqueue this update
-                    let hash_cost = calc_hash_cost(prev_account.as_ref())
-                        + calc_hash_cost(curr_account.as_ref());
-                    pending_updates.push(PendingUpdate {
-                        hash_cost,
-                        update: AccountsLtHashUpdate {
+                    async_progress.spawn(
+                        thread_pool,
+                        AccountsLtHashUpdate {
                             address: *address,
                             prev_account,
                             curr_account,
                         },
-                    });
+                    );
                 }
             }
         }
 
-        // Split the pending updates in batches; minimum one per accounts hasher thread.
-        // Attempt to evenly distribute the hashing work, based on the "hash cost",
-        // which is effectively the number of bytes to hash per update.
-        let num_updates = pending_updates.len();
-        let num_batches = num_updates.div_ceil(MAX_UPDATES_PER_BATCH);
-        let num_batches = cmp::max(num_batches, NUM_ACCOUNTS_HASHER_THREADS);
-        let batched_updates_freelist = batched_updates_freelist();
-        let mut batches: Box<_> = iter::repeat_with(|| AccountsLtHashBatch {
-            updates: batched_updates_freelist
-                .try_pop()
-                .unwrap_or_else(|| Vec::with_capacity(MAX_UPDATES_PER_BATCH)),
-            hash_cost: Saturating(0),
-        })
-        .take(num_batches)
-        .collect();
-        batch_pending_updates(&mut pending_updates, &mut batches);
-
-        // Dispatch the batched updates to the accounts hasher thread pool.
-        // If any of the batches were unused, reclaim them and add them
-        // back to the freelist.
-        let async_progress = &self.accounts_lt_hash_async_progress;
-        let thread_pool = accounts_hasher_thread_pool();
-        for batch in batches {
-            let updates = batch.updates;
-            if !updates.is_empty() {
-                async_progress.spawn(thread_pool, updates);
-            } else {
-                batched_updates_freelist.try_push(updates);
-            }
-        }
-
-        // Reclaim the pending updates too!
-        pending_updates_freelist.try_push(pending_updates);
-
-        // Reclaim the seen accounts hashset too!
+        // reclaim the seen accounts hashset
         seen_accounts_freelist.try_push(seen_accounts);
     }
 
@@ -126,7 +85,7 @@ impl Bank {
     /// computes their combined delta lt hash, then mixes it into the bank.
     pub(crate) fn finish_accounts_lt_hash_updates(&self) {
         let timer = Instant::now();
-        let (delta_lt_hash, stats, num_jobs_total) =
+        let (delta_lt_hash, num_jobs_total) =
             self.accounts_lt_hash_async_progress.wait_for_all_results();
         self.accounts_lt_hash
             .lock()
@@ -135,45 +94,12 @@ impl Bank {
             .mix_in(&delta_lt_hash);
         let finish_time = timer.elapsed();
 
-        let batched_updates_freelist_stats = batched_updates_freelist().stats();
-        let pending_updates_freelist_stats = pending_updates_freelist().stats();
         let seen_accounts_freelist_stats = seen_accounts_freelist().stats();
         datapoint_info!(
             "bank-accounts_lt_hash",
             ("slot", self.slot(), i64),
             ("num_jobs", num_jobs_total, i64),
-            ("num_updates", stats.num_updates.0, i64),
             ("finish_us", finish_time.as_micros(), i64),
-            (
-                "batched_updates_freelist_num_containers",
-                batched_updates_freelist_stats.num_containers,
-                i64
-            ),
-            (
-                "batched_updates_freelist_capacity_elems",
-                batched_updates_freelist_stats.capacity_elems,
-                i64
-            ),
-            (
-                "batched_updates_freelist_capacity_bytes",
-                batched_updates_freelist_stats.capacity_bytes,
-                i64
-            ),
-            (
-                "pending_updates_freelist_num_containers",
-                pending_updates_freelist_stats.num_containers,
-                i64
-            ),
-            (
-                "pending_updates_freelist_capacity_elems",
-                pending_updates_freelist_stats.capacity_elems,
-                i64
-            ),
-            (
-                "pending_updates_freelist_capacity_bytes",
-                pending_updates_freelist_stats.capacity_bytes,
-                i64
-            ),
             (
                 "seen_accounts_freelist_num_containers",
                 seen_accounts_freelist_stats.num_containers,
@@ -195,8 +121,8 @@ impl Bank {
 
 /// Struct for tracking progress of the asynchronous accounts lt hashing for a Bank.
 pub struct AccountsLtHashAsyncProgress {
-    results_sender: Sender<AccountsLtHashAccumulator>,
-    results_receiver: Receiver<AccountsLtHashAccumulator>,
+    results_sender: Sender<LtHash>,
+    results_receiver: Receiver<LtHash>,
     num_jobs_pending: Arc<AtomicUsize>,
     num_jobs_total: AtomicU64,
 }
@@ -218,13 +144,8 @@ impl AccountsLtHashAsyncProgress {
         }
     }
 
-    /// Enqueues `updates` into `thread_pool` for asynchronous processing.
-    ///
-    /// Note: `updates` must not be empty.
-    /// * in debug-mode, the fn will panic.
-    /// * in release-mode, `updates` will be dropped and not pushed back onto the freelist.
-    fn spawn(&self, thread_pool: &'static ThreadPool, updates: Vec<AccountsLtHashUpdate>) {
-        debug_assert!(!updates.is_empty());
+    /// Enqueues `update` into `thread_pool` for asynchronous processing.
+    fn spawn(&self, thread_pool: &'static ThreadPool, update: AccountsLtHashUpdate) {
         self.num_jobs_pending.fetch_add(1, Ordering::Release);
         self.num_jobs_total.fetch_add(1, Ordering::Relaxed);
         thread_pool.spawn({
@@ -232,66 +153,50 @@ impl AccountsLtHashAsyncProgress {
             let results_receiver = self.results_receiver.clone();
             let num_jobs_pending = Arc::clone(&self.num_jobs_pending);
             move || {
-                let mut updates = updates;
-                let num_updates = Saturating(updates.len() as u64);
-                let lt_hash = Self::process(&mut updates);
-                let mut result = AccountsLtHashAccumulator {
-                    lt_hash,
-                    stats: UpdateStats { num_updates },
-                };
-                Self::collect_available_results(&results_receiver, &mut result);
+                let mut result = Self::process(update);
+                Self::collect_available_results(&mut result, &results_receiver);
 
-                // SAFETY: Sending never errors since channel cannot be disconnected nor full.
+                // SAFETY: Sending never fails because...
+                // * channel never disconnects: each holds a receiver too
+                // * channel is never full: each hasher thread drains the channel before sending
                 results_sender.try_send(result).unwrap();
 
                 // Decrement the number of pending jobs happens *after* sending the result
                 // to the channel.  This ensures `wait_for_all_results()` cannot observe
                 // zero pending jobs until all results are available to drain.
                 num_jobs_pending.fetch_sub(1, Ordering::Release);
-
-                batched_updates_freelist().try_push(updates);
             }
         });
     }
 
     /// Waits for all pending jobs to complete, then returns:
     /// * the overall accounts lt hash
-    /// * the stats from all the updates
     /// * the number of asynchronous jobs
-    fn wait_for_all_results(&self) -> (LtHash, UpdateStats, u64) {
+    fn wait_for_all_results(&self) -> (LtHash, u64) {
         while self.num_jobs_pending.load(Ordering::Acquire) > 0 {
             // Spin, do not yield! This is called by Bank::freeze() and we want to be fast.
         }
 
-        let mut accumulator = AccountsLtHashAccumulator {
-            lt_hash: LtHash::identity(),
-            stats: UpdateStats::default(),
-        };
-        Self::collect_available_results(&self.results_receiver, &mut accumulator);
-        (
-            accumulator.lt_hash,
-            accumulator.stats,
-            self.num_jobs_total.load(Ordering::Relaxed),
-        )
+        let mut accumulator = LtHash::identity();
+        Self::collect_available_results(&mut accumulator, &self.results_receiver);
+        (accumulator, self.num_jobs_total.load(Ordering::Relaxed))
     }
 
-    /// Processes `updates` and returns their overall accounts lt hash.
-    fn process(updates: &mut Vec<AccountsLtHashUpdate>) -> LtHash {
+    /// Processes `update` and returns its accounts lt hash.
+    fn process(update: AccountsLtHashUpdate) -> LtHash {
         let mut accum_lt_hash = LtHash::identity();
-        for update in updates.drain(..) {
-            let AccountsLtHashUpdate {
-                address,
-                prev_account,
-                curr_account,
-            } = update;
-            if let Some(prev_account) = prev_account {
-                let prev_lt_hash = AccountsDb::lt_hash_account(&prev_account, &address);
-                accum_lt_hash.mix_out(&prev_lt_hash.0);
-            }
-            if let Some(curr_account) = curr_account {
-                let curr_lt_hash = AccountsDb::lt_hash_account(&curr_account, &address);
-                accum_lt_hash.mix_in(&curr_lt_hash.0);
-            }
+        let AccountsLtHashUpdate {
+            address,
+            prev_account,
+            curr_account,
+        } = update;
+        if let Some(prev_account) = prev_account {
+            let prev_lt_hash = AccountsDb::lt_hash_account(&prev_account, &address);
+            accum_lt_hash.mix_out(&prev_lt_hash.0);
+        }
+        if let Some(curr_account) = curr_account {
+            let curr_lt_hash = AccountsDb::lt_hash_account(&curr_account, &address);
+            accum_lt_hash.mix_in(&curr_lt_hash.0);
         }
         accum_lt_hash
     }
@@ -299,41 +204,11 @@ impl AccountsLtHashAsyncProgress {
     /// Drains all available results from `results_receiver`, and then
     /// accumulates them into `accumulator`.
     #[inline]
-    fn collect_available_results(
-        results_receiver: &Receiver<AccountsLtHashAccumulator>,
-        accumulator: &mut AccountsLtHashAccumulator,
-    ) {
+    fn collect_available_results(accumulator: &mut LtHash, results_receiver: &Receiver<LtHash>) {
         while let Ok(result) = results_receiver.try_recv() {
-            accumulator.accumulate(result);
+            accumulator.mix_in(&result);
         }
     }
-}
-
-/// A batch of accounts lt hash updates to process.
-#[derive(Default)]
-struct AccountsLtHashBatch {
-    updates: Vec<AccountsLtHashUpdate>,
-    hash_cost: Saturating<u64>,
-}
-
-/// The struct to accumulate results from processing a batch of updates.
-#[derive(Debug)]
-struct AccountsLtHashAccumulator {
-    lt_hash: LtHash,
-    stats: UpdateStats,
-}
-
-impl AccountsLtHashAccumulator {
-    fn accumulate(&mut self, other: Self) {
-        self.lt_hash.mix_in(&other.lt_hash);
-        self.stats.num_updates += other.stats.num_updates;
-    }
-}
-
-/// Stats from processing a batch of updates.
-#[derive(Debug, Default)]
-struct UpdateStats {
-    num_updates: Saturating<u64>,
 }
 
 /// A single accounts lt hash update to process.
@@ -342,39 +217,6 @@ struct AccountsLtHashUpdate {
     address: Pubkey,
     prev_account: Option<AccountSharedData>,
     curr_account: Option<AccountSharedData>,
-}
-
-/// The number of lt hash updates to batch up before sending to the async thread pool.
-///
-/// The 14 KiB number is the current largest size of jemalloc's "small slab" bins.
-const MAX_UPDATES_PER_BATCH: usize = (14 * 1024) / size_of::<AccountsLtHashUpdate>();
-const _: () = assert!(MAX_UPDATES_PER_BATCH > 0);
-
-/// Get the freelist of vectors to use for batching updates.
-fn batched_updates_freelist() -> &'static VecFreelist<AccountsLtHashUpdate> {
-    // Derived empirically while observing an unstaked node on mnb.
-    const MAX_CONTAINERS: usize = 2_000;
-    static FREELIST: LazyLock<VecFreelist<AccountsLtHashUpdate>> = LazyLock::new(|| {
-        VecFreelist::new(MAX_CONTAINERS, Some(MAX_BYTES_BATCHED_UPDATES_FREELIST))
-    });
-    &FREELIST
-}
-
-/// A pending update, used to put into batches for processing.
-#[derive(Debug)]
-struct PendingUpdate {
-    update: AccountsLtHashUpdate,
-    hash_cost: Saturating<u64>,
-}
-
-/// Get the freelist of vectors to use for holding pending updates.
-fn pending_updates_freelist() -> &'static VecFreelist<PendingUpdate> {
-    // Derived empirically while observing an unstaked node on mnb.
-    const MAX_CONTAINERS: usize = 50;
-    static FREELIST: LazyLock<VecFreelist<PendingUpdate>> = LazyLock::new(|| {
-        VecFreelist::new(MAX_CONTAINERS, Some(MAX_BYTES_PENDING_UPDATES_FREELIST))
-    });
-    &FREELIST
 }
 
 /// Get the freelist of hashsets to use for seen accounts.
@@ -387,7 +229,6 @@ fn seen_accounts_freelist() -> &'static HashSetFreelist<Pubkey> {
     &FREELIST
 }
 
-type VecFreelist<T> = ContainerFreelist<Vec<T>>;
 type HashSetFreelist<T> = ContainerFreelist<ahash::HashSet<T>>;
 
 /// Freelist of containers, to avoid repeat allocations/deallocations.
@@ -528,46 +369,6 @@ impl<T> Container for ahash::HashSet<T> {
     }
 }
 
-/// Calculates the cost of hashing an account.
-///
-/// Which is an approximation based on the number of bytes to hash.
-#[inline]
-fn calc_hash_cost(account: Option<&impl ReadableAccount>) -> Saturating<u64> {
-    const ACCOUNT_HASH_METADATA_BYTES: u64 = 8 /* lamports */
-    + 1 /* executable */
-    + 32 /* owner */
-    + 32 /* address */;
-
-    let hash_cost = account.map_or(0, |account| {
-        if account.lamports() == 0 {
-            0
-        } else {
-            ACCOUNT_HASH_METADATA_BYTES.saturating_add(account.data().len() as u64)
-        }
-    });
-    Saturating(hash_cost)
-}
-
-/// Splits `pending_updates` into `batches`.
-///
-/// Updates are greedily/best-effort evenly distributed into batches based "hash cost".
-fn batch_pending_updates(
-    pending_updates: &mut Vec<PendingUpdate>,
-    batches: &mut [AccountsLtHashBatch],
-) {
-    debug_assert!(!batches.is_empty());
-    pending_updates.sort_unstable_by_key(|pending_update| cmp::Reverse(pending_update.hash_cost));
-    for pending_update in pending_updates.drain(..) {
-        let batch = batches
-            .iter_mut()
-            .min_by_key(|batch| batch.hash_cost)
-            .unwrap();
-        let PendingUpdate { update, hash_cost } = pending_update;
-        batch.hash_cost += hash_cost;
-        batch.updates.push(update);
-    }
-}
-
 /// Returns the thread pool for asynchronous accounts hashing.
 ///
 /// Note, the thread pool will be created on first call.
@@ -606,7 +407,7 @@ mod tests {
         solana_pubkey::{self as pubkey, Pubkey},
         solana_rent::Rent,
         solana_signer::Signer as _,
-        std::{array, cmp, iter, str::FromStr as _, sync::Arc},
+        std::{cmp, iter, str::FromStr as _, sync::Arc},
         tempfile::TempDir,
         test_case::{test_case, test_matrix},
     };
@@ -1074,7 +875,8 @@ mod tests {
     fn test_container_freelist_max_capacity() {
         let max_capacity = 77;
         let max_bytes = max_capacity * size_of::<u64>();
-        let mut freelist = VecFreelist::<u64>::new(10, Some(max_bytes));
+        // brooks TODO: change to hashset freelist
+        let mut freelist = ContainerFreelist::<Vec<u64>>::new(10, Some(max_bytes));
 
         // pushing a vec that is too big will not actually push
         freelist.try_push(Vec::with_capacity(max_capacity + 1));
@@ -1101,34 +903,5 @@ mod tests {
         assert_eq!(stats2.num_containers, 2);
         assert_eq!(stats2.capacity_elems, max_capacity + 1);
         assert_eq!(stats2.capacity_bytes, max_bytes + size_of::<u64>());
-    }
-
-    /// Ensure batching the pending updates is fair.
-    #[test]
-    fn test_batch_pending_updates() {
-        let mut pending_updates: Vec<_> = [1, 4, 333, 2, 3, 5, 123_456_789, 8, 7, 9, 6]
-            .into_iter()
-            .map(|hash_cost| PendingUpdate {
-                update: AccountsLtHashUpdate {
-                    address: Pubkey::new_unique(),
-                    prev_account: None,
-                    curr_account: None,
-                },
-                hash_cost: Saturating(hash_cost),
-            })
-            .collect();
-        let mut batches: [AccountsLtHashBatch; 4] =
-            array::from_fn(|_| AccountsLtHashBatch::default());
-
-        batch_pending_updates(&mut pending_updates, &mut batches);
-
-        // sort to make assertions deterministic
-        batches.sort_unstable_by_key(|batch| batch.hash_cost);
-
-        let batch_costs: Vec<_> = batches.iter().map(|batch| batch.hash_cost.0).collect();
-        assert_eq!(batch_costs, vec![22, 23, 333, 123_456_789]);
-
-        let batch_lens: Vec<_> = batches.iter().map(|batch| batch.updates.len()).collect();
-        assert_eq!(batch_lens, vec![4, 5, 1, 1]);
     }
 }
