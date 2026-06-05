@@ -1,13 +1,15 @@
 use {
     super::Bank,
-    crossbeam_channel::{Receiver, Sender},
     crossbeam_queue::ArrayQueue,
+    crossbeam_utils::CachePadded,
     rayon::{ThreadPool, ThreadPoolBuilder},
     solana_account::{AccountSharedData, ReadableAccount, accounts_equal},
     solana_accounts_db::{accounts_db::AccountsDb, storable_accounts::StorableAccounts},
     solana_lattice_hash::lt_hash::LtHash,
     solana_pubkey::Pubkey,
     std::{
+        array,
+        cell::UnsafeCell,
         sync::{
             Arc, LazyLock,
             atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -83,15 +85,13 @@ impl Bank {
     ///
     /// This function waits for any in-flight jobs on the accounts hasher threads,
     /// computes their combined delta lt hash, then mixes it into the bank.
-    pub(crate) fn finish_accounts_lt_hash_updates(&self) {
+    pub fn finish_accounts_lt_hash_updates(&self) {
         let timer = Instant::now();
-        let (delta_lt_hash, num_jobs_total) =
-            self.accounts_lt_hash_async_progress.wait_for_all_results();
-        self.accounts_lt_hash
-            .lock()
-            .unwrap()
-            .0
-            .mix_in(&delta_lt_hash);
+        let num_jobs_total = {
+            let mut accounts_lt_hash = self.accounts_lt_hash.lock().unwrap();
+            self.accounts_lt_hash_async_progress
+                .finish(&mut accounts_lt_hash.0)
+        };
         let finish_time = timer.elapsed();
 
         let seen_accounts_freelist_stats = seen_accounts_freelist().stats();
@@ -121,8 +121,7 @@ impl Bank {
 
 /// Struct for tracking progress of the asynchronous accounts lt hashing for a Bank.
 pub struct AccountsLtHashAsyncProgress {
-    results_sender: Sender<LtHash>,
-    results_receiver: Receiver<LtHash>,
+    accumulators: Arc<[CachePadded<ThreadAccumulator>; NUM_ACCOUNTS_HASHER_THREADS]>,
     num_jobs_pending: Arc<AtomicUsize>,
     num_jobs_total: AtomicU64,
 }
@@ -130,15 +129,10 @@ pub struct AccountsLtHashAsyncProgress {
 impl AccountsLtHashAsyncProgress {
     /// Creates a new AccountsLtHashAsyncProgress variable, which is suitable for a new Bank.
     pub fn new() -> Self {
-        // Since (1) there is a fixed number of accounts hasher threads, and (2) each thread
-        // drains all pending results from the channel before sending theirs, then the
-        // results channel should never have more than NUM_ACCOUNTS_HASHER_THREADS messages.
-        // The `* 2` doubling is just-in-case padding.
-        const CHANNEL_CAPACITY: usize = NUM_ACCOUNTS_HASHER_THREADS * 2;
-        let (results_sender, results_receiver) = crossbeam_channel::bounded(CHANNEL_CAPACITY);
         Self {
-            results_sender,
-            results_receiver,
+            accumulators: Arc::new(array::from_fn(|_| {
+                CachePadded::new(ThreadAccumulator::new())
+            })),
             num_jobs_pending: Arc::new(AtomicUsize::new(0)),
             num_jobs_total: AtomicU64::new(0),
         }
@@ -149,42 +143,70 @@ impl AccountsLtHashAsyncProgress {
         self.num_jobs_pending.fetch_add(1, Ordering::Release);
         self.num_jobs_total.fetch_add(1, Ordering::Relaxed);
         thread_pool.spawn({
-            let results_sender = self.results_sender.clone();
-            let results_receiver = self.results_receiver.clone();
+            let accumulators = Arc::clone(&self.accumulators);
             let num_jobs_pending = Arc::clone(&self.num_jobs_pending);
             move || {
-                let mut result = Self::process(update);
-                Self::collect_available_results(&mut result, &results_receiver);
+                // SAFETY: We always call from the same/correct Rayon thread pool.
+                let worker_index = thread_pool.current_thread_index().unwrap();
 
-                // SAFETY: Sending never fails because...
-                // * channel never disconnects: each holds a receiver too
-                // * channel is never full: each hasher thread drains the channel before sending
-                results_sender.try_send(result).unwrap();
+                // SAFETY: There are num_threads accumulators, and each
+                // thread's index shall always be in range 0..num_threads.
+                debug_assert!(worker_index < accumulators.len());
+                let accumulator = unsafe { accumulators.get_unchecked(worker_index) };
 
-                // Decrement the number of pending jobs happens *after* sending the result
-                // to the channel.  This ensures `wait_for_all_results()` cannot observe
-                // zero pending jobs until all results are available to drain.
+                // SAFETY:
+                // - The pointer is non-null, not dangling, and is properly aligned,
+                //   since it came from `accumualtor` above.
+                // - While the &mut is alive, the data within the UnsafeCell is not accessed.
+                // - While the ref is alive, The data within the UnsafeCell is not deallocated.
+                // - We guarantee each worker thread has its own accumulator, and each
+                //   worker can only execute one job at a time.
+                //   Therefore there are no other writers to this memory.
+                // - We guarantee there are no readers until after all jobs have completed.
+                //   Therefore there are no concurrent, nor unsynchronized, memory accesses.
+                let accum_lt_hash = unsafe { &mut *accumulator.inner.get() };
+
+                Self::process(accum_lt_hash, update);
+
+                // Decrementing the number of pending jobs MUST happen *after*
+                // accumulating the result.  This ensures `finish()` cannot
+                // observe zero pending jobs until all workers are done.
+                // This also enforces the synchronization of the accumulators,
+                // so there are no data races nor aliasing.
                 num_jobs_pending.fetch_sub(1, Ordering::Release);
             }
         });
     }
 
-    /// Waits for all pending jobs to complete, then returns:
-    /// * the overall accounts lt hash
-    /// * the number of asynchronous jobs
-    fn wait_for_all_results(&self) -> (LtHash, u64) {
+    /// Waits for all pending jobs to complete, then mixes the results into `lt_hash`.
+    ///
+    /// Returns the number of asynchronous jobs completed.
+    ///
+    /// Note: Since an LtHash is large, `lt_hash` is passed as an in-out parameter.
+    /// This it to avoid Rust compiler bug that fails to perform return value optimization.
+    fn finish(&self, lt_hash: &mut LtHash) -> u64 {
+        // Wait for all pending jobs to complete.  This also enforces the synchronization
+        // of the accumulators so there is no aliasing nor data races.
         while self.num_jobs_pending.load(Ordering::Acquire) > 0 {
             // Spin, do not yield! This is called by Bank::freeze() and we want to be fast.
         }
 
-        let mut accumulator = LtHash::identity();
-        Self::collect_available_results(&mut accumulator, &self.results_receiver);
-        (accumulator, self.num_jobs_total.load(Ordering::Relaxed))
+        for thread_accumulator in self.accumulators.iter() {
+            // SAFETY:
+            // - Refer to the comments in `spawn()` above.
+            // - `num_jobs_pending` synchronizes access to ensure there are no workers
+            //   concurrently accessing their accumulator.
+            let thread_lt_hash = unsafe { &*thread_accumulator.inner.get() };
+            lt_hash.mix_in(thread_lt_hash);
+        }
+        self.num_jobs_total.load(Ordering::Relaxed)
     }
 
-    /// Processes `update` and returns its accounts lt hash.
-    fn process(update: AccountsLtHashUpdate) -> LtHash {
-        let mut accum_lt_hash = LtHash::identity();
+    /// Processes `update` and mixes the result into `accum_lt_hash`.
+    ///
+    /// Note: Since an LtHash is large, `accum_lt_hash` is passed as an in-out parameter.
+    /// This it to avoid Rust compiler bug that fails to perform return value optimization.
+    fn process(accum_lt_hash: &mut LtHash, update: AccountsLtHashUpdate) {
         let AccountsLtHashUpdate {
             address,
             prev_account,
@@ -198,15 +220,22 @@ impl AccountsLtHashAsyncProgress {
             let curr_lt_hash = AccountsDb::lt_hash_account(&curr_account, &address);
             accum_lt_hash.mix_in(&curr_lt_hash.0);
         }
-        accum_lt_hash
     }
+}
 
-    /// Drains all available results from `results_receiver`, and then
-    /// accumulates them into `accumulator`.
-    #[inline]
-    fn collect_available_results(accumulator: &mut LtHash, results_receiver: &Receiver<LtHash>) {
-        while let Ok(result) = results_receiver.try_recv() {
-            accumulator.mix_in(&result);
+/// A per-thread accounts lt hash accumulator
+struct ThreadAccumulator {
+    inner: UnsafeCell<LtHash>,
+}
+
+// SAFETY: Users guarantee that each ThreadAccumulator has a maximum of one writer
+// at a time, and that readers only access after all writing has completed.
+unsafe impl Sync for ThreadAccumulator {}
+
+impl ThreadAccumulator {
+    const fn new() -> Self {
+        Self {
+            inner: UnsafeCell::new(LtHash::identity()),
         }
     }
 }
@@ -875,7 +904,6 @@ mod tests {
     fn test_container_freelist_max_capacity() {
         let max_capacity = 77;
         let max_bytes = max_capacity * size_of::<u64>();
-        // brooks TODO: change to hashset freelist
         let mut freelist = ContainerFreelist::<Vec<u64>>::new(10, Some(max_bytes));
 
         // pushing a vec that is too big will not actually push
