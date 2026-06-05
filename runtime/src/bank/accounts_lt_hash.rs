@@ -258,12 +258,10 @@ fn seen_accounts_freelist() -> &'static HashSetFreelist<Pubkey> {
     &FREELIST
 }
 
-type HashSetFreelist<T> = ContainerFreelist<ahash::HashSet<T>>;
-
 /// Freelist of containers, to avoid repeat allocations/deallocations.
 #[derive(Debug)]
-struct ContainerFreelist<C> {
-    list: ArrayQueue<C>,
+struct HashSetFreelist<T> {
+    list: ArrayQueue<ahash::HashSet<T>>,
 
     /// the maximum capacity, in elements, this freelist will hold
     max_capacity: Option<usize>,
@@ -273,7 +271,7 @@ struct ContainerFreelist<C> {
     total_capacity: AtomicUsize,
 }
 
-impl<C: Container> ContainerFreelist<C> {
+impl<T> HashSetFreelist<T> {
     /// Creates a new, empty, freelist.
     ///
     /// max_containers:
@@ -284,7 +282,7 @@ impl<C: Container> ContainerFreelist<C> {
     /// * This value corresponds to the total capacity across all the containers in the freelist.
     /// * If `None`, there is no maximum.
     fn new(max_containers: usize, max_bytes: Option<usize>) -> Self {
-        let max_capacity = max_bytes.map(|max_bytes| max_bytes / size_of::<C::ElemT>());
+        let max_capacity = max_bytes.map(|max_bytes| max_bytes / size_of::<T>());
         Self {
             list: ArrayQueue::new(max_containers),
             max_capacity,
@@ -294,7 +292,7 @@ impl<C: Container> ContainerFreelist<C> {
     }
 
     /// Pushes `container` on to the freelist (IFF its capacity is greater than zero).
-    fn try_push(&self, mut container: C) {
+    fn try_push(&self, mut container: ahash::HashSet<T>) {
         // If the capacity is zero, then the container never allocated.
         // In that case, don't waste time putting it back into the freelist,
         // since there's nothing of value to reuse.
@@ -331,7 +329,7 @@ impl<C: Container> ContainerFreelist<C> {
     /// Pops a container off the freelist and returns it.
     ///
     /// The returned container will always be empty.
-    fn try_pop(&self) -> Option<C> {
+    fn try_pop(&self) -> Option<ahash::HashSet<T>> {
         let container = self.list.pop()?;
         assert!(container.is_empty());
         self.num_containers.fetch_sub(1, Ordering::Relaxed);
@@ -346,7 +344,7 @@ impl<C: Container> ContainerFreelist<C> {
         FreelistStats {
             num_containers: self.num_containers.load(Ordering::Relaxed),
             capacity_elems,
-            capacity_bytes: capacity_elems * size_of::<C::ElemT>(),
+            capacity_bytes: capacity_elems * size_of::<T>(),
         }
     }
 }
@@ -360,42 +358,6 @@ struct FreelistStats {
     capacity_elems: usize,
     /// the capacity, in bytes, across all the containers in the freelist
     capacity_bytes: usize,
-}
-
-/// Methods that a container must implement to be used by ContainerFreelist.
-trait Container {
-    type ElemT;
-    const _CHECK_ELEM_SIZE: () = assert!(size_of::<Self::ElemT>() > 0);
-
-    fn is_empty(&self) -> bool;
-    fn capacity(&self) -> usize;
-    fn clear(&mut self);
-}
-
-impl<T> Container for Vec<T> {
-    type ElemT = T;
-    fn is_empty(&self) -> bool {
-        self.is_empty()
-    }
-    fn capacity(&self) -> usize {
-        self.capacity()
-    }
-    fn clear(&mut self) {
-        self.clear();
-    }
-}
-
-impl<T> Container for ahash::HashSet<T> {
-    type ElemT = T;
-    fn is_empty(&self) -> bool {
-        self.is_empty()
-    }
-    fn capacity(&self) -> usize {
-        self.capacity()
-    }
-    fn clear(&mut self) {
-        self.clear();
-    }
 }
 
 /// Returns the thread pool for asynchronous accounts hashing.
@@ -899,37 +861,49 @@ mod tests {
         assert_eq!(roundtrip_bank, *bank);
     }
 
-    /// Ensure ContainerFreelist respects max size.
+    /// Ensure freelist respects max size.
     #[test]
-    fn test_container_freelist_max_capacity() {
-        let max_capacity = 77;
-        let max_bytes = max_capacity * size_of::<u64>();
-        let mut freelist = ContainerFreelist::<Vec<u64>>::new(10, Some(max_bytes));
+    fn test_freelist_max_capacity() {
+        use ahash::HashSetExt as _;
+        type Container = ahash::HashSet<u64>;
 
-        // pushing a vec that is too big will not actually push
-        freelist.try_push(Vec::with_capacity(max_capacity + 1));
+        // This test uses a hashbrown container, which has some special power-of-two sizing plus
+        // a buffer.  So create the container first, and use that to derive the max capacity.
+        let container = Container::with_capacity(77);
+
+        let max_capacity = container.capacity();
+        let max_bytes = max_capacity * size_of::<u64>();
+        let mut freelist = HashSetFreelist::new(10, Some(max_bytes));
+
+        // pushing a container that is too big will not actually push
+        freelist.try_push(Container::with_capacity(max_capacity + 1));
         let stats0 = freelist.stats();
         assert_eq!(stats0.num_containers, 0);
         assert_eq!(stats0.capacity_elems, 0);
         assert_eq!(stats0.capacity_bytes, 0);
 
-        // pushing a vec that is not too big will actually push
-        freelist.try_push(Vec::with_capacity(max_capacity));
+        // pushing a container that is not too big will actually push
+        freelist.try_push(container);
         let stats1 = freelist.stats();
         assert_eq!(stats1.num_containers, 1);
         assert_eq!(stats1.capacity_elems, max_capacity);
         assert_eq!(stats1.capacity_bytes, max_bytes);
 
-        // pushing a vec that would exceed capacity will not push
-        freelist.try_push(Vec::with_capacity(1));
+        // pushing a container that would exceed capacity will not push
+        freelist.try_push(Container::with_capacity(1));
         assert_eq!(freelist.stats(), stats1);
 
         // ...but, if we remove the limit, push should work again
         freelist.max_capacity = None;
-        freelist.try_push(Vec::with_capacity(1));
+        let container = Container::with_capacity(1);
+        let container_capacity = container.capacity();
+        freelist.try_push(container);
         let stats2 = freelist.stats();
         assert_eq!(stats2.num_containers, 2);
-        assert_eq!(stats2.capacity_elems, max_capacity + 1);
-        assert_eq!(stats2.capacity_bytes, max_bytes + size_of::<u64>());
+        assert_eq!(stats2.capacity_elems, max_capacity + container_capacity);
+        assert_eq!(
+            stats2.capacity_bytes,
+            max_bytes + container_capacity * size_of::<u64>(),
+        );
     }
 }
