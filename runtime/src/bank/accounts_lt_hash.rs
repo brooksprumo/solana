@@ -251,6 +251,7 @@ struct AccountsLtHashUpdate {
 /// Get the freelist of hashsets to use for seen accounts.
 fn seen_accounts_freelist() -> &'static HashSetFreelist<Pubkey> {
     // Derived empirically while observing an unstaked node on mnb.
+    // Should end up being the same number as replay threads.
     const MAX_CONTAINERS: usize = 50;
     static FREELIST: LazyLock<HashSetFreelist<Pubkey>> = LazyLock::new(|| {
         HashSetFreelist::new(MAX_CONTAINERS, Some(MAX_BYTES_SEEN_ACCOUNTS_FREELIST))
