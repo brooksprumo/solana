@@ -3,7 +3,7 @@ use {
     crossbeam_queue::ArrayQueue,
     crossbeam_utils::CachePadded,
     rayon::{ThreadPool, ThreadPoolBuilder},
-    solana_account::{AccountSharedData, ReadableAccount, accounts_equal},
+    solana_account::{AccountSharedData, ReadableAccount},
     solana_accounts_db::{accounts_db::AccountsDb, storable_accounts::StorableAccounts},
     solana_lattice_hash::lt_hash::LtHash,
     solana_pubkey::Pubkey,
@@ -51,24 +51,18 @@ impl Bank {
             let curr_account = accounts.account(index, |account| {
                 (account.lamports() != 0).then(|| account.take_account())
             });
-            match (&prev_account, &curr_account) {
-                (None, None) => {
-                    // the account was ephemeral; skip it
-                }
-                (Some(a), Some(b)) if accounts_equal(a, b) => {
-                    // the account was not modified; skip it
-                }
-                _ => {
-                    // the account was modified; enqueue this update
-                    async_progress.spawn(
-                        thread_pool,
-                        AccountsLtHashUpdate {
-                            address: *address,
-                            prev_account,
-                            curr_account,
-                        },
-                    );
-                }
+            if prev_account.is_none() && curr_account.is_none() {
+                // the account was ephemeral; skip it
+            } else {
+                // the account was modified; enqueue this update
+                async_progress.spawn(
+                    thread_pool,
+                    AccountsLtHashUpdate {
+                        address: *address,
+                        prev_account,
+                        curr_account,
+                    },
+                );
             }
         }
 
