@@ -8,11 +8,10 @@ use {
     solana_lattice_hash::lt_hash::LtHash,
     solana_pubkey::Pubkey,
     std::{
-        array,
-        cell::UnsafeCell,
-        hint,
+        array, hint,
+        mem::size_of,
         sync::{
-            Arc, LazyLock,
+            Arc, LazyLock, Mutex,
             atomic::{AtomicU64, AtomicUsize, Ordering},
         },
         time::Instant,
@@ -116,7 +115,33 @@ impl Bank {
 
 /// Struct for tracking progress of the asynchronous accounts lt hashing for a Bank.
 pub struct AccountsLtHashAsyncProgress {
-    accumulators: Arc<[CachePadded<ThreadAccumulator>; NUM_ACCOUNTS_HASHER_THREADS]>,
+    // Note: use [Mutex<CachePadded<LtHash>>] and *not* [CachePadded<Mutex<LtHash>>].
+    // - In both ways each mutex is on its own separate cache line.
+    // - In both ways the size used for each element, including padding, is the same.
+    // - Only this way ensures that each LtHash is placed for aligned SIMD/AVX access.
+    //
+    // Here's the layout of [Mutex<CachePadded<LtHash>>; 2]
+    //
+    //  │element 0                         │element 1
+    //  │                                  │
+    //  ▼───────┬─────────┬────────────────▼───────┬─────────┬────────────────┐
+    //  │ Mutex │ padding │     LtHash     │ Mutex │ padding │     LtHash     │
+    //  ├───────┼─────────┼────────────────┼───────┼─────────┼────────────────┤
+    //  │       │         │                │       │         │                │
+    //  │0      │6        │128 <-- aligned │2176   │2182     │2304            │4352
+    //
+    //
+    // And here's the layout of [CachePadded<Mutex<LtHash>>; 2]
+    //
+    //  │element 0                         │element 1
+    //  │                                  │
+    //  ▼───────┬────────────────┬─────────▼───────┬────────────────┬─────────┐
+    //  │ Mutex │     LtHash     │ padding │ Mutex │     LtHash     │ padding │
+    //  ├───────┼────────────────┼─────────┼───────┼────────────────┼─────────┤
+    //  │       │                │         │       │                │         │
+    //  │0      │6 <-- unaligned │2054     │2176   │2182            │4230     │4352
+    //
+    accumulators: Arc<[Mutex<CachePadded<LtHash>>; NUM_ACCOUNTS_HASHER_THREADS]>,
     num_jobs_pending: Arc<AtomicUsize>,
     num_jobs_total: AtomicU64,
 }
@@ -126,7 +151,7 @@ impl AccountsLtHashAsyncProgress {
     pub fn new() -> Self {
         Self {
             accumulators: Arc::new(array::from_fn(|_| {
-                CachePadded::new(ThreadAccumulator::new())
+                Mutex::new(CachePadded::new(LtHash::identity()))
             })),
             num_jobs_pending: Arc::new(AtomicUsize::new(0)),
             num_jobs_total: AtomicU64::new(0),
@@ -149,25 +174,11 @@ impl AccountsLtHashAsyncProgress {
                 debug_assert!(worker_index < accumulators.len());
                 let accumulator = unsafe { accumulators.get_unchecked(worker_index) };
 
-                // SAFETY:
-                // - The pointer is non-null, not dangling, and is properly aligned,
-                //   since it came from `accumulator` above.
-                // - While the &mut is alive, the data within the UnsafeCell is not accessed.
-                // - While the ref is alive, The data within the UnsafeCell is not deallocated.
-                // - We guarantee each worker thread has its own accumulator, and each
-                //   worker can only execute one job at a time.
-                //   Therefore there are no other writers to this memory.
-                // - We guarantee there are no readers until after all jobs have completed.
-                //   Therefore there are no concurrent, nor unsynchronized, memory accesses.
-                let accum_lt_hash = unsafe { &mut *accumulator.inner.get() };
-
-                Self::process(accum_lt_hash, update);
+                Self::process(&mut accumulator.lock().unwrap(), update);
 
                 // Decrementing the number of pending jobs MUST happen *after*
                 // accumulating the result.  This ensures `finish()` cannot
                 // observe zero pending jobs until all workers are done.
-                // This also enforces the synchronization of the accumulators,
-                // so there are no data races nor aliasing.
                 num_jobs_pending.fetch_sub(1, Ordering::Release);
             }
         });
@@ -180,20 +191,13 @@ impl AccountsLtHashAsyncProgress {
     /// Note: Since an LtHash is large, `lt_hash` is passed as an in-out parameter.
     /// This it to avoid Rust compiler bug that fails to perform return value optimization.
     fn finish(&self, lt_hash: &mut LtHash) -> u64 {
-        // Wait for all pending jobs to complete.  This also enforces the synchronization
-        // of the accumulators so there is no aliasing nor data races.
         while self.num_jobs_pending.load(Ordering::Acquire) > 0 {
             // Spin, do not yield! This is called by Bank::freeze() and we want to be fast.
             hint::spin_loop();
         }
 
         for thread_accumulator in self.accumulators.iter() {
-            // SAFETY:
-            // - Refer to the comments in `spawn()` above.
-            // - `num_jobs_pending` synchronizes access to ensure there are no workers
-            //   concurrently accessing their accumulator.
-            let thread_lt_hash = unsafe { &*thread_accumulator.inner.get() };
-            lt_hash.mix_in(thread_lt_hash);
+            lt_hash.mix_in(&thread_accumulator.lock().unwrap());
         }
         self.num_jobs_total.load(Ordering::Relaxed)
     }
@@ -215,23 +219,6 @@ impl AccountsLtHashAsyncProgress {
         if let Some(curr_account) = curr_account {
             let curr_lt_hash = AccountsDb::lt_hash_account(&curr_account, &address);
             accum_lt_hash.mix_in(&curr_lt_hash.0);
-        }
-    }
-}
-
-/// A per-thread accounts lt hash accumulator
-struct ThreadAccumulator {
-    inner: UnsafeCell<LtHash>,
-}
-
-// SAFETY: Users guarantee that each ThreadAccumulator has a maximum of one writer
-// at a time, and that readers only access after all writing has completed.
-unsafe impl Sync for ThreadAccumulator {}
-
-impl ThreadAccumulator {
-    const fn new() -> Self {
-        Self {
-            inner: UnsafeCell::new(LtHash::identity()),
         }
     }
 }
