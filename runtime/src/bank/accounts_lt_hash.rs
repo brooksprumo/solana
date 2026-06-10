@@ -156,7 +156,7 @@ impl AccountsLtHashAsyncProgress {
 
                 // SAFETY:
                 // - The pointer is non-null, not dangling, and is properly aligned,
-                //   since it came from `accumualtor` above.
+                //   since it came from `accumulator` above.
                 // - While the &mut is alive, the data within the UnsafeCell is not accessed.
                 // - While the ref is alive, The data within the UnsafeCell is not deallocated.
                 // - We guarantee each worker thread has its own accumulator, and each
