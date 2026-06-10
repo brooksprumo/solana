@@ -10,6 +10,7 @@ use {
     std::{
         array,
         cell::UnsafeCell,
+        hint,
         sync::{
             Arc, LazyLock,
             atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -183,6 +184,7 @@ impl AccountsLtHashAsyncProgress {
         // of the accumulators so there is no aliasing nor data races.
         while self.num_jobs_pending.load(Ordering::Acquire) > 0 {
             // Spin, do not yield! This is called by Bank::freeze() and we want to be fast.
+            hint::spin_loop();
         }
 
         for thread_accumulator in self.accumulators.iter() {
