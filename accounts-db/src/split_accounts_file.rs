@@ -66,11 +66,11 @@ const HEADER_SLOT_OFFSET: usize = 16;
 const HEADER_ID_OFFSET: usize = 24;
 const HEADER_USED_LEN_OFFSET: usize = 32;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) struct DataLocation {
-    slot: Slot,
-    id: u32,
-    offset: Offset,
+    pub(crate) slot: Slot,
+    pub(crate) id: u32,
+    pub(crate) offset: Offset,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -94,9 +94,10 @@ struct SplitStoredAccount {
 
 /// Account storage backed by separate metadata and data files.
 ///
-/// The account index points at offsets in the meta file.  In this first
-/// milestone, each meta entry owns its data entry if it has one; data references
-/// are not shared between account versions yet.
+/// The account index points at offsets in the meta file. Data entries can be
+/// referenced by newer metadata entries in sibling split stores. A reusable
+/// reference is only created after validating that the old data entry matches
+/// the new account bytes.
 #[derive(Debug)]
 pub struct SplitAccountsFile {
     base_path: PathBuf,
@@ -292,6 +293,14 @@ impl SplitAccountsFile {
         &self.meta_path
     }
 
+    pub(crate) fn can_reference_data_from(&self, other: &Self) -> bool {
+        fn parent_or_empty(path: &Path) -> &Path {
+            path.parent().unwrap_or_else(|| Path::new(""))
+        }
+
+        parent_or_empty(&self.data_path) == parent_or_empty(&other.data_path)
+    }
+
     pub(crate) fn get_stored_account_without_data_callback<Ret>(
         &self,
         offset: usize,
@@ -405,14 +414,74 @@ impl SplitAccountsFile {
         data_lens
     }
 
+    pub(crate) fn get_account_stored_sizes(&self, sorted_offsets: &[usize]) -> Vec<usize> {
+        let mut stored_sizes = Vec::with_capacity(sorted_offsets.len());
+        for &offset in sorted_offsets {
+            let Some(account) = self.read_meta_account(offset) else {
+                break;
+            };
+            stored_sizes.push(self.account_stored_size(&account));
+        }
+        stored_sizes
+    }
+
     pub(crate) fn scan_pubkeys(&self, mut callback: impl FnMut(&Pubkey)) -> io::Result<()> {
         self.scan_accounts_without_data(|_offset, account| callback(account.pubkey()))
+    }
+
+    pub(crate) fn reusable_external_data_location(
+        &self,
+        offset: Offset,
+        expected_pubkey: &Pubkey,
+        expected_data: &[u8],
+    ) -> Option<DataLocation> {
+        let account = self.read_meta_account(offset)?;
+        if &account.pubkey != expected_pubkey {
+            return None;
+        }
+
+        let SplitDataRef::External { len, location } = account.data_ref else {
+            return None;
+        };
+        if len != expected_data.len() {
+            return None;
+        }
+
+        let data = self.read_account_data(&account).ok()?;
+        (data == expected_data).then_some(location)
+    }
+
+    pub(crate) fn external_data_location(&self, offset: Offset) -> Option<DataLocation> {
+        let account = self.read_meta_account(offset)?;
+        let SplitDataRef::External { location, .. } = account.data_ref else {
+            return None;
+        };
+        (!self.owns_data_location(location)).then_some(location)
     }
 
     pub(crate) fn write_accounts<'a>(
         &self,
         accounts: &impl StorableAccounts<'a>,
         skip: usize,
+    ) -> Option<StoredAccountsInfo> {
+        self.write_accounts_internal(accounts, skip, None)
+    }
+
+    pub(crate) fn write_accounts_with_reusable_data_refs<'a>(
+        &self,
+        accounts: &impl StorableAccounts<'a>,
+        skip: usize,
+        reusable_data_refs: &[Option<DataLocation>],
+    ) -> Option<StoredAccountsInfo> {
+        assert_eq!(accounts.len(), reusable_data_refs.len());
+        self.write_accounts_internal(accounts, skip, Some(reusable_data_refs))
+    }
+
+    fn write_accounts_internal<'a>(
+        &self,
+        accounts: &impl StorableAccounts<'a>,
+        skip: usize,
+        reusable_data_refs: Option<&[Option<DataLocation>]>,
     ) -> Option<StoredAccountsInfo> {
         assert!(self.allow_writes, "append not allowed in read-only state");
         let _lock = self.append_lock.lock().unwrap();
@@ -431,7 +500,14 @@ impl SplitAccountsFile {
             accounts.account_default_if_zero_lamport(i, |account| {
                 let data_len = account.data().len();
                 let meta_stored_size = Self::calculate_meta_stored_size(data_len);
-                let data_stored_size = if should_store_internal(data_len) {
+                let reusable_data_ref = reusable_data_refs
+                    .and_then(|refs| refs.get(i))
+                    .copied()
+                    .flatten()
+                    .filter(|_| data_len != 0 && !should_store_internal(data_len));
+                let data_stored_size = if should_store_internal(data_len)
+                    || reusable_data_ref.is_some()
+                {
                     0
                 } else {
                     Self::calculate_data_stored_size(data_len)
@@ -451,6 +527,11 @@ impl SplitAccountsFile {
                     SplitDataRef::None
                 } else if should_store_internal(data_len) {
                     SplitDataRef::Internal { len: data_len }
+                } else if let Some(location) = reusable_data_ref {
+                    SplitDataRef::External {
+                        len: data_len,
+                        location,
+                    }
                 } else {
                     self.write_data_entry(aligned_data_offset, account.pubkey(), account.data())
                         .expect("must append split data entry");
@@ -518,11 +599,11 @@ impl SplitAccountsFile {
         Ok(bytes)
     }
 
-    fn meta_len(&self) -> usize {
+    pub(crate) fn meta_len(&self) -> usize {
         self.meta_current_len.load(Ordering::Acquire)
     }
 
-    fn data_len(&self) -> usize {
+    pub(crate) fn data_len(&self) -> usize {
         self.data_current_len.load(Ordering::Acquire)
     }
 
@@ -536,6 +617,18 @@ impl SplitAccountsFile {
 
     fn calculate_data_stored_size(data_len: usize) -> usize {
         align_usize(DATA_ENTRY_FIXED_SIZE.saturating_add(data_len), DATA_ALIGNMENT)
+    }
+
+    fn account_stored_size(&self, account: &SplitStoredAccount) -> usize {
+        let data_stored_size = match account.data_ref {
+            SplitDataRef::External { len, location } if self.owns_data_location(location) => {
+                Self::calculate_data_stored_size(len)
+            }
+            SplitDataRef::None | SplitDataRef::Internal { .. } | SplitDataRef::External { .. } => {
+                0
+            }
+        };
+        account.stored_size.saturating_add(data_stored_size)
     }
 
     fn read_meta_account(&self, offset: usize) -> Option<SplitStoredAccount> {
@@ -621,24 +714,37 @@ impl SplitAccountsFile {
                 Ok(data)
             }
             SplitDataRef::External { len, location } => {
-                if location.slot != self.slot || location.id != self.id {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "split account data points outside its owning storage",
-                    ));
+                if self.owns_data_location(location) {
+                    return Self::read_data_entry_from_file(
+                        &self.data_file,
+                        self.data_len(),
+                        location.offset,
+                        &account.pubkey,
+                        len,
+                    );
                 }
-                self.read_data_entry(location.offset, &account.pubkey, len)
+
+                let data_path = data_path_for_base(&self.base_path_for_location(location));
+                let data_file_info = FileInfo::new_from_path(&data_path)?;
+                read_header(&data_file_info.file, DATA_MAGIC)?;
+                Self::read_data_entry_from_file(
+                    &data_file_info.file,
+                    data_file_info.size as usize,
+                    location.offset,
+                    &account.pubkey,
+                    len,
+                )
             }
         }
     }
 
-    fn read_data_entry(
-        &self,
+    fn read_data_entry_from_file(
+        data_file: &File,
+        data_len: usize,
         offset: usize,
         expected_pubkey: &Pubkey,
         expected_len: usize,
     ) -> io::Result<Vec<u8>> {
-        let data_len = self.data_len();
         let stored_size = Self::calculate_data_stored_size(expected_len);
         if offset
             .checked_add(stored_size)
@@ -651,7 +757,7 @@ impl SplitAccountsFile {
         }
 
         let mut fixed = [0u8; DATA_ENTRY_FIXED_SIZE];
-        read_exact_at(&self.data_file, data_len, offset, &mut fixed)?;
+        read_exact_at(data_file, data_len, offset, &mut fixed)?;
         let pubkey = Pubkey::new_from_array(
             fixed[DATA_ADDRESS_OFFSET..DATA_ADDRESS_OFFSET + 32]
                 .try_into()
@@ -670,13 +776,17 @@ impl SplitAccountsFile {
         }
 
         let mut data = vec![0; expected_len];
-        read_exact_at(
-            &self.data_file,
-            data_len,
-            offset + DATA_ENTRY_FIXED_SIZE,
-            &mut data,
-        )?;
+        read_exact_at(data_file, data_len, offset + DATA_ENTRY_FIXED_SIZE, &mut data)?;
         Ok(data)
+    }
+
+    fn owns_data_location(&self, location: DataLocation) -> bool {
+        location.slot == self.slot && location.id == self.id
+    }
+
+    fn base_path_for_location(&self, location: DataLocation) -> PathBuf {
+        self.base_path
+            .with_file_name(format!("{}.{}", location.slot, location.id))
     }
 
     fn write_data_entry(&self, offset: usize, pubkey: &Pubkey, data: &[u8]) -> io::Result<()> {
@@ -933,7 +1043,7 @@ mod tests {
     use {
         super::*,
         crate::append_vec::{AppendVec, new_scan_accounts_reader},
-        solana_account::accounts_equal,
+        solana_account::{WritableAccount, accounts_equal},
         tempfile::TempDir,
     };
 
@@ -991,6 +1101,47 @@ mod tests {
                 (stored.offsets[1], large.0, large.1.data().len()),
             ]
         );
+    }
+
+    #[test]
+    fn test_split_accounts_file_reuses_external_data_from_sibling_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let old_split = SplitAccountsFile::new(temp_dir.path().join("42.7"), true, 32 * 1024);
+        let new_split = SplitAccountsFile::new(temp_dir.path().join("43.8"), true, 32 * 1024);
+        assert!(new_split.can_reference_data_from(&old_split));
+
+        let (pubkey, account) = new_account(22, HEADER_SIZE);
+        let accounts = [(&pubkey, &account)];
+        let old_offset = old_split
+            .write_accounts(&(42, &accounts[..]), 0)
+            .unwrap()
+            .offsets[0];
+        old_split.flush().unwrap();
+        assert!(old_split.data_len() > HEADER_SIZE);
+
+        let location = old_split
+            .reusable_external_data_location(old_offset, &pubkey, account.data())
+            .unwrap();
+        let mut updated_account = account.clone();
+        updated_account.set_lamports(account.lamports() + 1);
+        let updated_accounts = [(&pubkey, &updated_account)];
+        let new_stored = new_split
+            .write_accounts_with_reusable_data_refs(
+                &(43, &updated_accounts[..]),
+                0,
+                &[Some(location)],
+            )
+            .unwrap();
+
+        assert_eq!(new_split.data_len(), HEADER_SIZE);
+        assert_eq!(
+            new_split.get_account_stored_sizes(&new_stored.offsets),
+            vec![SplitAccountsFile::calculate_meta_stored_size(account.data().len())],
+        );
+        let loaded = new_split
+            .get_account_shared_data(new_stored.offsets[0])
+            .unwrap();
+        assert!(accounts_equal(&loaded, &updated_account));
     }
 
     #[test]

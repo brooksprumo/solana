@@ -249,6 +249,70 @@ fn test_split_accounts_file_provider_flush_and_load_from_storage() {
 }
 
 #[test]
+fn test_split_flush_reuses_external_data_for_metadata_only_update() {
+    let (_temp_dirs, paths) = get_temp_accounts_paths(1).unwrap();
+    let accounts_db = AccountsDb::new_for_tests_with_provider_and_config(
+        paths,
+        AccountsFileProvider::Split,
+        ACCOUNTS_DB_CONFIG_FOR_TESTING,
+    );
+    let old_slot = 0;
+    let new_slot = 1;
+    let split_header_len = 4 * 1024;
+    let pubkey = Pubkey::new_unique();
+    let owner = Pubkey::new_unique();
+    let mut account = AccountSharedData::new(123, 8 * 1024, &owner);
+    account.set_data((0..account.data().len()).map(|i| (i % 251) as u8).collect());
+
+    accounts_db.store_for_tests((old_slot, [(&pubkey, &account)].as_slice()));
+    accounts_db.add_root(old_slot);
+    accounts_db.flush_rooted_accounts_cache(
+        Some(old_slot),
+        FlushShouldClean::Yes {
+            max_clean_root: None,
+        },
+    );
+
+    let old_storage = accounts_db.get_storage_for_slot(old_slot).unwrap();
+    let old_storage_id = old_storage.id();
+    assert!(old_storage.accounts.is_split());
+    assert!(old_storage.accounts.split_data_len_for_tests().unwrap() > split_header_len);
+
+    let mut metadata_only_update = account.clone();
+    metadata_only_update.set_lamports(account.lamports() + 1);
+    accounts_db.store_for_tests((new_slot, [(&pubkey, &metadata_only_update)].as_slice()));
+    accounts_db.add_root(new_slot);
+    accounts_db.flush_rooted_accounts_cache(
+        Some(new_slot),
+        FlushShouldClean::Yes {
+            max_clean_root: None,
+        },
+    );
+
+    let new_storage = accounts_db.get_storage_for_slot(new_slot).unwrap();
+    assert!(new_storage.accounts.is_split());
+    assert_eq!(
+        new_storage.accounts.split_data_len_for_tests().unwrap(),
+        split_header_len,
+    );
+
+    let pinned_old_storage = accounts_db
+        .storage
+        .get_account_storage_entry(old_slot, old_storage_id)
+        .unwrap();
+    assert_eq!(pinned_old_storage.count(), 0);
+    assert_eq!(pinned_old_storage.split_external_data_ref_count(), 1);
+    assert_eq!(accounts_db.get_storages(..=new_slot).0.len(), 1);
+
+    let ancestors = Ancestors::from(vec![new_slot]);
+    let (loaded, loaded_slot) = accounts_db
+        .do_load_for_tests(&ancestors, &pubkey)
+        .unwrap();
+    assert_eq!(loaded_slot, new_slot);
+    assert!(accounts_equal(&loaded, &metadata_only_update));
+}
+
+#[test]
 fn test_generate_index_for_single_ref_zero_lamport_slot() {
     let db = AccountsDb::new_single_for_tests();
     let slot0 = 0;

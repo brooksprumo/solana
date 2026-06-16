@@ -52,6 +52,10 @@ pub struct AccountStorageEntry {
     /// 2. The account was set to zero lamports and is older than the last
     ///    full snapshot. In this case, slot is set to the snapshot slot
     pub(crate) obsolete_accounts: RwLock<ObsoleteAccounts>,
+
+    /// Number of split-file metadata entries in other storages that reference
+    /// data entries owned by this storage.
+    split_external_data_ref_count: AtomicUsize,
 }
 
 impl AccountStorageEntry {
@@ -74,6 +78,7 @@ impl AccountStorageEntry {
             num_alive_bytes: AtomicUsize::new(0),
             zero_lamport_single_ref_offsets: RwLock::default(),
             obsolete_accounts: RwLock::default(),
+            split_external_data_ref_count: AtomicUsize::new(0),
         }
     }
 
@@ -89,6 +94,7 @@ impl AccountStorageEntry {
                 self.zero_lamport_single_ref_offsets.read().unwrap().clone(),
             ),
             obsolete_accounts: RwLock::new(self.obsolete_accounts.read().unwrap().clone()),
+            split_external_data_ref_count: AtomicUsize::new(self.split_external_data_ref_count()),
         })
     }
 
@@ -106,6 +112,7 @@ impl AccountStorageEntry {
             num_alive_bytes: AtomicUsize::new(0),
             zero_lamport_single_ref_offsets: RwLock::default(),
             obsolete_accounts: RwLock::new(obsolete_accounts),
+            split_external_data_ref_count: AtomicUsize::new(0),
         }
     }
 
@@ -135,16 +142,28 @@ impl AccountStorageEntry {
     /// in slot or earlier. If slot is None, then slot will be assumed to be the
     /// max root, and all obsolete bytes will be returned.
     pub fn get_obsolete_bytes(&self, slot: Option<Slot>) -> usize {
-        let obsolete_bytes: usize = self
+        if !self.accounts.is_split() {
+            return self
+                .obsolete_accounts_read_lock()
+                .filter_obsolete_accounts(slot)
+                .map(|(offset, data_len)| {
+                    self.accounts
+                        .calculate_stored_size(data_len)
+                        .min(self.accounts.len() - offset)
+                })
+                .sum();
+        }
+
+        let mut obsolete_offsets: Vec<_> = self
             .obsolete_accounts_read_lock()
             .filter_obsolete_accounts(slot)
-            .map(|(offset, data_len)| {
-                self.accounts
-                    .calculate_stored_size(data_len)
-                    .min(self.accounts.len() - offset)
-            })
-            .sum();
-        obsolete_bytes
+            .map(|(offset, _data_len)| offset)
+            .collect();
+        obsolete_offsets.sort_unstable();
+        self.accounts
+            .get_account_stored_sizes(&obsolete_offsets)
+            .into_iter()
+            .sum()
     }
 
     /// Return true if offset is "new" and inserted successfully. Otherwise,
@@ -249,6 +268,31 @@ impl AccountStorageEntry {
     /// Returns the path to the underlying accounts storage file
     pub fn path(&self) -> &Path {
         self.accounts.path()
+    }
+
+    pub(crate) fn add_split_external_data_ref(&self) {
+        self.split_external_data_ref_count
+            .fetch_add(1, Ordering::Release);
+    }
+
+    pub(crate) fn remove_split_external_data_ref(&self) {
+        let previous = self
+            .split_external_data_ref_count
+            .fetch_sub(1, Ordering::Release);
+        assert!(
+            previous > 0,
+            "split external data ref count underflow for slot: {}, id: {}",
+            self.slot,
+            self.id,
+        );
+    }
+
+    pub(crate) fn has_split_external_data_refs(&self) -> bool {
+        self.split_external_data_ref_count() > 0
+    }
+
+    pub(crate) fn split_external_data_ref_count(&self) -> usize {
+        self.split_external_data_ref_count.load(Ordering::Acquire)
     }
 }
 

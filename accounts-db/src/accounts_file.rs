@@ -4,7 +4,7 @@ use {
         account_storage::stored_account_info::{StoredAccountInfo, StoredAccountInfoWithoutData},
         accounts_db::AccountsFileId,
         append_vec::{AppendVec, AppendVecError},
-        split_accounts_file::SplitAccountsFile,
+        split_accounts_file::{DataLocation, SplitAccountsFile},
         storable_accounts::StorableAccounts,
     },
     agave_fs::{FileInfo, buffered_reader::RequiredLenBufFileRead, file_io::open_for_reading},
@@ -255,6 +255,23 @@ impl AccountsFile {
         }
     }
 
+    pub(crate) fn get_account_stored_sizes(&self, sorted_offsets: &[usize]) -> Vec<usize> {
+        match self {
+            Self::AppendVec(av) => {
+                let file_len = av.len();
+                av.get_account_data_lens(sorted_offsets)
+                    .into_iter()
+                    .zip(sorted_offsets)
+                    .map(|(data_len, offset)| {
+                        AppendVec::calculate_stored_size(data_len)
+                            .min(file_len.saturating_sub(*offset))
+                    })
+                    .collect()
+            }
+            Self::Split(split) => split.get_account_stored_sizes(sorted_offsets),
+        }
+    }
+
     /// iterate over all pubkeys
     pub fn scan_pubkeys(&self, callback: impl FnMut(&Pubkey)) -> Result<()> {
         match self {
@@ -284,6 +301,66 @@ impl AccountsFile {
 
     pub fn is_split(&self) -> bool {
         matches!(self, Self::Split(_))
+    }
+
+    pub(crate) fn can_reuse_split_data_from(&self, old: &Self) -> bool {
+        match (self, old) {
+            (Self::Split(new), Self::Split(old)) => new.can_reference_data_from(old),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn reusable_split_data_location(
+        &self,
+        offset: Offset,
+        expected_pubkey: &Pubkey,
+        expected_data: &[u8],
+    ) -> Option<DataLocation> {
+        match self {
+            Self::Split(split) => {
+                split.reusable_external_data_location(offset, expected_pubkey, expected_data)
+            }
+            Self::AppendVec(_) => None,
+        }
+    }
+
+    pub(crate) fn split_external_data_location(&self, offset: Offset) -> Option<DataLocation> {
+        match self {
+            Self::Split(split) => split.external_data_location(offset),
+            Self::AppendVec(_) => None,
+        }
+    }
+
+    pub(crate) fn split_external_data_locations(
+        &self,
+        sorted_offsets: &[Offset],
+    ) -> Vec<DataLocation> {
+        sorted_offsets
+            .iter()
+            .filter_map(|&offset| self.split_external_data_location(offset))
+            .collect()
+    }
+
+    pub(crate) fn write_accounts_with_reusable_split_data_refs<'a>(
+        &self,
+        accounts: &impl StorableAccounts<'a>,
+        skip: usize,
+        reusable_data_refs: &[Option<DataLocation>],
+    ) -> Option<StoredAccountsInfo> {
+        match self {
+            Self::Split(split) => {
+                split.write_accounts_with_reusable_data_refs(accounts, skip, reusable_data_refs)
+            }
+            Self::AppendVec(_) => self.write_accounts(accounts, skip),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn split_data_len_for_tests(&self) -> Option<usize> {
+        match self {
+            Self::Split(split) => Some(split.data_len()),
+            Self::AppendVec(_) => None,
+        }
     }
 
     pub fn append_vec_archive_bytes(
