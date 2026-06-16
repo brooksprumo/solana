@@ -4800,7 +4800,9 @@ impl AccountsDb {
                 };
                 if should_flush {
                     flush_stats.num_bytes_flushed +=
-                        AppendVec::calculate_stored_size(account.data().len()) as u64;
+                        self.accounts_file_provider
+                            .calculate_stored_size(account.data().len())
+                            as u64;
                     flush_stats.num_accounts_flushed += 1;
                     Some((key, account))
                 } else {
@@ -4808,7 +4810,9 @@ impl AccountsDb {
                     // index, since it's equivalent to purging
                     purged_pubkeys.push(*key);
                     flush_stats.num_bytes_purged +=
-                        AppendVec::calculate_stored_size(account.data().len()) as u64;
+                        self.accounts_file_provider
+                            .calculate_stored_size(account.data().len())
+                            as u64;
                     flush_stats.num_accounts_purged += 1;
                     None
                 }

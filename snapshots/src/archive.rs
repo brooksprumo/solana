@@ -12,15 +12,20 @@ use {
         account_storage::AccountStoragesOrderer,
         account_storage_entry::AccountStorageEntry,
         account_storage_reader::{
-            ACCOUNT_STORAGE_MAX_BUFFER_SIZE, AccountStorageReader, open_storage_files,
-            storage_file_buf_reader,
+            ACCOUNT_STORAGE_MAX_BUFFER_SIZE, AccountStorageReader, storage_file_buf_reader,
         },
         accounts_file::AccountsFile,
     },
     solana_clock::Slot,
     solana_measure::measure::Measure,
     solana_metrics::datapoint_info,
-    std::{fs, io::Write, path::Path, sync::Arc},
+    std::{
+        collections::HashSet,
+        fs,
+        io::{Cursor, Write},
+        path::Path,
+        sync::Arc,
+    },
 };
 
 // Balance large and small files order in snapshot tar with bias towards small (4 small + 1 large),
@@ -140,18 +145,25 @@ pub fn archive_snapshot(
 
             // Walk storages and their (lazily-opened) file handles in chunks,
             // bounding how many archive-mode fds are simultaneously open.
-            let mut storage_file_pairs = storages_orderer
-                .iter()
-                .zip(open_storage_files(storages_orderer.iter(), use_direct_io));
+            let mut storages = storages_orderer.iter();
             let mut buf_reader =
                 storage_file_buf_reader(ACCOUNT_STORAGE_MAX_BUFFER_SIZE, use_page_cache, io_setup)
                     .map_err(E::StorageFileBufReaderError)?;
             let mut chunk = Vec::with_capacity(STORAGE_FILE_OPEN_CHUNK_SIZE);
             loop {
                 chunk.clear();
-                for (storage, file) in (&mut storage_file_pairs).take(STORAGE_FILE_OPEN_CHUNK_SIZE)
-                {
-                    chunk.push((storage, file.map_err(E::StorageFileBufReaderError)?));
+                for storage in (&mut storages).take(STORAGE_FILE_OPEN_CHUNK_SIZE) {
+                    let file = if storage.accounts.is_split() {
+                        None
+                    } else {
+                        Some(
+                            storage
+                                .accounts
+                                .open_file_for_archive(use_direct_io)
+                                .map_err(E::StorageFileBufReaderError)?,
+                        )
+                    };
+                    chunk.push((storage, file));
                 }
                 if chunk.is_empty() {
                     break;
@@ -162,14 +174,45 @@ pub fn archive_snapshot(
                 // Queue the whole chunk for read-ahead before consuming any of
                 // it, so the io_uring pipeline can saturate across files.
                 for (storage, file) in &chunk {
-                    chunk_reader
-                        .add_file_to_prefetch(file.as_ref(), storage.accounts.len() as FileSize)
-                        .map_err(E::StorageFileBufReaderError)?;
+                    if let Some(file) = file {
+                        chunk_reader
+                            .add_file_to_prefetch(
+                                file.as_ref(),
+                                storage.accounts.len() as FileSize,
+                            )
+                            .map_err(E::StorageFileBufReaderError)?;
+                    }
                 }
 
                 for (storage, file) in &chunk {
                     let path_in_archive = Path::new(ACCOUNTS_DIR)
                         .join(AccountsFile::file_name(storage.slot(), storage.id()));
+                    if file.is_none() {
+                        let obsolete_offsets: HashSet<_> = storage
+                            .obsolete_accounts_for_snapshots(snapshot_slot)
+                            .filter_obsolete_accounts(None)
+                            .map(|(offset, _data_len)| offset)
+                            .collect();
+                        let archive_bytes = storage
+                            .accounts
+                            .append_vec_archive_bytes(&obsolete_offsets)
+                            .map_err(|err| {
+                                E::AccountStorageReaderError(err, storage.path().to_path_buf())
+                            })?;
+                        let mut header = tar::Header::new_gnu();
+                        header.set_path(path_in_archive).map_err(|err| {
+                            E::ArchiveAccountStorageFile(err, storage.path().to_path_buf())
+                        })?;
+                        header.set_size(archive_bytes.len() as u64);
+                        header.set_cksum();
+                        archive
+                            .append(&header, Cursor::new(archive_bytes))
+                            .map_err(|err| {
+                                E::ArchiveAccountStorageFile(err, storage.path().to_path_buf())
+                            })?;
+                        continue;
+                    }
+                    let file = file.as_ref().expect("direct archive file exists");
 
                     chunk_reader
                         .set_file(file.as_ref(), storage.accounts.len() as FileSize)

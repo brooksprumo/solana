@@ -221,6 +221,34 @@ define_accounts_db_test!(
 );
 
 #[test]
+fn test_split_accounts_file_provider_flush_and_load_from_storage() {
+    let accounts_db = AccountsDb::new_single_for_tests_with_provider_and_config(
+        AccountsFileProvider::Split,
+        ACCOUNTS_DB_CONFIG_FOR_TESTING,
+    );
+    let slot = 0;
+    let pubkey = Pubkey::new_unique();
+    let owner = Pubkey::new_unique();
+    let mut account = AccountSharedData::new(123, 8 * 1024, &owner);
+    account.set_data((0..account.data().len()).map(|i| (i % 251) as u8).collect());
+
+    accounts_db.store_for_tests((slot, [(&pubkey, &account)].as_slice()));
+    accounts_db.add_root_and_flush_write_cache(slot);
+
+    let storage = accounts_db.get_storage_for_slot(slot).unwrap();
+    assert!(storage.accounts.is_split());
+    assert_eq!(storage.path().extension().unwrap(), "meta");
+    assert!(storage.path().with_extension("data").exists());
+
+    let ancestors = Ancestors::from(vec![slot]);
+    let (loaded, loaded_slot) = accounts_db
+        .do_load_for_tests(&ancestors, &pubkey)
+        .unwrap();
+    assert_eq!(loaded_slot, slot);
+    assert!(accounts_equal(&loaded, &account));
+}
+
+#[test]
 fn test_generate_index_for_single_ref_zero_lamport_slot() {
     let db = AccountsDb::new_single_for_tests();
     let slot0 = 0;
@@ -3757,7 +3785,7 @@ define_accounts_db_test!(
 
         // assert the "alive_bytes_exclude_zero_lamport_single_ref_accounts"
         match accounts_db.accounts_file_provider {
-            AccountsFileProvider::AppendVec => {
+            AccountsFileProvider::AppendVec | AccountsFileProvider::Split => {
                 assert_eq!(
                     storage.alive_bytes_exclude_zero_lamport_single_ref_accounts(),
                     0
