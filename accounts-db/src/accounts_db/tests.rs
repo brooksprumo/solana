@@ -2561,6 +2561,36 @@ fn test_shrink_candidate_slots_with_dead_ancient_account() {
 }
 
 #[test]
+fn test_shrink_append_vec_source_into_split_storage() {
+    let db = AccountsDb::new_single_for_tests();
+    assert_eq!(db.accounts_file_provider, AccountsFileProvider::Split);
+
+    let slot = 1;
+    let id = 999;
+    let account_data_size = 16 * 4096;
+    let pubkey = Pubkey::new_unique();
+    let tf = crate::append_vec::test_utils::get_append_vec_path(
+        "test_shrink_append_vec_source_into_split_storage",
+    );
+    let storage =
+        sample_storage_with_entries_id(&tf, slot, &pubkey, id, true, Some(account_data_size));
+    assert!(!storage.accounts.is_split());
+
+    insert_store(&db, Arc::clone(&storage));
+    db.accounts_index.add_root(slot);
+    populate_index(&db, slot..slot + 1);
+
+    db.shrink_slot_forced(slot);
+
+    let storage_after_shrink = db.get_storage_for_slot(slot).unwrap();
+    assert!(storage_after_shrink.accounts.is_split());
+    let ancestors = Ancestors::from(vec![slot]);
+    let (loaded_account, loaded_slot) = db.do_load_for_tests(&ancestors, &pubkey).unwrap();
+    assert_eq!(loaded_slot, slot);
+    assert_eq!(loaded_account.data().len(), account_data_size as usize);
+}
+
+#[test]
 fn test_select_candidates_by_total_usage_no_candidates() {
     // no input candidates -- none should be selected
     agave_logger::setup();

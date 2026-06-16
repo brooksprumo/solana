@@ -2557,7 +2557,9 @@ impl AccountsDb {
                     ),
                     pubkey: *account.pubkey(),
                     data_len: account.data_len as u64,
-                    stored_size: store.accounts.calculate_stored_size(account.data_len),
+                    stored_size: self
+                        .accounts_file_provider
+                        .calculate_stored_size(account.data_len),
                 });
             })
             .expect("must scan accounts storage");
