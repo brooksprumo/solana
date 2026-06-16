@@ -42,6 +42,13 @@ impl AccountsDb {
     fn get_storage_for_slot(&self, slot: Slot) -> Option<Arc<AccountStorageEntry>> {
         self.storage.get_slot_storage_entry(slot)
     }
+
+    fn new_single_for_tests_with_append_vec() -> Self {
+        Self::new_single_for_tests_with_provider_and_config(
+            AccountsFileProvider::AppendVec,
+            ACCOUNTS_DB_CONFIG_FOR_TESTING,
+        )
+    }
 }
 
 /// this tuple contains slot info PER account
@@ -331,7 +338,7 @@ fn test_generate_index_for_single_ref_zero_lamport_slot() {
     assert_eq!(slot_list_len, 1);
     assert_eq!(
         append_vec.alive_bytes(),
-        AppendVec::calculate_stored_size(0),
+        append_vec.accounts.calculate_stored_size(0),
     );
     assert_eq!(append_vec.accounts_count(), 1);
     assert_eq!(append_vec.count(), 1);
@@ -1527,7 +1534,9 @@ fn test_alive_bytes_after_shrink_with_zero_lamport_single_ref_accounts() {
     assert!(expected_alive_bytes_after_shrink < alive_bytes_before_shrink);
     assert_eq!(
         expected_alive_bytes_after_shrink,
-        AppendVec::calculate_stored_size(alive_account.data().len()),
+        storage
+            .accounts
+            .calculate_stored_size(alive_account.data().len()),
     );
 
     accounts_db.shrink_slot_forced(slot);
@@ -2534,14 +2543,15 @@ fn test_shrink_candidate_slots_with_dead_ancient_account() {
     // and storage capacity shrunk to the sum of alive bytes of
     // accounts it holds.  This is the data lengths of the
     // accounts plus the length of their metadata.
-    assert_eq!(
-        created_accounts.capacity as usize,
-        AppendVec::calculate_stored_size(1000) + AppendVec::calculate_stored_size(2000),
-    );
-    // The above check works only when the AppendVec storage is
-    // used. More generally the pubkey of the smallest account
-    // shouldn't be present in the shrunk storage, which is
-    // validated by the following scan of the storage accounts.
+    if !storage.accounts.is_split() {
+        assert_eq!(
+            created_accounts.capacity as usize,
+            AppendVec::calculate_stored_size(1000) + AppendVec::calculate_stored_size(2000),
+        );
+    }
+    // The above check works only when the AppendVec storage is used. More generally the pubkey of
+    // the smallest account shouldn't be present in the shrunk storage, which is validated by the
+    // following scan of the storage accounts.
     storage
         .accounts
         .scan_pubkeys(|pubkey| {
@@ -2974,7 +2984,7 @@ fn test_account_balance_for_capitalization_native_program() {
 #[test]
 fn test_store_overhead() {
     agave_logger::setup();
-    let accounts = AccountsDb::new_single_for_tests();
+    let accounts = AccountsDb::new_single_for_tests_with_append_vec();
     let account = AccountSharedData::new(1, 0, &Pubkey::default());
     let pubkey = solana_pubkey::new_rand();
     accounts.store_for_tests((0, [(&pubkey, &account)].as_slice()));
@@ -3911,6 +3921,10 @@ fn test_zero_lamport_single_ref_resweep_respects_last_swept(set_last_swept: bool
         ][..],
     ));
     db.add_root_and_flush_write_cache(slot_above_last_swept);
+
+    // Split storage may already be shrink-productive before the snapshot advances because its
+    // capacity includes split-file overhead. Isolate this test to the snapshot resweep behavior.
+    db.shrink_candidate_slots.lock().unwrap().clear();
 
     // Optionally mark slot 2 as already swept. `set_last_swept_full_snapshot_slot`
     // requires `last_swept <= latest`, so advance latest to slot 2 first (it gets
@@ -5872,7 +5886,7 @@ fn test_shrink_collect_simple() {
                                  {append_opposite_zero_lamport_account}, normal_account_count: \
                                  {normal_account_count}"
                             );
-                            let db = AccountsDb::new_single_for_tests();
+                            let db = AccountsDb::new_single_for_tests_with_append_vec();
                             let slot5 = 5;
                             // don't do special zero lamport account handling
                             db.set_latest_full_snapshot_slot(0);
@@ -6316,7 +6330,7 @@ pub(crate) fn create_db_with_storages_and_index(
 ) -> (AccountsDb, Slot) {
     agave_logger::setup();
 
-    let db = AccountsDb::new_single_for_tests();
+    let db = AccountsDb::new_single_for_tests_with_append_vec();
 
     // create a single append vec with a single account in a slot
     // add the pubkey to index if alive

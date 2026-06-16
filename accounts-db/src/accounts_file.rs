@@ -400,8 +400,8 @@ impl AccountsFile {
 /// An enum that creates AccountsFile instance with the specified format.
 #[derive(Debug, Default, Copy, Clone, Eq, PartialEq)]
 pub enum AccountsFileProvider {
-    #[default]
     AppendVec,
+    #[default]
     Split,
 }
 
@@ -424,6 +424,16 @@ impl AccountsFileProvider {
                 file_size as usize,
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_accounts_file_provider_defaults_to_split() {
+        assert_eq!(AccountsFileProvider::default(), AccountsFileProvider::Split);
     }
 }
 

@@ -54,7 +54,7 @@ use {
         accounts_update_notifier_interface::{AccountForGeyser, AccountsUpdateNotifier},
         active_stats::{ActiveStatItem, ActiveStats},
         ancestors::Ancestors,
-        append_vec::{self, AppendVec, STORE_META_OVERHEAD},
+        append_vec::{self, STORE_META_OVERHEAD},
         contains::Contains,
         is_zero_lamport::IsZeroLamport,
         partitioned_rewards::PartitionedEpochRewardsConfig,
@@ -284,6 +284,7 @@ struct LoadAccountsIndexForShrink<'a, T: ShrinkCollectRefs<'a>> {
 pub struct AccountFromStorage {
     pub index_info: AccountInfo,
     pub data_len: u64,
+    pub(crate) stored_size: usize,
     pub pubkey: Pubkey,
 }
 
@@ -298,7 +299,7 @@ impl AccountFromStorage {
         &self.pubkey
     }
     pub fn stored_size(&self) -> usize {
-        AppendVec::calculate_stored_size(self.data_len as usize)
+        self.stored_size
     }
     pub fn data_len(&self) -> usize {
         self.data_len as usize
@@ -316,6 +317,7 @@ impl AccountFromStorage {
             ),
             pubkey: *account.pubkey(),
             data_len: account.data_len as u64,
+            stored_size: append_vec::AppendVec::calculate_stored_size(account.data_len),
         }
     }
 }
@@ -2555,6 +2557,7 @@ impl AccountsDb {
                     ),
                     pubkey: *account.pubkey(),
                     data_len: account.data_len as u64,
+                    stored_size: store.accounts.calculate_stored_size(account.data_len),
                 });
             })
             .expect("must scan accounts storage");

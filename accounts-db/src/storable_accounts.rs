@@ -606,6 +606,9 @@ mod tests {
                                     account.is_zero_lamport(),
                                 ),
                                 data_len: account.data.len() as u64,
+                                stored_size: crate::append_vec::AppendVec::calculate_stored_size(
+                                    account.data.len(),
+                                ),
                                 pubkey: *account.pubkey,
                             }
                         })
@@ -733,6 +736,9 @@ mod tests {
                             account.is_zero_lamport(),
                         ),
                         data_len: account.data.len() as u64,
+                        stored_size: crate::append_vec::AppendVec::calculate_stored_size(
+                            account.data.len(),
+                        ),
                         pubkey: *account.pubkey,
                     }
                 })
@@ -823,6 +829,7 @@ mod tests {
                 account.is_zero_lamport(),
             ),
             data_len: account.data().len() as u64,
+            stored_size: crate::append_vec::AppendVec::calculate_stored_size(account.data().len()),
             pubkey: Pubkey::new_unique(),
         };
 
@@ -861,6 +868,7 @@ mod tests {
                 false,
             ),
             data_len: 0,
+            stored_size: crate::append_vec::AppendVec::calculate_stored_size(0),
             pubkey: Pubkey::new_unique(),
         })
         .take(11)
@@ -888,6 +896,7 @@ mod tests {
                 false,
             ),
             data_len: 0,
+            stored_size: crate::append_vec::AppendVec::calculate_stored_size(0),
             pubkey: Pubkey::new_unique(),
         })
         .take(5)
