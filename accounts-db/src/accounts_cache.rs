@@ -386,6 +386,10 @@ impl AccountsCache {
         self.unflushed_roots.read().unwrap().len()
     }
 
+    pub fn contains_unflushed_root(&self, root: Slot) -> bool {
+        self.unflushed_roots.read().unwrap().contains(&root)
+    }
+
     /// Returns the unflushed roots up to and including `max_root` (or all roots if `None`). The
     /// returned roots remain tracked as unflushed until `remove_slot` drops each one when its cache
     /// is flushed.

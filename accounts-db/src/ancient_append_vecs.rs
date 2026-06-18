@@ -354,6 +354,11 @@ impl AccountsDb {
         sorted_slots: Vec<Slot>,
         can_randomly_shrink: bool,
     ) {
+        if self.use_rocks_accounts() {
+            // There are no ancient append vecs to pack in Rocks mode.
+            return;
+        }
+
         let tuning = PackedAncientStorageTuning {
             // Slots old enough to be ancient.
             max_ancient_slots: self.max_ancient_storages,

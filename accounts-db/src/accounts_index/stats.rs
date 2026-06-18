@@ -188,6 +188,12 @@ impl Stats {
         self.count.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn reset_counts_after_clear(&self) {
+        self.count.store(0, Ordering::Relaxed);
+        self.count_in_mem.store(0, Ordering::Relaxed);
+        self.capacity_in_mem.store(0, Ordering::Relaxed);
+    }
+
     pub fn report_stats<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>>(
         &self,
         storage: &BucketMapHolder<T, U>,

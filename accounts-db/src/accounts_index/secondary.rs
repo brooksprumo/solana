@@ -129,6 +129,14 @@ impl<SecondaryIndexEntryType: SecondaryIndexEntry + Default + Sync + Send>
         }
     }
 
+    pub fn clear(&self) {
+        self.index.clear();
+        self.index.shrink_to_fit();
+        self.reverse_index.clear();
+        self.reverse_index.shrink_to_fit();
+        self.stats.num_inner_keys.store(0, Ordering::Relaxed);
+    }
+
     /// Inserts `inner_key` into `key`'s map.
     pub fn insert(&self, key: &Pubkey, inner_key: &Pubkey) {
         // Note: Always lock the reverse index first, so we synchronize with remove().

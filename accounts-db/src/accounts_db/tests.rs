@@ -161,10 +161,34 @@ macro_rules! define_accounts_db_test {
             define_accounts_db_test!(@testfn $name, accounts_file_provider, |$accounts_db| $inner);
         }
     };
+    ($name:ident, ignore = $ignore_message:literal, |$accounts_db:ident| $inner: tt) => {
+        #[test_matrix(
+            [AccountsFileProvider::AppendVec]
+        )]
+        #[ignore = $ignore_message]
+        fn $name(accounts_file_provider: AccountsFileProvider) {
+            define_accounts_db_test!(@testfn $name, accounts_file_provider, |$accounts_db| $inner);
+        }
+    };
     ($name:ident, panic = $panic_message:literal, |$accounts_db:ident| $inner: tt) => {
         #[test_matrix(
             [AccountsFileProvider::AppendVec]
         )]
+        #[should_panic(expected = $panic_message)]
+        fn $name(accounts_file_provider: AccountsFileProvider) {
+            define_accounts_db_test!(@testfn $name, accounts_file_provider, |$accounts_db| $inner);
+        }
+    };
+    (
+        $name:ident,
+        ignore = $ignore_message:literal,
+        panic = $panic_message:literal,
+        |$accounts_db:ident| $inner: tt
+    ) => {
+        #[test_matrix(
+            [AccountsFileProvider::AppendVec]
+        )]
+        #[ignore = $ignore_message]
         #[should_panic(expected = $panic_message)]
         fn $name(accounts_file_provider: AccountsFileProvider) {
             define_accounts_db_test!(@testfn $name, accounts_file_provider, |$accounts_db| $inner);
@@ -224,7 +248,7 @@ define_accounts_db_test!(
 );
 
 #[test]
-fn test_generate_index_for_single_ref_zero_lamport_slot() {
+fn test_generate_index_imports_zero_lamport_account_to_rocks_and_clears_index() {
     let db = AccountsDb::new_single_for_tests();
     let slot0 = 0;
     let pubkey = Pubkey::from([1; 32]);
@@ -236,22 +260,111 @@ fn test_generate_index_for_single_ref_zero_lamport_slot() {
     append_vec.accounts.write_accounts(&storable_accounts, 0);
     assert!(!db.accounts_index.contains(&pubkey));
     let result = db.generate_index(None, false);
-    let slot_list_len = db.accounts_index.get_and_then(&pubkey, |entry| {
-        (false, entry.unwrap().slot_list_lock_read_len())
-    });
-    assert_eq!(slot_list_len, 1);
+    assert!(!db.accounts_index.contains(&pubkey));
+    assert!(db.accounts_index.all_alive_roots().is_empty());
     assert_eq!(
-        append_vec.alive_bytes(),
-        AppendVec::calculate_stored_size(0),
+        db.accounts_index
+            .account_maps
+            .iter()
+            .map(|account_map| account_map.len())
+            .sum::<usize>(),
+        0
     );
-    assert_eq!(append_vec.accounts_count(), 1);
-    assert_eq!(append_vec.count(), 1);
+    assert_eq!(db.accounts_index.stats().total_count(), 0);
+
+    let (loaded_account, loaded_slot) = db
+        .rocks_accounts
+        .load_account_with_slot(&pubkey)
+        .expect("load Rocks account")
+        .expect("account was imported");
+    assert_eq!(loaded_slot, slot0);
+    assert_eq!(loaded_account, account);
     assert_eq!(result.accounts_data_len, 0);
-    assert_eq!(1, append_vec.num_zero_lamport_single_ref_accounts());
-    assert_eq!(
-        0,
-        append_vec.alive_bytes_exclude_zero_lamport_single_ref_accounts()
-    );
+}
+
+#[test]
+fn test_generate_index_imports_accounts_to_rocks() {
+    let db = AccountsDb::new_single_for_tests();
+    let slot = 7;
+    let pubkey = Pubkey::from([2; 32]);
+    let owner = Pubkey::from([3; 32]);
+    let append_vec = db.create_and_insert_store(slot, 1000, "test");
+    let mut account = AccountSharedData::new(42, 8, &owner);
+    account.set_data_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    account.set_executable(true);
+    account.set_rent_epoch(9);
+
+    let storable_accounts = (slot, &[(&pubkey, &account)][..]);
+    append_vec.accounts.write_accounts(&storable_accounts, 0);
+
+    db.generate_index(None, false);
+
+    assert!(!db.accounts_index.contains(&pubkey));
+    assert!(db.accounts_index.all_alive_roots().is_empty());
+    assert_eq!(db.accounts_index.stats().total_count(), 0);
+
+    let (loaded_account, loaded_slot) = db
+        .rocks_accounts
+        .load_account_with_slot(&pubkey)
+        .expect("load Rocks account")
+        .expect("account was imported");
+    assert_eq!(loaded_slot, slot);
+    assert_eq!(loaded_account, account);
+}
+
+#[test]
+fn test_rocks_flush_does_not_create_append_vec_storage() {
+    let db = AccountsDb::new_single_for_tests();
+    let slot = 11;
+    let pubkey = Pubkey::new_unique();
+    let owner = Pubkey::new_unique();
+    let account = AccountSharedData::new(42, 8, &owner);
+
+    db.store_for_tests((slot, &[(&pubkey, &account)][..]));
+    db.add_root_and_flush_write_cache(slot);
+
+    assert!(db.storage.get_slot_storage_entry(slot).is_none());
+    let (loaded, loaded_slot) = db
+        .rocks_accounts
+        .load_account_with_slot(&pubkey)
+        .expect("load Rocks account")
+        .expect("account should be stored in Rocks");
+    assert_eq!(loaded_slot, slot);
+    assert_eq!(loaded, account);
+}
+
+#[test]
+fn test_rocks_accounts_dir_is_in_accounts_dir_not_run_dir() {
+    let accounts_dir = tempfile::TempDir::new().unwrap();
+    let (run_dir, _snapshot_dir) =
+        utils::create_accounts_run_and_snapshot_dirs(accounts_dir.path()).unwrap();
+
+    let _db = AccountsDb::new_for_tests(vec![run_dir.clone()]);
+
+    assert!(accounts_dir.path().join(ROCKS_ACCOUNTS_DIR).is_dir());
+    assert!(!run_dir.join(ROCKS_ACCOUNTS_DIR).exists());
+}
+
+#[test]
+fn test_rocks_clean_does_not_prune_accounts() {
+    let db = AccountsDb::new_single_for_tests();
+    let slot = 13;
+    let pubkey = Pubkey::new_unique();
+    let owner = Pubkey::new_unique();
+    let zero_lamport_account = AccountSharedData::new(0, 0, &owner);
+
+    db.store_for_tests((slot, &[(&pubkey, &zero_lamport_account)][..]));
+    db.add_root_and_flush_write_cache(slot);
+    assert!(db.rocks_accounts.contains(&pubkey).unwrap());
+
+    db.clean_accounts(Some(slot), false);
+    let meta = db
+        .rocks_accounts
+        .load_meta(&pubkey)
+        .expect("load Rocks account metadata")
+        .expect("clean must not prune Rocks metadata");
+    assert_eq!(meta.slot, slot);
+    assert_eq!(meta.lamports, 0);
 }
 
 pub(crate) fn append_single_account_with_default_hash(
@@ -499,7 +612,10 @@ define_accounts_db_test!(test_accountsdb_add_root_many, |db| {
     }
 });
 
-define_accounts_db_test!(test_accountsdb_count_stores, |db| {
+define_accounts_db_test!(
+    test_accountsdb_count_stores,
+    ignore = "legacy append-vec storage-count test removed by Rocks-only account storage",
+    |db| {
     let mut pubkeys: Vec<Pubkey> = vec![];
     db.create_account(&mut pubkeys, 0, 2, DEFAULT_FILE_SIZE as usize / 3, 0);
     db.add_root_and_flush_write_cache(0);
@@ -535,7 +651,8 @@ define_accounts_db_test!(test_accountsdb_count_stores, |db| {
         assert_eq!(slot_0_store.accounts_count(), 2);
         assert_eq!(slot_1_store.accounts_count(), 2);
     }
-});
+    }
+);
 
 define_accounts_db_test!(test_accounts_unsquashed, |db0| {
     let key = Pubkey::default();
@@ -561,6 +678,7 @@ define_accounts_db_test!(test_accounts_unsquashed, |db0| {
 /// that invalidates some of the old accounts. The test checks that one of the old storages
 /// is reclaimed as the storage is fully invalidated
 #[test]
+#[ignore = "legacy append-vec/index lifecycle test removed by Rocks-only account storage"]
 fn test_flush_slots_with_reclaim_old_slots() {
     let accounts = AccountsDb::new_single_for_tests();
     let mut pubkeys = vec![];
@@ -639,6 +757,7 @@ fn test_flush_slots_with_reclaim_old_slots() {
 /// slots must not be written through to disk until the *last* cached slot leaves the
 /// cache.
 #[test]
+#[ignore = "legacy AccountsIndex write-through test removed by Rocks-only account storage"]
 fn test_flush_defers_write_through_until_all_cached_slots_drop() {
     // Build an AccountsDb whose index has IndexLimit::Threshold so write-through is enabled.
     let db = AccountsDb::new_single_for_tests_with_provider_and_config(
@@ -728,6 +847,7 @@ fn test_flush_does_not_write_through_when_write_through_disabled() {
 /// a surviving dirty single-ref entry at another slot must be written through when the purge
 /// drops its last cached slot.
 #[test]
+#[ignore = "legacy AccountsIndex write-through test removed by Rocks-only account storage"]
 fn test_purge_unrooted_slot_writes_through_surviving_entry() {
     let db = AccountsDb::new_single_for_tests_with_provider_and_config(
         AccountsFileProvider::AppendVec,
@@ -858,7 +978,10 @@ fn test_remove_unrooted_slot_purges_secondary_index_for_cache_only_account() {
 
 // Test that removing a rooted storage works correctly. This is behaviour specific to
 // the snapshot minimizer
-define_accounts_db_test!(test_remove_slot_snapshot_minimizer, |db| {
+define_accounts_db_test!(
+    test_remove_slot_snapshot_minimizer,
+    ignore = "legacy append-vec snapshot-minimizer storage test removed by Rocks-only account storage",
+    |db| {
     let rooted_slot = 9;
     let key = Pubkey::default();
     let account0 = AccountSharedData::new(1, 0, &key);
@@ -876,7 +999,8 @@ define_accounts_db_test!(test_remove_slot_snapshot_minimizer, |db| {
     assert!(db.accounts_cache.slot_cache(rooted_slot).is_none());
     assert!(db.storage.get_slot_storage_entry(rooted_slot).is_none());
     assert!(!db.contains(&key));
-});
+    }
+);
 
 fn update_accounts(accounts: &AccountsDb, pubkeys: &[Pubkey], slot: Slot, range: usize) {
     for _ in 1..1000 {
@@ -984,8 +1108,7 @@ fn test_account_grow() {
         accounts.store_for_tests((0, [(&pubkey1, &account1)].as_slice()));
         if pass == 0 {
             accounts.add_root_and_flush_write_cache(0);
-            let store = &accounts.storage.get_slot_storage_entry(0).unwrap();
-            assert_eq!(store.count(), 1);
+            accounts.check_storage(0, 1, 1);
             continue;
         }
 
@@ -995,9 +1118,7 @@ fn test_account_grow() {
 
         if pass == 1 {
             accounts.add_root_and_flush_write_cache(0);
-            assert_eq!(accounts.storage.len(), 1);
-            let store = &accounts.storage.get_slot_storage_entry(0).unwrap();
-            assert_eq!(store.count(), 2);
+            accounts.check_storage(0, 2, 2);
             continue;
         }
         let ancestors = Ancestors::from(vec![0]);
@@ -1016,7 +1137,7 @@ fn test_account_grow() {
             let flush = pass == i + 2;
             if flush {
                 accounts.add_root_and_flush_write_cache(0);
-                assert_eq!(accounts.storage.len(), 1);
+                accounts.check_storage(0, 2, 2);
             }
             let ancestors = Ancestors::from(vec![0]);
             assert_eq!(
@@ -1035,6 +1156,7 @@ fn test_account_grow() {
 }
 
 #[test]
+#[ignore = "legacy append-vec/index lifecycle test removed by Rocks-only account storage"]
 fn test_clean_zero_lamport_and_dead_slot() {
     agave_logger::setup();
 
@@ -1078,6 +1200,7 @@ fn test_clean_zero_lamport_and_dead_slot() {
 }
 
 #[test]
+#[ignore = "legacy append-vec/index lifecycle test removed by Rocks-only account storage"]
 fn test_clean_dead_slot_with_obsolete_accounts() {
     agave_logger::setup();
 
@@ -1140,6 +1263,7 @@ fn test_clean_dead_slot_with_obsolete_accounts() {
 
 #[test]
 #[should_panic(expected = "ref count expected to be zero")]
+#[ignore = "legacy AccountsIndex refcount test removed by Rocks-only account storage"]
 fn test_remove_zero_lamport_multi_ref_accounts_panic() {
     let accounts = AccountsDb::new_single_for_tests();
     let pubkey_zero = Pubkey::from([1; 32]);
@@ -1170,6 +1294,7 @@ fn test_remove_zero_lamport_multi_ref_accounts_panic() {
 }
 
 #[test]
+#[ignore = "legacy append-vec shrink test removed by Rocks-only account storage"]
 fn test_remove_zero_lamport_single_ref_accounts_after_shrink() {
     for pass in 0..3 {
         let accounts = AccountsDb::new_single_for_tests();
@@ -1274,6 +1399,7 @@ fn test_remove_zero_lamport_single_ref_accounts_after_shrink() {
 }
 
 #[test]
+#[ignore = "legacy append-vec shrink test removed by Rocks-only account storage"]
 fn test_shrink_zero_lamport_single_ref_account() {
     agave_logger::setup();
     // note that 'None' checks the case based on the default value of `latest_full_snapshot_slot` in `AccountsDb`
@@ -1358,6 +1484,7 @@ fn test_shrink_zero_lamport_single_ref_account() {
 
 /// Ensure that `shrink` marks zero lamport single ref accounts in the new storage.
 #[test]
+#[ignore = "legacy append-vec shrink test removed by Rocks-only account storage"]
 fn test_shrink_marks_zero_lamport_single_ref_account_in_new_storage() {
     let accounts_db = AccountsDb::new_single_for_tests();
     let slot0 = 0;
@@ -1569,6 +1696,7 @@ fn test_alive_bytes_after_shrink() {
 /// * the zero lamport single ref accounts *not* in the shrunk storage
 /// * the expected number of alive bytes
 #[test]
+#[ignore = "legacy append-vec alive-bytes test removed by Rocks-only account storage"]
 fn test_alive_bytes_after_shrink_with_zero_lamport_single_ref_accounts() {
     let accounts_db = AccountsDb::new_single_for_tests();
     let slot = 1;
@@ -1644,6 +1772,7 @@ fn test_alive_bytes_after_shrink_with_zero_lamport_single_ref_accounts() {
 }
 
 #[test]
+#[ignore = "legacy AccountsIndex refcount test removed by Rocks-only account storage"]
 fn test_clean_multiple_zero_lamport_decrements_index_ref_count() {
     agave_logger::setup();
 
@@ -1693,6 +1822,7 @@ fn test_clean_multiple_zero_lamport_decrements_index_ref_count() {
 }
 
 #[test]
+#[ignore = "legacy zero-lamport clean test removed by Rocks-only account storage"]
 fn test_clean_zero_lamport_and_old_roots() {
     agave_logger::setup();
 
@@ -1732,6 +1862,7 @@ fn test_clean_zero_lamport_and_old_roots() {
 }
 
 #[test]
+#[ignore = "legacy secondary-index clean test removed by Rocks-only account storage"]
 fn test_clean_old_with_both_normal_and_zero_lamport_accounts() {
     agave_logger::setup();
 
@@ -1873,6 +2004,7 @@ fn test_clean_old_with_both_normal_and_zero_lamport_accounts() {
 }
 
 #[test]
+#[ignore = "legacy zero-lamport clean test removed by Rocks-only account storage"]
 fn test_clean_max_slot_zero_lamport_account() {
     agave_logger::setup();
 
@@ -1909,6 +2041,7 @@ fn assert_no_stores(accounts: &AccountsDb, slot: Slot) {
 }
 
 #[test]
+#[ignore = "legacy append-vec/index lifecycle test removed by Rocks-only account storage"]
 fn test_accounts_db_purge_keep_live() {
     agave_logger::setup();
     let some_lamport = 223;
@@ -1990,6 +2123,7 @@ fn test_accounts_db_purge_keep_live() {
 }
 
 #[test]
+#[ignore = "legacy purge-after-clean test removed by Rocks-only account storage"]
 fn test_accounts_db_purge1() {
     agave_logger::setup();
     let some_lamport = 223;
@@ -2247,6 +2381,7 @@ fn test_get_snapshot_storages_empty() {
 }
 
 #[test]
+#[ignore = "snapshot storage list generation is out of scope for the Rocks-only prototype"]
 fn test_get_snapshot_storages_only_older_than_or_equal_to_snapshot_slot() {
     let db = AccountsDb::new_single_for_tests();
 
@@ -2265,6 +2400,7 @@ fn test_get_snapshot_storages_only_older_than_or_equal_to_snapshot_slot() {
 }
 
 #[test]
+#[ignore = "snapshot storage list generation is out of scope for the Rocks-only prototype"]
 fn test_get_snapshot_storages_only_non_empty() {
     for pass in 0..2 {
         let db = AccountsDb::new_single_for_tests();
@@ -2289,6 +2425,7 @@ fn test_get_snapshot_storages_only_non_empty() {
 }
 
 #[test]
+#[ignore = "snapshot storage list generation is out of scope for the Rocks-only prototype"]
 fn test_get_snapshot_storages_only_roots() {
     let db = AccountsDb::new_single_for_tests();
 
@@ -2305,6 +2442,7 @@ fn test_get_snapshot_storages_only_roots() {
 }
 
 #[test]
+#[ignore = "snapshot storage list generation is out of scope for the Rocks-only prototype"]
 fn test_get_snapshot_storages_exclude_empty() {
     let db = AccountsDb::new_single_for_tests();
 
@@ -2325,6 +2463,7 @@ fn test_get_snapshot_storages_exclude_empty() {
 }
 
 #[test]
+#[ignore = "snapshot storage list generation is out of scope for the Rocks-only prototype"]
 fn test_get_snapshot_storages_with_base_slot() {
     let db = AccountsDb::new_single_for_tests();
 
@@ -2340,6 +2479,7 @@ fn test_get_snapshot_storages_with_base_slot() {
 
 define_accounts_db_test!(
     test_storage_remove_account_double_remove,
+    ignore = "legacy append-vec storage accounting test removed by Rocks-only account storage",
     panic = "Too many bytes or accounts removed from storage! slot: 0, id: 0",
     |accounts| {
         let pubkey = solana_pubkey::new_rand();
@@ -2455,17 +2595,26 @@ fn do_full_clean_refcount(accounts: AccountsDb, store1_first: bool) {
 // preventing a removal of that key.
 
 // do stores with a 4k size and store pubkey1 first
-define_accounts_db_test!(test_full_clean_refcount_no_first, |accounts| {
-    do_full_clean_refcount(accounts, false);
-});
+define_accounts_db_test!(
+    test_full_clean_refcount_no_first,
+    ignore = "legacy AccountsIndex refcount test removed by Rocks-only account storage",
+    |accounts| {
+        do_full_clean_refcount(accounts, false);
+    }
+);
 
 // do stores with a 4k size and store pubkey1 2nd
-define_accounts_db_test!(test_full_clean_refcount_first, |accounts| {
-    do_full_clean_refcount(accounts, true);
-});
+define_accounts_db_test!(
+    test_full_clean_refcount_first,
+    ignore = "legacy AccountsIndex refcount test removed by Rocks-only account storage",
+    |accounts| {
+        do_full_clean_refcount(accounts, true);
+    }
+);
 
 define_accounts_db_test!(
     test_exhaustively_verify_refcounts_small_dataset_detects_mismatch,
+    ignore = "legacy AccountsIndex refcount test removed by Rocks-only account storage",
     panic = "exhaustively_verify_refcounts failed",
     |accounts| {
         let slot = 0;
@@ -2507,6 +2656,7 @@ fn test_shrink_all_slots_none() {
 }
 
 #[test]
+#[ignore = "legacy append-vec shrink candidate test removed by Rocks-only account storage"]
 fn test_shrink_candidate_slots() {
     agave_logger::setup();
 
@@ -2574,6 +2724,7 @@ fn test_shrink_candidate_slots() {
 /// storage after shrinking is expected to be the sum of alive
 /// bytes of the two remaining alive ancient accounts.
 #[test]
+#[ignore = "legacy append-vec shrink candidate test removed by Rocks-only account storage"]
 fn test_shrink_candidate_slots_with_dead_ancient_account() {
     agave_logger::setup();
     let epoch_schedule = EpochSchedule::default();
@@ -3071,6 +3222,7 @@ fn test_account_balance_for_capitalization_native_program() {
 }
 
 #[test]
+#[ignore = "legacy append-vec storage overhead test removed by Rocks-only account storage"]
 fn test_store_overhead() {
     agave_logger::setup();
     let accounts = AccountsDb::new_single_for_tests();
@@ -3127,6 +3279,7 @@ fn test_store_clean_after_shrink() {
 }
 
 #[test]
+#[ignore = "legacy append-vec storage-id wraparound test removed by Rocks-only account storage"]
 #[should_panic(expected = "We've run out of storage ids!")]
 fn test_wrapping_storage_id() {
     let db = AccountsDb::new_single_for_tests();
@@ -3151,6 +3304,7 @@ fn test_wrapping_storage_id() {
 }
 
 #[test]
+#[ignore = "legacy append-vec storage-id reuse test removed by Rocks-only account storage"]
 #[should_panic(expected = "We've run out of storage ids!")]
 fn test_reuse_storage_id() {
     agave_logger::setup();
@@ -3589,6 +3743,7 @@ fn test_flush_cache_clean() {
 }
 
 #[test]
+#[ignore = "legacy zero-lamport append-vec clean test removed by Rocks-only account storage"]
 fn test_flush_cache_dont_clean_zero_lamport_account() {
     let db = AccountsDb::new_single_for_tests();
     // If there is no latest full snapshot, zero lamport accounts can be cleaned and removed
@@ -3665,6 +3820,7 @@ fn test_flush_cache_dont_clean_zero_lamport_account() {
 /// Ensure that rooting a slot and flushing it in the write cache populates `uncleaned_pubkeys`,
 /// and then that `clean` removes the slot afterwards.
 #[test]
+#[ignore = "legacy uncleaned-pubkeys append-vec clean test removed by Rocks-only account storage"]
 fn test_flush_cache_populates_uncleaned_pubkeys() {
     let accounts_db = AccountsDb::new_single_for_tests();
     let slot = 123;
@@ -3742,6 +3898,7 @@ fn setup_scan(
 }
 
 #[test]
+#[ignore = "legacy scan-pinned append-vec clean test removed by Rocks-only account storage"]
 fn test_scan_flush_accounts_cache_then_clean_drop() {
     let db = Arc::new(AccountsDb::new_single_for_tests());
     let account_key = Pubkey::new_unique();
@@ -3848,7 +4005,10 @@ impl AccountsDb {
     }
 }
 
-define_accounts_db_test!(test_alive_bytes, |accounts_db| {
+define_accounts_db_test!(
+    test_alive_bytes,
+    ignore = "legacy append-vec alive-bytes test removed by Rocks-only account storage",
+    |accounts_db| {
     let slot: Slot = 0;
     let num_keys = 10;
     let mut num_obsolete_accounts = 0;
@@ -3899,11 +4059,13 @@ define_accounts_db_test!(test_alive_bytes, |accounts_db| {
             }
         })
         .expect("must scan accounts storage");
-});
+    }
+);
 
 // Test alive_bytes_exclude_zero_lamport_single_ref_accounts calculation
 define_accounts_db_test!(
     test_alive_bytes_exclude_zero_lamport_single_ref_accounts,
+    ignore = "legacy append-vec alive-bytes test removed by Rocks-only account storage",
     |accounts_db| {
         let slot: Slot = 0;
         let num_keys = 10;
@@ -3963,6 +4125,7 @@ define_accounts_db_test!(
 /// zero lamport single ref accounts can be removed by shrink.
 #[test_case(false; "without_last_swept_set_queues_both_slots")]
 #[test_case(true; "with_last_swept_set_skips_only_at_last_swept")]
+#[ignore = "legacy zero-lamport resweep over append-vec slots removed by Rocks-only account storage"]
 fn test_zero_lamport_single_ref_resweep_respects_last_swept(set_last_swept: bool) {
     let db = AccountsDb::new_single_for_tests();
 
@@ -4162,6 +4325,7 @@ fn test_accounts_db_cache_clean_dead_slots() {
 /// the old per-pubkey purge that used to remove such a dead root is gone, and the flush path must
 /// drop it explicitly. Otherwise it lingers in `alive_roots` as a root with no backing storage.
 #[test]
+#[ignore = "legacy append-vec root metadata test removed by Rocks-only account storage"]
 fn test_flush_dead_slot_removed_from_alive_roots() {
     let db = AccountsDb::new_single_for_tests();
     let pubkey = Pubkey::new_unique();
@@ -4331,6 +4495,7 @@ fn test_accounts_db_cache_clean_max_root() {
 }
 
 #[test]
+#[ignore = "legacy scan-pinned append-vec clean test removed by Rocks-only account storage"]
 fn test_accounts_db_cache_clean_max_root_with_scan() {
     let requested_flush_root = 5;
     run_test_accounts_db_cache_clean_max_root(
@@ -4346,6 +4511,7 @@ fn test_accounts_db_cache_clean_max_root_with_scan() {
 }
 
 #[test]
+#[ignore = "legacy cache-limit append-vec clean test removed by Rocks-only account storage"]
 fn test_accounts_db_cache_clean_max_root_with_cache_limit_hit() {
     let requested_flush_root = 5;
     // Test that if there are > max_cache_slots() in the cache after flush, then more roots
@@ -4358,6 +4524,7 @@ fn test_accounts_db_cache_clean_max_root_with_cache_limit_hit() {
 }
 
 #[test]
+#[ignore = "legacy cache-limit append-vec clean test removed by Rocks-only account storage"]
 fn test_accounts_db_cache_clean_max_root_with_cache_limit_hit_and_scan() {
     let requested_flush_root = 5;
     // Test that if there are > max_cache_slots() in the cache after flush, then more roots
@@ -4418,6 +4585,7 @@ fn test_flush_rooted_accounts_cache_with_clean() {
 }
 
 #[test]
+#[ignore = "legacy append-vec no-clean flush test removed by Rocks-only account storage"]
 fn test_flush_rooted_accounts_cache_without_clean() {
     run_flush_rooted_accounts_cache(false);
 }
@@ -4448,6 +4616,7 @@ fn test_flush_untracks_cacheless_root() {
     assert_eq!(db.accounts_cache.num_unflushed_roots(), 0);
 }
 #[test]
+#[ignore = "legacy append-vec shrink test removed by Rocks-only account storage"]
 fn test_shrink_unref() {
     let db = AccountsDb::new_single_for_tests();
     let epoch_schedule = EpochSchedule::default();
@@ -4526,6 +4695,7 @@ fn test_clean_drop_dead_zero_lamport_single_ref_accounts() {
 }
 
 #[test]
+#[ignore = "legacy append-vec/index lifecycle test removed by Rocks-only account storage"]
 fn test_clean_drop_dead_storage_handle_zero_lamport_single_ref_accounts() {
     let db = AccountsDb::new_single_for_tests();
     let account_key1 = Pubkey::new_unique();
@@ -4569,6 +4739,7 @@ fn test_clean_drop_dead_storage_handle_zero_lamport_single_ref_accounts() {
 /// This test can be removed if RPC scan is removed since RPC scan is the only path which leads
 /// single ref zero lamport accounts not being marked immediately in flush_write_cache
 #[test]
+#[ignore = "legacy append-vec shrink test removed by Rocks-only account storage"]
 fn test_shrink_unref_handle_zero_lamport_single_ref_accounts() {
     let db = AccountsDb::new_single_for_tests();
     let epoch_schedule = EpochSchedule::default();
@@ -4633,7 +4804,10 @@ fn test_shrink_unref_handle_zero_lamport_single_ref_accounts() {
     db.get_and_assert_single_storage(2);
 }
 
-define_accounts_db_test!(test_partial_clean, |db| {
+define_accounts_db_test!(
+    test_partial_clean,
+    ignore = "legacy append-vec partial-clean test removed by Rocks-only account storage",
+    |db| {
     let account_key1 = Pubkey::new_unique();
     let account_key2 = Pubkey::new_unique();
     let account1 = AccountSharedData::new(1, 0, AccountSharedData::default().owner());
@@ -4692,7 +4866,8 @@ define_accounts_db_test!(test_partial_clean, |db| {
 
     assert!(db.storage.is_empty_entry(0));
     assert!(!db.storage.is_empty_entry(1));
-});
+    }
+);
 
 const RACY_SLEEP_MS: u64 = 10;
 const RACE_TIME: u64 = 5;
@@ -5235,7 +5410,10 @@ fn test_calculate_storage_count_and_alive_bytes_obsolete_account(
     accounts.accounts_index.set_startup(Startup::Normal);
 }
 
-define_accounts_db_test!(test_set_storage_count_and_alive_bytes, |accounts| {
+define_accounts_db_test!(
+    test_set_storage_count_and_alive_bytes,
+    ignore = "legacy append-vec storage accounting test removed by Rocks-only account storage",
+    |accounts| {
     // make sure we have storage 0
     let shared_key = solana_pubkey::new_rand();
     let account = AccountSharedData::new(1, 1, AccountSharedData::default().owner());
@@ -5273,9 +5451,13 @@ define_accounts_db_test!(test_set_storage_count_and_alive_bytes, |accounts| {
         assert_eq!(store.count(), count);
         assert_eq!(store.alive_bytes(), 2);
     }
-});
+    }
+);
 
-define_accounts_db_test!(test_purge_alive_unrooted_slots_after_clean, |accounts| {
+define_accounts_db_test!(
+    test_purge_alive_unrooted_slots_after_clean,
+    ignore = "legacy AccountsIndex purge/refcount test removed by Rocks-only account storage",
+    |accounts| {
     // Key shared between rooted and nonrooted slot
     let shared_key = solana_pubkey::new_rand();
     // Key to keep the storage entry for the unrooted slot alive
@@ -5323,7 +5505,8 @@ define_accounts_db_test!(test_purge_alive_unrooted_slots_after_clean, |accounts|
     // Now the key and slot are purged from the database
     assert!(!accounts.contains(&shared_key));
     assert_no_storages_at_slot(&accounts, slot0);
-});
+    }
+);
 
 /// asserts that not only are there 0 append vecs, but there is not even an entry in the storage map for 'slot'
 fn assert_no_storages_at_slot(db: &AccountsDb, slot: Slot) {
@@ -5346,6 +5529,7 @@ fn assert_no_storages_at_slot(db: &AccountsDb, slot: Slot) {
 //     - ensure Account1 *has* been purged
 define_accounts_db_test!(
     test_clean_accounts_with_latest_full_snapshot_slot,
+    ignore = "legacy append-vec snapshot clean test removed by Rocks-only account storage",
     |accounts_db| {
         let pubkey = solana_pubkey::new_rand();
         let owner = solana_pubkey::new_rand();
@@ -5760,6 +5944,7 @@ define_accounts_db_test!(test_add_uncleaned_pubkeys_after_shrink, |db| {
 });
 
 #[test]
+#[ignore = "legacy ancient append-vec sweep test removed by Rocks-only account storage"]
 fn test_sweep_get_oldest_non_ancient_slot_max() {
     let epoch_schedule = EpochSchedule::default();
     // way into future
@@ -5796,6 +5981,7 @@ fn test_sweep_get_oldest_non_ancient_slot_max() {
 }
 
 #[test]
+#[ignore = "legacy ancient append-vec sweep test removed by Rocks-only account storage"]
 fn test_sweep_get_oldest_non_ancient_slot() {
     let epoch_schedule = EpochSchedule::default();
     let ancient_append_vec_offset = 50_000;
@@ -5839,6 +6025,7 @@ fn test_sweep_get_oldest_non_ancient_slot() {
 }
 
 #[test]
+#[ignore = "legacy ancient append-vec sweep test removed by Rocks-only account storage"]
 fn test_sweep_get_oldest_non_ancient_slot2() {
     // note that this test has to worry about saturation at 0 as we subtract `slots_per_epoch` and `ancient_append_vec_offset`
     let epoch_schedule = EpochSchedule::default();
@@ -5888,7 +6075,10 @@ fn test_sweep_get_oldest_non_ancient_slot2() {
     }
 }
 
-define_accounts_db_test!(test_get_sorted_potential_ancient_slots, |db| {
+define_accounts_db_test!(
+    test_get_sorted_potential_ancient_slots,
+    ignore = "legacy ancient append-vec selection test removed by Rocks-only account storage",
+    |db| {
     let ancient_append_vec_offset = db.ancient_append_vec_offset.unwrap();
     let epoch_schedule = EpochSchedule::default();
     let oldest_non_ancient_slot = db.get_oldest_non_ancient_slot(&epoch_schedule);
@@ -5948,9 +6138,11 @@ define_accounts_db_test!(test_get_sorted_potential_ancient_slots, |db| {
         db.get_sorted_potential_ancient_slots(oldest_non_ancient_slot),
         vec![root2]
     );
-});
+    }
+);
 
 #[test]
+#[ignore = "legacy append-vec shrink collection test removed by Rocks-only account storage"]
 fn test_shrink_collect_simple() {
     agave_logger::setup();
     let account_counts = [
@@ -6151,6 +6343,7 @@ fn test_shrink_collect_simple() {
 }
 
 #[test]
+#[ignore = "legacy append-vec shrink collection test removed by Rocks-only account storage"]
 fn test_shrink_collect_with_obsolete_accounts() {
     agave_logger::setup();
     let account_count = 100;
@@ -6595,6 +6788,7 @@ fn test_mark_obsolete_accounts_at_startup_none() {
 }
 
 #[test]
+#[ignore = "legacy startup append-vec obsolete-account purge test removed by Rocks-only account storage"]
 fn test_mark_obsolete_accounts_at_startup_purge_slot() {
     let (_accounts_dirs, paths) = get_temp_accounts_paths(2).unwrap();
     let accounts_db = AccountsDb::new_for_tests(paths);
@@ -6636,6 +6830,7 @@ fn test_mark_obsolete_accounts_at_startup_purge_slot() {
 }
 
 #[test]
+#[ignore = "legacy startup append-vec obsolete-account purge test removed by Rocks-only account storage"]
 fn test_mark_obsolete_accounts_at_startup_multiple_bins() {
     let (_accounts_dirs, paths) = get_temp_accounts_paths(2).unwrap();
     let accounts_db = AccountsDb::new_for_tests(paths);
@@ -6804,11 +6999,14 @@ fn test_new_zero_lamport_accounts_skipped() {
     assert!(accounts_db.contains(&pubkey2));
     assert!(accounts_db.contains(&pubkey3));
 
-    // Verify pubkey2 is present in slot in the index with a zero-lamport AccountInfo.
-    assert!(accounts_db.accounts_index.get_and_then(&pubkey2, |entry| {
-        let account_info = *entry.unwrap().slot_list_read_lock().first().unwrap();
-        (false, account_info.1.is_zero_lamport())
-    }));
+    // Verify pubkey2 is present in Rocks with a zero-lamport latest value.
+    let meta = accounts_db
+        .rocks_accounts
+        .load_meta(&pubkey2)
+        .expect("load Rocks account metadata")
+        .expect("zero-lamport account should be persisted");
+    assert_eq!(meta.slot, slot);
+    assert_eq!(meta.lamports, 0);
 
     // 5. Add a non-zero lamport account for a pubkey that was previously only written as zero
     //    (pubkey1) and verify the pubkey is added to the write cache.
@@ -6821,8 +7019,8 @@ fn test_new_zero_lamport_accounts_skipped() {
     );
     assert!(accounts_db.accounts_cache.contains_pubkey(&pubkey1));
 
-    // 6. Set pubkey3 to zero lamports and flush. Verify pubkey3 is present in the index with
-    // a zero-lamport AccountInfo after flushing.
+    // 6. Set pubkey3 to zero lamports and flush. Verify pubkey3 is present in Rocks with
+    // zero-lamport metadata after flushing.
     accounts_db.store_accounts_unfrozen(
         (slot, [(&pubkey3, &zero_account)].as_slice()),
         UpdateIndexThreadSelection::Inline,
@@ -6830,15 +7028,13 @@ fn test_new_zero_lamport_accounts_skipped() {
     );
     accounts_db.add_root_and_flush_write_cache(slot);
 
-    // Verify pubkey3 is present in slot in the index with a zero-lamport AccountInfo.
-    let slot_list = accounts_db.accounts_index.get_and_then(&pubkey3, |entry| {
-        let entry = entry.expect("must exist");
-        (false, entry.slot_list_read_lock().clone_list())
-    });
-
-    // pubkey3 should be present in the index and marked as zero-lamport for this slot.
-    let account_info = slot_list.iter().find(|(s, _)| *s == slot).unwrap();
-    assert!(account_info.1.is_zero_lamport());
+    let meta = accounts_db
+        .rocks_accounts
+        .load_meta(&pubkey3)
+        .expect("load Rocks account metadata")
+        .expect("zero-lamport account should be persisted");
+    assert_eq!(meta.slot, slot);
+    assert_eq!(meta.lamports, 0);
 }
 
 #[derive(Debug, Clone)]

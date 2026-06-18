@@ -49,6 +49,9 @@ num_cpus = { workspace = true }
 qualifier_attr = { workspace = true, optional = true }
 rand = { workspace = true }
 rayon = { workspace = true }
+rocksdb = { version = "0.24.0", default-features = false, features = [
+    "lz4",
+] }
 seqlock = { workspace = true }
 serde = { workspace = true, features = ["rc"] }
 smallvec = { workspace = true, features = ["const_generics"] }

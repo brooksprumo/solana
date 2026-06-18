@@ -734,6 +734,23 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
         }
     }
 
+    pub(crate) fn clear_after_startup_import(&self) {
+        for account_map in self.account_maps.iter() {
+            account_map.clear_after_startup_import();
+        }
+
+        self.program_id_index.clear();
+        self.spl_token_mint_index.clear();
+        self.spl_token_owner_index.clear();
+
+        *self.roots_tracker.write().unwrap() = RootsTracker::new(1);
+        self.roots_added.store(0, Ordering::Relaxed);
+        self.roots_removed.store(0, Ordering::Relaxed);
+        self.purge_older_root_entries_one_slot_list
+            .store(0, Ordering::Relaxed);
+        self.stats().reset_counts_after_clear();
+    }
+
     pub(crate) fn update_secondary_indexes(
         &self,
         pubkey: &Pubkey,

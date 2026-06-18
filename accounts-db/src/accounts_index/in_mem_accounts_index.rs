@@ -187,6 +187,22 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
         keys.into_iter().collect()
     }
 
+    pub(crate) fn clear_after_startup_import(&self) {
+        {
+            let mut map = self.map_internal.write().unwrap();
+            let _old_map = mem::take(&mut *map);
+        }
+
+        if let Some(disk) = self.bucket.as_ref() {
+            for pubkey in disk.keys() {
+                disk.delete_key(&pubkey);
+            }
+        }
+
+        self.startup_info.insert.lock().unwrap().clear();
+        *self.startup_info.duplicates.lock().unwrap() = StartupInfoDuplicates::default();
+    }
+
     fn load_from_disk(&self, pubkey: &Pubkey) -> Option<(SlotList<U>, RefCount)> {
         self.bucket.as_ref().and_then(|disk| {
             let m = Measure::start("load_disk_found_count");
