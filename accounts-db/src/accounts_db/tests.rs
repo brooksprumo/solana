@@ -313,6 +313,38 @@ fn test_generate_index_imports_accounts_to_rocks() {
 }
 
 #[test]
+fn test_generate_index_imports_highest_slot_duplicate_to_rocks() {
+    let db = AccountsDb::new_single_for_tests();
+    let old_slot = 7;
+    let new_slot = 9;
+    let pubkey = Pubkey::new_unique();
+    let owner = Pubkey::new_unique();
+    let old_append_vec = db.create_and_insert_store(old_slot, 1000, "test");
+    let new_append_vec = db.create_and_insert_store(new_slot, 1000, "test");
+    let old_account = AccountSharedData::new(7, 7, &owner);
+    let new_account = AccountSharedData::new(9, 9, &owner);
+
+    old_append_vec
+        .accounts
+        .write_accounts(&(old_slot, &[(&pubkey, &old_account)][..]), 0);
+    new_append_vec
+        .accounts
+        .write_accounts(&(new_slot, &[(&pubkey, &new_account)][..]), 0);
+
+    let result = db.generate_index(None, false);
+
+    let (loaded_account, loaded_slot) = db
+        .rocks_accounts
+        .load_account_with_slot(&pubkey)
+        .expect("load Rocks account")
+        .expect("account was imported");
+    assert_eq!(loaded_slot, new_slot);
+    assert_eq!(loaded_account, new_account);
+    assert_eq!(result.accounts_data_len, new_account.data().len() as u64);
+    assert_eq!(result.calculated_capitalization, new_account.lamports());
+}
+
+#[test]
 fn test_rocks_flush_does_not_create_append_vec_storage() {
     let db = AccountsDb::new_single_for_tests();
     let slot = 11;

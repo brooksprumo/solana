@@ -4,6 +4,8 @@ use {
     solana_clock::{Epoch, Slot},
     solana_pubkey::Pubkey,
     std::{
+        cmp::Ordering,
+        collections::{hash_map::Entry, HashMap},
         fmt,
         path::{Path, PathBuf},
         sync::Arc,
@@ -85,10 +87,22 @@ impl AccountMeta {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RocksAccountsStoreStats {
     pub accounts_written: usize,
+    pub accounts_skipped: usize,
     pub metadata_values_written: usize,
     pub data_values_written: usize,
     pub data_values_deleted: usize,
     pub data_bytes_written: u64,
+}
+
+impl RocksAccountsStoreStats {
+    pub(crate) fn accumulate(&mut self, other: Self) {
+        self.accounts_written += other.accounts_written;
+        self.accounts_skipped += other.accounts_skipped;
+        self.metadata_values_written += other.metadata_values_written;
+        self.data_values_written += other.data_values_written;
+        self.data_values_deleted += other.data_values_deleted;
+        self.data_bytes_written += other.data_bytes_written;
+    }
 }
 
 pub(crate) struct RocksAccountsDb {
@@ -183,6 +197,7 @@ impl RocksAccountsDb {
         slot: Slot,
         account: &impl ReadableAccount,
         stats: &mut RocksAccountsStoreStats,
+        compare_existing_data: bool,
     ) -> Result<(), rocksdb::Error> {
         let meta = AccountMeta::from_account(slot, account).encode();
         batch.put_cf(&self.meta_cf(), pubkey.as_ref(), meta);
@@ -193,7 +208,7 @@ impl RocksAccountsDb {
         if account.lamports() == 0 || data.is_empty() {
             batch.delete_cf(&self.data_cf(), pubkey.as_ref());
             stats.data_values_deleted += 1;
-        } else if !self.data_matches(pubkey, data)? {
+        } else if !compare_existing_data || !self.data_matches(pubkey, data)? {
             batch.put_cf(&self.data_cf(), pubkey.as_ref(), data);
             stats.data_values_written += 1;
             stats.data_bytes_written += data.len() as u64;
@@ -210,7 +225,7 @@ impl RocksAccountsDb {
         let mut batch = WriteBatch::default();
         let mut stats = RocksAccountsStoreStats::default();
         for (pubkey, account) in accounts {
-            self.add_account_to_batch(&mut batch, pubkey, slot, account, &mut stats)?;
+            self.add_account_to_batch(&mut batch, pubkey, slot, account, &mut stats, true)?;
         }
 
         if stats.accounts_written > 0 {
@@ -227,7 +242,66 @@ impl RocksAccountsDb {
         let mut batch = WriteBatch::default();
         let mut stats = RocksAccountsStoreStats::default();
         for (pubkey, slot, account) in accounts {
-            self.add_account_to_batch(&mut batch, pubkey, slot, account, &mut stats)?;
+            self.add_account_to_batch(&mut batch, pubkey, slot, account, &mut stats, true)?;
+        }
+
+        if stats.accounts_written > 0 {
+            self.db.write_without_wal(batch)?;
+        }
+        Ok(stats)
+    }
+
+    pub(crate) fn store_startup_accounts_with_slots<'a>(
+        &self,
+        accounts: impl IntoIterator<Item = (&'a Pubkey, Slot, &'a AccountSharedData)>,
+    ) -> Result<RocksAccountsStoreStats, rocksdb::Error> {
+        let mut latest_accounts = HashMap::<Pubkey, (Slot, &'a AccountSharedData)>::new();
+        let mut stats = RocksAccountsStoreStats::default();
+
+        for (pubkey, slot, account) in accounts {
+            match latest_accounts.entry(*pubkey) {
+                Entry::Vacant(entry) => {
+                    entry.insert((slot, account));
+                }
+                Entry::Occupied(mut entry) => match slot.cmp(&entry.get().0) {
+                    Ordering::Greater => {
+                        stats.accounts_skipped += 1;
+                        entry.insert((slot, account));
+                    }
+                    Ordering::Less => {
+                        stats.accounts_skipped += 1;
+                    }
+                    Ordering::Equal => {
+                        panic!("Accounts may only be stored once per slot: ({slot}, {pubkey})");
+                    }
+                },
+            }
+        }
+
+        let mut batch = WriteBatch::default();
+        for (pubkey, (slot, account)) in latest_accounts {
+            match self.load_meta(&pubkey)? {
+                Some(existing_meta) => match slot.cmp(&existing_meta.slot) {
+                    Ordering::Greater => {}
+                    Ordering::Less => {
+                        stats.accounts_skipped += 1;
+                        continue;
+                    }
+                    Ordering::Equal => {
+                        panic!("Accounts may only be stored once per slot: ({slot}, {pubkey})");
+                    }
+                },
+                None => {}
+            }
+
+            self.add_account_to_batch(
+                &mut batch,
+                &pubkey,
+                slot,
+                account,
+                &mut stats,
+                false,
+            )?;
         }
 
         if stats.accounts_written > 0 {
@@ -374,5 +448,46 @@ mod tests {
         assert_eq!(slot, 4);
         assert_eq!(loaded.lamports(), 43);
         assert_eq!(loaded.data(), account.data());
+    }
+
+    #[test]
+    fn test_startup_store_keeps_highest_slot() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = RocksAccountsDb::open(temp_dir.path()).unwrap();
+        let pubkey = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let older = AccountSharedData::new(5, 4, &owner);
+        let newer = AccountSharedData::new(10, 8, &owner);
+
+        let stats = db
+            .store_startup_accounts_with_slots([(&pubkey, 10, &newer), (&pubkey, 5, &older)])
+            .unwrap();
+        assert_eq!(stats.accounts_written, 1);
+        assert_eq!(stats.accounts_skipped, 1);
+        let (loaded, slot) = db.load_account_with_slot(&pubkey).unwrap().unwrap();
+        assert_eq!(slot, 10);
+        assert_eq!(loaded, newer);
+
+        let stats = db
+            .store_startup_accounts_with_slots([(&pubkey, 7, &older)])
+            .unwrap();
+        assert_eq!(stats.accounts_written, 0);
+        assert_eq!(stats.accounts_skipped, 1);
+        let (loaded, slot) = db.load_account_with_slot(&pubkey).unwrap().unwrap();
+        assert_eq!(slot, 10);
+        assert_eq!(loaded, newer);
+    }
+
+    #[test]
+    #[should_panic(expected = "Accounts may only be stored once per slot:")]
+    fn test_startup_store_panics_on_same_slot_duplicate() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = RocksAccountsDb::open(temp_dir.path()).unwrap();
+        let pubkey = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let account = AccountSharedData::new(5, 4, &owner);
+
+        db.store_startup_accounts_with_slots([(&pubkey, 10, &account), (&pubkey, 10, &account)])
+            .unwrap();
     }
 }

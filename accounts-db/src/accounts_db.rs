@@ -59,7 +59,7 @@ use {
         is_zero_lamport::IsZeroLamport,
         partitioned_rewards::PartitionedEpochRewardsConfig,
         read_only_accounts_cache::ReadOnlyAccountsCache,
-        rocks_accounts::RocksAccountsDb,
+        rocks_accounts::{RocksAccountsDb, RocksAccountsStoreStats},
         storable_accounts::{StorableAccounts, StorableAccountsBySlot},
         u64_align,
         utils::{self, create_account_shared_data},
@@ -6112,50 +6112,131 @@ impl AccountsDb {
 
     fn store_rocks_startup_batch(
         batch: &mut Vec<(Pubkey, Slot, AccountSharedData)>,
+        batch_bytes: &mut usize,
         rocks_accounts: &RocksAccountsDb,
-    ) {
+    ) -> RocksAccountsStoreStats {
         if batch.is_empty() {
-            return;
+            return RocksAccountsStoreStats::default();
         }
 
-        rocks_accounts
-            .store_accounts_with_slots(
+        let stats = rocks_accounts
+            .store_startup_accounts_with_slots(
                 batch
                     .iter()
                     .map(|(pubkey, slot, account)| (pubkey, *slot, account)),
             )
             .expect("store startup accounts to Rocks");
         batch.clear();
+        *batch_bytes = 0;
+        stats
     }
 
-    fn import_rocks_accounts_from_startup_index(&self) -> u64 {
-        const ROCKS_STARTUP_IMPORT_BATCH_SIZE: usize = 4096;
+    fn import_rocks_accounts_from_storages(
+        &self,
+        storages: &[Arc<AccountStorageEntry>],
+    ) -> (u64, RocksAccountsStoreStats) {
+        const ROCKS_STARTUP_IMPORT_BATCH_ACCOUNTS: usize = 65_536;
+        const ROCKS_STARTUP_IMPORT_BATCH_BYTES: usize = 256 * 1024 * 1024;
 
-        let max_root = self.accounts_index.max_root_inclusive();
-        let ancestors = Ancestors::default();
-        let mut batch = Vec::with_capacity(ROCKS_STARTUP_IMPORT_BATCH_SIZE);
-        let mut accounts_imported = 0_u64;
+        let mut reader = append_vec::new_scan_accounts_reader();
+        let mut batch = Vec::with_capacity(ROCKS_STARTUP_IMPORT_BATCH_ACCOUNTS);
+        let mut batch_bytes = 0;
+        let mut accounts_scanned = 0_u64;
+        let mut stats = RocksAccountsStoreStats::default();
 
-        self.accounts_index.scan_accounts(
-            &ancestors,
-            max_root,
-            |pubkey, (account_info, slot)| {
-                let mut accessor =
-                    self.get_account_accessor(slot, &account_info.storage_location());
-                let account = accessor.check_and_get_loaded_account_shared_data();
-                batch.push((*pubkey, slot, account));
-                accounts_imported += 1;
+        for storage in storages {
+            let slot = storage.slot();
+            let obsolete_accounts: IntSet<_> = storage
+                .obsolete_accounts_read_lock()
+                .filter_obsolete_accounts(None)
+                .map(|(offset, _)| offset)
+                .collect();
+            let geyser_notifier = self
+                .accounts_update_notifier
+                .as_ref()
+                .filter(|notifier| notifier.snapshot_notifications_enabled());
+            let mut write_version_for_geyser = 0;
 
-                if batch.len() >= ROCKS_STARTUP_IMPORT_BATCH_SIZE {
-                    Self::store_rocks_startup_batch(&mut batch, &self.rocks_accounts);
-                }
-            },
-            &ScanConfig::default(),
-        );
+            storage
+                .accounts
+                .scan_accounts(&mut reader, |offset, account| {
+                    if obsolete_accounts.contains(&offset) {
+                        return;
+                    }
 
-        Self::store_rocks_startup_batch(&mut batch, &self.rocks_accounts);
+                    if let Some(geyser_notifier) = geyser_notifier {
+                        debug_assert!(geyser_notifier.snapshot_notifications_enabled());
+                        let account_for_geyser = AccountForGeyser {
+                            pubkey: account.pubkey(),
+                            lamports: account.lamports(),
+                            owner: account.owner(),
+                            executable: account.executable(),
+                            rent_epoch: account.rent_epoch(),
+                            data: account.data(),
+                        };
+                        geyser_notifier.notify_account_restore_from_snapshot(
+                            slot,
+                            write_version_for_geyser,
+                            &account_for_geyser,
+                        );
+                        write_version_for_geyser += 1;
+                    }
+
+                    accounts_scanned += 1;
+                    batch_bytes += account.data().len() + 128;
+                    batch.push((*account.pubkey(), slot, create_account_shared_data(&account)));
+
+                    if batch.len() >= ROCKS_STARTUP_IMPORT_BATCH_ACCOUNTS
+                        || batch_bytes >= ROCKS_STARTUP_IMPORT_BATCH_BYTES
+                    {
+                        stats.accumulate(Self::store_rocks_startup_batch(
+                            &mut batch,
+                            &mut batch_bytes,
+                            &self.rocks_accounts,
+                        ));
+                    }
+                })
+                .expect("must scan accounts storage");
+        }
+
+        stats.accumulate(Self::store_rocks_startup_batch(
+            &mut batch,
+            &mut batch_bytes,
+            &self.rocks_accounts,
+        ));
         self.rocks_accounts.flush().expect("flush startup Rocks import");
-        accounts_imported
+        (accounts_scanned, stats)
+    }
+
+    fn calculate_index_generation_info_from_rocks(&self) -> IndexGenerationInfo {
+        let mut accounts_data_len = 0;
+        let mut lt_hash = LtHash::identity();
+        let mut capitalization = 0_u128;
+
+        self.rocks_accounts
+            .scan_accounts(|pubkey, account, _slot| {
+                if account.lamports() != 0 {
+                    accounts_data_len += account.data().len() as u64;
+                    lt_hash.mix_in(&Self::lt_hash_account(&account, pubkey).0);
+                }
+                capitalization = capitalization
+                    .checked_add(u128::from(account.lamports()))
+                    .expect("capitalization cannot overflow");
+            })
+            .expect("scan Rocks accounts for startup index generation info");
+
+        let calculated_capitalization = u64::try_from(capitalization).unwrap_or_else(|_| {
+            panic!(
+                "calculated capitalization overflowed a u64, which is invalid! calculated \
+                 capitalization: {capitalization}",
+            )
+        });
+
+        IndexGenerationInfo {
+            accounts_data_len,
+            calculated_accounts_lt_hash: AccountsLtHash(lt_hash),
+            calculated_capitalization,
+        }
     }
 
     pub fn generate_index(
@@ -6171,6 +6252,40 @@ impl AccountsDb {
             storages.truncate(limit); // get rid of the newer slots and keep just the older
         }
         let num_storages = storages.len();
+
+        if self.use_rocks_accounts() {
+            let mut import_rocks_accounts_time = Measure::start("import_rocks_accounts_time");
+            let (num_rocks_accounts_scanned, rocks_stats) =
+                self.import_rocks_accounts_from_storages(&storages);
+            import_rocks_accounts_time.stop();
+            info!(
+                "scanned {num_rocks_accounts_scanned} startup accounts and wrote {} accounts \
+                 into Rocks in {:?}; skipped {} older duplicate accounts",
+                rocks_stats.accounts_written,
+                import_rocks_accounts_time.as_duration(),
+                rocks_stats.accounts_skipped,
+            );
+
+            let mut calculate_info_time = Measure::start("calculate_rocks_index_generation_info");
+            let index_generation_info = self.calculate_index_generation_info_from_rocks();
+            calculate_info_time.stop();
+            info!(
+                "calculated Rocks startup accounts info in {:?}",
+                calculate_info_time.as_duration()
+            );
+
+            if let Some(storage) = storages.last() {
+                self.accounts_cache.set_max_flush_root(storage.slot());
+            }
+            self.accounts_index.clear_after_startup_import();
+
+            if let Some(geyser_notifier) = &self.accounts_update_notifier {
+                geyser_notifier.notify_end_of_restore_from_snapshot();
+            }
+
+            total_time.stop();
+            return index_generation_info;
+        }
 
         self.accounts_index.set_startup(Startup::Startup);
 
@@ -6438,32 +6553,6 @@ impl AccountsDb {
                 total_accum.capitalization,
             );
         };
-
-        if self.use_rocks_accounts() {
-            for storage in &storages {
-                self.accounts_index.add_root(storage.slot());
-            }
-
-            let mut import_rocks_accounts_time = Measure::start("import_rocks_accounts_time");
-            let num_rocks_accounts_imported = self.import_rocks_accounts_from_startup_index();
-            import_rocks_accounts_time.stop();
-            info!(
-                "imported {num_rocks_accounts_imported} startup accounts into Rocks in {:?}",
-                import_rocks_accounts_time.as_duration()
-            );
-            if let Some(storage) = storages.last() {
-                self.accounts_cache.set_max_flush_root(storage.slot());
-            }
-
-            self.accounts_index.clear_after_startup_import();
-
-            total_time.stop();
-            return IndexGenerationInfo {
-                accounts_data_len: total_accum.accounts_data_len,
-                calculated_accounts_lt_hash: AccountsLtHash(total_accum.lt_hash),
-                calculated_capitalization,
-            };
-        }
 
         // insert all zero lamport account storage into the dirty stores and add them into the uncleaned roots for clean to pick up
         info!(
