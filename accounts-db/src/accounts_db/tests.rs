@@ -16,7 +16,7 @@ use {
         Account, AccountSharedData, DUMMY_INHERITABLE_ACCOUNT_FIELDS, InheritableAccountFields,
         ReadableAccount, WritableAccount, accounts_equal,
     },
-    solana_lattice_hash::lt_hash::Checksum as LtHashChecksum,
+    solana_lattice_hash::lt_hash::{Checksum as LtHashChecksum, LtHash},
     solana_pubkey::PUBKEY_BYTES,
     std::{
         iter::{self, FromIterator},
@@ -342,6 +342,13 @@ fn test_generate_index_imports_highest_slot_duplicate_to_rocks() {
     assert_eq!(loaded_account, new_account);
     assert_eq!(result.accounts_data_len, new_account.data().len() as u64);
     assert_eq!(result.calculated_capitalization, new_account.lamports());
+
+    let mut expected_lt_hash = LtHash::identity();
+    expected_lt_hash.mix_in(&AccountsDb::lt_hash_account(&new_account, &pubkey).0);
+    assert_eq!(
+        result.calculated_accounts_lt_hash,
+        AccountsLtHash(expected_lt_hash)
+    );
 }
 
 #[test]

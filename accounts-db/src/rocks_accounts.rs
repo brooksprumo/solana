@@ -1,14 +1,12 @@
 use {
     rocksdb::{
         BlockBasedOptions, Cache, ColumnFamilyDescriptor, ColumnFamilyRef, DB, IteratorMode,
-        Options, WriteBatch,
+        MergeOperands, Options, WriteBatch,
     },
     solana_account::{AccountSharedData, ReadableAccount},
     solana_clock::{Epoch, Slot},
     solana_pubkey::Pubkey,
     std::{
-        cmp::Ordering,
-        collections::{hash_map::Entry, HashMap},
         fmt,
         path::{Path, PathBuf},
         sync::Arc,
@@ -22,6 +20,8 @@ const ACCOUNT_META_BLOCK_CACHE_SIZE: usize = 50 * 1024 * 1024 * 1024;
 const ACCOUNT_DATA_BLOB_CACHE_SIZE: usize = 10 * 1024 * 1024 * 1024;
 
 const ACCOUNT_META_LEN: usize = 8 + 32 + 8 + 1 + 8;
+const ACCOUNT_DATA_VALUE_MAGIC: &[u8; 16] = b"solAcctDataV001!";
+const ACCOUNT_DATA_VALUE_HEADER_LEN: usize = ACCOUNT_DATA_VALUE_MAGIC.len() + 8 + 1 + 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AccountMeta {
@@ -86,6 +86,121 @@ impl AccountMeta {
             self.rent_epoch,
         )
     }
+}
+
+enum AccountDataValue<'a> {
+    Present { slot: Slot, data: &'a [u8] },
+    Absent { slot: Slot },
+    LegacyRaw { data: &'a [u8] },
+}
+
+impl<'a> AccountDataValue<'a> {
+    fn slot(&self) -> Slot {
+        match self {
+            Self::Present { slot, .. } | Self::Absent { slot } => *slot,
+            Self::LegacyRaw { .. } => 0,
+        }
+    }
+}
+
+fn encode_account_data_value(slot: Slot, data: Option<&[u8]>) -> Vec<u8> {
+    let data_len = data.map_or(0, <[u8]>::len);
+    let mut out = Vec::with_capacity(ACCOUNT_DATA_VALUE_HEADER_LEN + data_len);
+    out.extend_from_slice(ACCOUNT_DATA_VALUE_MAGIC);
+    out.extend_from_slice(&slot.to_le_bytes());
+    out.push(u8::from(data.is_some()));
+    out.extend_from_slice(&(data_len as u64).to_le_bytes());
+    if let Some(data) = data {
+        out.extend_from_slice(data);
+    }
+    out
+}
+
+fn decode_account_data_value(bytes: &[u8]) -> AccountDataValue<'_> {
+    if bytes.len() < ACCOUNT_DATA_VALUE_HEADER_LEN
+        || &bytes[..ACCOUNT_DATA_VALUE_MAGIC.len()] != ACCOUNT_DATA_VALUE_MAGIC
+    {
+        return AccountDataValue::LegacyRaw { data: bytes };
+    }
+
+    let slot_start = ACCOUNT_DATA_VALUE_MAGIC.len();
+    let present_index = slot_start + 8;
+    let len_start = present_index + 1;
+    let data_start = len_start + 8;
+    let Ok(slot) = bytes[slot_start..present_index].try_into() else {
+        return AccountDataValue::LegacyRaw { data: bytes };
+    };
+    let Ok(data_len) = bytes[len_start..data_start].try_into() else {
+        return AccountDataValue::LegacyRaw { data: bytes };
+    };
+    let slot = u64::from_le_bytes(slot);
+    let data_len = u64::from_le_bytes(data_len) as usize;
+    let Some(data_end) = data_start.checked_add(data_len) else {
+        return AccountDataValue::LegacyRaw { data: bytes };
+    };
+    if data_end != bytes.len() {
+        return AccountDataValue::LegacyRaw { data: bytes };
+    }
+
+    match bytes[present_index] {
+        0 => AccountDataValue::Absent { slot },
+        1 => AccountDataValue::Present {
+            slot,
+            data: &bytes[data_start..data_end],
+        },
+        _ => AccountDataValue::LegacyRaw { data: bytes },
+    }
+}
+
+fn account_data_value_data(bytes: &[u8]) -> &[u8] {
+    match decode_account_data_value(bytes) {
+        AccountDataValue::Present { data, .. } | AccountDataValue::LegacyRaw { data } => data,
+        AccountDataValue::Absent { .. } => &[],
+    }
+}
+
+fn merge_account_meta(
+    _key: &[u8],
+    old_value: Option<&[u8]>,
+    operands: &MergeOperands,
+) -> Option<Vec<u8>> {
+    let mut latest_slot = old_value
+        .and_then(AccountMeta::decode)
+        .map(|meta| meta.slot)
+        .unwrap_or_default();
+    let mut latest_value = old_value.map(<[u8]>::to_vec);
+
+    for operand in operands {
+        let operand_meta = AccountMeta::decode(operand)?;
+        if latest_value.is_none() || operand_meta.slot >= latest_slot {
+            latest_slot = operand_meta.slot;
+            latest_value = Some(operand.to_vec());
+        }
+    }
+
+    latest_value
+}
+
+fn merge_account_data(
+    _key: &[u8],
+    old_value: Option<&[u8]>,
+    operands: &MergeOperands,
+) -> Option<Vec<u8>> {
+    let mut latest_slot = old_value
+        .map(decode_account_data_value)
+        .map(|value| value.slot())
+        .unwrap_or_default();
+    let mut latest_value = old_value.map(<[u8]>::to_vec);
+
+    for operand in operands {
+        let operand_value = decode_account_data_value(operand);
+        if latest_value.is_none() || operand_value.slot() >= latest_slot {
+            latest_slot = operand_value.slot();
+            latest_value = Some(operand.to_vec());
+        }
+    }
+
+    latest_value
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +273,7 @@ impl RocksAccountsDb {
     fn account_meta_options() -> Options {
         let mut options = Options::default();
         options.set_write_buffer_size(64 * 1024 * 1024);
+        options.set_merge_operator_associative("account meta slot merge", merge_account_meta);
 
         let cache = Cache::new_lru_cache(ACCOUNT_META_BLOCK_CACHE_SIZE);
         let mut block_options = BlockBasedOptions::default();
@@ -170,6 +286,7 @@ impl RocksAccountsDb {
     fn account_data_options() -> Options {
         let mut options = Options::default();
         options.set_write_buffer_size(256 * 1024 * 1024);
+        options.set_merge_operator_associative("account data slot merge", merge_account_data);
         options.set_enable_blob_files(true);
         options.set_min_blob_size(ACCOUNT_DATA_MIN_BLOB_SIZE);
         let blob_cache = Cache::new_lru_cache(ACCOUNT_DATA_BLOB_CACHE_SIZE);
@@ -205,7 +322,7 @@ impl RocksAccountsDb {
     fn data_matches(&self, pubkey: &Pubkey, data: &[u8]) -> Result<bool, rocksdb::Error> {
         self.db
             .get_cf(&self.data_cf(), pubkey.as_ref())
-            .map(|old_data| old_data.as_deref().unwrap_or_default() == data)
+            .map(|old_data| old_data.as_deref().map(account_data_value_data) == Some(data))
     }
 
     fn add_account_to_batch(
@@ -227,7 +344,11 @@ impl RocksAccountsDb {
             batch.delete_cf(&self.data_cf(), pubkey.as_ref());
             stats.data_values_deleted += 1;
         } else if !compare_existing_data || !self.data_matches(pubkey, data)? {
-            batch.put_cf(&self.data_cf(), pubkey.as_ref(), data);
+            batch.put_cf(
+                &self.data_cf(),
+                pubkey.as_ref(),
+                encode_account_data_value(slot, Some(data)),
+            );
             stats.data_values_written += 1;
             stats.data_bytes_written += data.len() as u64;
         }
@@ -273,53 +394,33 @@ impl RocksAccountsDb {
         &self,
         accounts: impl IntoIterator<Item = (&'a Pubkey, Slot, &'a AccountSharedData)>,
     ) -> Result<RocksAccountsStoreStats, rocksdb::Error> {
-        let mut latest_accounts = HashMap::<Pubkey, (Slot, &'a AccountSharedData)>::new();
+        let meta_cf = self.meta_cf();
+        let data_cf = self.data_cf();
+        let mut batch = WriteBatch::default();
         let mut stats = RocksAccountsStoreStats::default();
 
         for (pubkey, slot, account) in accounts {
-            match latest_accounts.entry(*pubkey) {
-                Entry::Vacant(entry) => {
-                    entry.insert((slot, account));
-                }
-                Entry::Occupied(mut entry) => match slot.cmp(&entry.get().0) {
-                    Ordering::Greater => {
-                        stats.accounts_skipped += 1;
-                        entry.insert((slot, account));
-                    }
-                    Ordering::Less => {
-                        stats.accounts_skipped += 1;
-                    }
-                    Ordering::Equal => {
-                        panic!("Accounts may only be stored once per slot: ({slot}, {pubkey})");
-                    }
-                },
-            }
-        }
+            batch.merge_cf(
+                &meta_cf,
+                pubkey.as_ref(),
+                AccountMeta::from_account(slot, account).encode(),
+            );
+            stats.accounts_written += 1;
+            stats.metadata_values_written += 1;
 
-        let mut batch = WriteBatch::default();
-        for (pubkey, (slot, account)) in latest_accounts {
-            match self.load_meta(&pubkey)? {
-                Some(existing_meta) => match slot.cmp(&existing_meta.slot) {
-                    Ordering::Greater => {}
-                    Ordering::Less => {
-                        stats.accounts_skipped += 1;
-                        continue;
-                    }
-                    Ordering::Equal => {
-                        panic!("Accounts may only be stored once per slot: ({slot}, {pubkey})");
-                    }
-                },
-                None => {}
-            }
-
-            self.add_account_to_batch(
-                &mut batch,
-                &pubkey,
-                slot,
-                account,
-                &mut stats,
-                false,
-            )?;
+            let data = account.data();
+            if account.lamports() == 0 || data.is_empty() {
+                batch.merge_cf(&data_cf, pubkey.as_ref(), encode_account_data_value(slot, None));
+                stats.data_values_deleted += 1;
+            } else {
+                batch.merge_cf(
+                    &data_cf,
+                    pubkey.as_ref(),
+                    encode_account_data_value(slot, Some(data)),
+                );
+                stats.data_values_written += 1;
+                stats.data_bytes_written += data.len() as u64;
+            };
         }
 
         if stats.accounts_written > 0 {
@@ -348,6 +449,7 @@ impl RocksAccountsDb {
         let data = self
             .db
             .get_cf(&self.data_cf(), pubkey.as_ref())?
+            .map(|data| account_data_value_data(&data).to_vec())
             .unwrap_or_default();
         let account = meta.clone().into_account(data);
         Ok(Some((account, meta)))
@@ -374,6 +476,7 @@ impl RocksAccountsDb {
             let data = self
                 .db
                 .get_cf(&data_cf, pubkey.as_ref())?
+                .map(|data| account_data_value_data(&data).to_vec())
                 .unwrap_or_default();
             let slot = meta.slot;
             callback(&pubkey, meta.into_account(data), slot);
@@ -522,8 +625,8 @@ mod tests {
         let stats = db
             .store_startup_accounts_with_slots([(&pubkey, 10, &newer), (&pubkey, 5, &older)])
             .unwrap();
-        assert_eq!(stats.accounts_written, 1);
-        assert_eq!(stats.accounts_skipped, 1);
+        assert_eq!(stats.accounts_written, 2);
+        assert_eq!(stats.accounts_skipped, 0);
         let (loaded, slot) = db.load_account_with_slot(&pubkey).unwrap().unwrap();
         assert_eq!(slot, 10);
         assert_eq!(loaded, newer);
@@ -531,16 +634,15 @@ mod tests {
         let stats = db
             .store_startup_accounts_with_slots([(&pubkey, 7, &older)])
             .unwrap();
-        assert_eq!(stats.accounts_written, 0);
-        assert_eq!(stats.accounts_skipped, 1);
+        assert_eq!(stats.accounts_written, 1);
+        assert_eq!(stats.accounts_skipped, 0);
         let (loaded, slot) = db.load_account_with_slot(&pubkey).unwrap().unwrap();
         assert_eq!(slot, 10);
         assert_eq!(loaded, newer);
     }
 
     #[test]
-    #[should_panic(expected = "Accounts may only be stored once per slot:")]
-    fn test_startup_store_panics_on_same_slot_duplicate() {
+    fn test_startup_store_allows_same_slot_duplicate() {
         let temp_dir = TempDir::new().unwrap();
         let db = RocksAccountsDb::open(temp_dir.path()).unwrap();
         let pubkey = Pubkey::new_unique();
@@ -549,5 +651,31 @@ mod tests {
 
         db.store_startup_accounts_with_slots([(&pubkey, 10, &account), (&pubkey, 10, &account)])
             .unwrap();
+
+        let (loaded, slot) = db.load_account_with_slot(&pubkey).unwrap().unwrap();
+        assert_eq!(slot, 10);
+        assert_eq!(loaded, account);
+    }
+
+    #[test]
+    fn test_startup_store_newer_zero_lamport_removes_older_data() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = RocksAccountsDb::open(temp_dir.path()).unwrap();
+        let pubkey = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let older = AccountSharedData::new(5, 4, &owner);
+        let newer_zero_lamport = AccountSharedData::new(0, 0, &owner);
+
+        db.store_startup_accounts_with_slots([
+            (&pubkey, 10, &older),
+            (&pubkey, 12, &newer_zero_lamport),
+            (&pubkey, 11, &older),
+        ])
+        .unwrap();
+
+        let (loaded, slot) = db.load_account_with_slot(&pubkey).unwrap().unwrap();
+        assert_eq!(slot, 12);
+        assert_eq!(loaded.lamports(), 0);
+        assert!(loaded.data().is_empty());
     }
 }

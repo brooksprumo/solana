@@ -6131,79 +6131,112 @@ impl AccountsDb {
         stats
     }
 
-    fn import_rocks_accounts_from_storages(
+    fn import_rocks_accounts_from_storage(
         &self,
-        storages: &[Arc<AccountStorageEntry>],
+        storage: &AccountStorageEntry,
+        batch_accounts_limit: usize,
+        batch_bytes_limit: usize,
     ) -> (u64, RocksAccountsStoreStats) {
-        const ROCKS_STARTUP_IMPORT_BATCH_ACCOUNTS: usize = 65_536;
-        const ROCKS_STARTUP_IMPORT_BATCH_BYTES: usize = 256 * 1024 * 1024;
-
         let mut reader = append_vec::new_scan_accounts_reader();
-        let mut batch = Vec::with_capacity(ROCKS_STARTUP_IMPORT_BATCH_ACCOUNTS);
+        let mut batch = Vec::with_capacity(batch_accounts_limit);
         let mut batch_bytes = 0;
         let mut accounts_scanned = 0_u64;
         let mut stats = RocksAccountsStoreStats::default();
+        let slot = storage.slot();
+        let obsolete_accounts: IntSet<_> = storage
+            .obsolete_accounts_read_lock()
+            .filter_obsolete_accounts(None)
+            .map(|(offset, _)| offset)
+            .collect();
+        let geyser_notifier = self
+            .accounts_update_notifier
+            .as_ref()
+            .filter(|notifier| notifier.snapshot_notifications_enabled());
+        let mut write_version_for_geyser = 0;
 
-        for storage in storages {
-            let slot = storage.slot();
-            let obsolete_accounts: IntSet<_> = storage
-                .obsolete_accounts_read_lock()
-                .filter_obsolete_accounts(None)
-                .map(|(offset, _)| offset)
-                .collect();
-            let geyser_notifier = self
-                .accounts_update_notifier
-                .as_ref()
-                .filter(|notifier| notifier.snapshot_notifications_enabled());
-            let mut write_version_for_geyser = 0;
+        storage
+            .accounts
+            .scan_accounts(&mut reader, |offset, account| {
+                if obsolete_accounts.contains(&offset) {
+                    return;
+                }
 
-            storage
-                .accounts
-                .scan_accounts(&mut reader, |offset, account| {
-                    if obsolete_accounts.contains(&offset) {
-                        return;
-                    }
+                if let Some(geyser_notifier) = geyser_notifier {
+                    debug_assert!(geyser_notifier.snapshot_notifications_enabled());
+                    let account_for_geyser = AccountForGeyser {
+                        pubkey: account.pubkey(),
+                        lamports: account.lamports(),
+                        owner: account.owner(),
+                        executable: account.executable(),
+                        rent_epoch: account.rent_epoch(),
+                        data: account.data(),
+                    };
+                    geyser_notifier.notify_account_restore_from_snapshot(
+                        slot,
+                        write_version_for_geyser,
+                        &account_for_geyser,
+                    );
+                    write_version_for_geyser += 1;
+                }
 
-                    if let Some(geyser_notifier) = geyser_notifier {
-                        debug_assert!(geyser_notifier.snapshot_notifications_enabled());
-                        let account_for_geyser = AccountForGeyser {
-                            pubkey: account.pubkey(),
-                            lamports: account.lamports(),
-                            owner: account.owner(),
-                            executable: account.executable(),
-                            rent_epoch: account.rent_epoch(),
-                            data: account.data(),
-                        };
-                        geyser_notifier.notify_account_restore_from_snapshot(
-                            slot,
-                            write_version_for_geyser,
-                            &account_for_geyser,
-                        );
-                        write_version_for_geyser += 1;
-                    }
+                accounts_scanned += 1;
+                batch_bytes += account.data().len() + 128;
+                batch.push((*account.pubkey(), slot, create_account_shared_data(&account)));
 
-                    accounts_scanned += 1;
-                    batch_bytes += account.data().len() + 128;
-                    batch.push((*account.pubkey(), slot, create_account_shared_data(&account)));
-
-                    if batch.len() >= ROCKS_STARTUP_IMPORT_BATCH_ACCOUNTS
-                        || batch_bytes >= ROCKS_STARTUP_IMPORT_BATCH_BYTES
-                    {
-                        stats.accumulate(Self::store_rocks_startup_batch(
-                            &mut batch,
-                            &mut batch_bytes,
-                            &self.rocks_accounts,
-                        ));
-                    }
-                })
-                .expect("must scan accounts storage");
-        }
+                if batch.len() >= batch_accounts_limit || batch_bytes >= batch_bytes_limit {
+                    stats.accumulate(Self::store_rocks_startup_batch(
+                        &mut batch,
+                        &mut batch_bytes,
+                        &self.rocks_accounts,
+                    ));
+                }
+            })
+            .expect("must scan accounts storage");
 
         stats.accumulate(Self::store_rocks_startup_batch(
             &mut batch,
             &mut batch_bytes,
             &self.rocks_accounts,
         ));
+        (accounts_scanned, stats)
+    }
+
+    fn import_rocks_accounts_from_storages(
+        &self,
+        storages: &[Arc<AccountStorageEntry>],
+    ) -> (u64, RocksAccountsStoreStats) {
+        const ROCKS_STARTUP_IMPORT_BATCH_ACCOUNTS_TOTAL: usize = 65_536;
+        const ROCKS_STARTUP_IMPORT_BATCH_BYTES_TOTAL: usize = 256 * 1024 * 1024;
+        const ROCKS_STARTUP_IMPORT_BATCH_ACCOUNTS_MIN: usize = 4_096;
+        const ROCKS_STARTUP_IMPORT_BATCH_BYTES_MIN: usize = 8 * 1024 * 1024;
+
+        let num_threads = self.thread_pool_foreground.current_num_threads().max(1);
+        let batch_accounts_limit = ROCKS_STARTUP_IMPORT_BATCH_ACCOUNTS_TOTAL
+            .div_ceil(num_threads)
+            .max(ROCKS_STARTUP_IMPORT_BATCH_ACCOUNTS_MIN);
+        let batch_bytes_limit = ROCKS_STARTUP_IMPORT_BATCH_BYTES_TOTAL
+            .div_ceil(num_threads)
+            .max(ROCKS_STARTUP_IMPORT_BATCH_BYTES_MIN);
+
+        let (accounts_scanned, stats) = self.thread_pool_foreground.install(|| {
+            storages
+                .par_iter()
+                .map(|storage| {
+                    self.import_rocks_accounts_from_storage(
+                        storage.as_ref(),
+                        batch_accounts_limit,
+                        batch_bytes_limit,
+                    )
+                })
+                .reduce(
+                    || (0, RocksAccountsStoreStats::default()),
+                    |(accounts_scanned_a, mut stats_a), (accounts_scanned_b, stats_b)| {
+                        stats_a.accumulate(stats_b);
+                        (accounts_scanned_a + accounts_scanned_b, stats_a)
+                    },
+                )
+        });
+
         self.rocks_accounts.flush().expect("flush startup Rocks import");
         (accounts_scanned, stats)
     }
@@ -6259,11 +6292,10 @@ impl AccountsDb {
                 self.import_rocks_accounts_from_storages(&storages);
             import_rocks_accounts_time.stop();
             info!(
-                "scanned {num_rocks_accounts_scanned} startup accounts and wrote {} accounts \
-                 into Rocks in {:?}; skipped {} older duplicate accounts",
+                "scanned {num_rocks_accounts_scanned} startup account versions and merged {} \
+                 versions into Rocks in {:?}",
                 rocks_stats.accounts_written,
                 import_rocks_accounts_time.as_duration(),
-                rocks_stats.accounts_skipped,
             );
 
             let mut calculate_info_time = Measure::start("calculate_rocks_index_generation_info");
