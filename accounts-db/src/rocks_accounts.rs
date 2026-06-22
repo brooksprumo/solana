@@ -1,5 +1,8 @@
 use {
-    rocksdb::{ColumnFamilyDescriptor, ColumnFamilyRef, DB, IteratorMode, Options, WriteBatch},
+    rocksdb::{
+        BlockBasedOptions, Cache, ColumnFamilyDescriptor, ColumnFamilyRef, DB, IteratorMode,
+        Options, WriteBatch,
+    },
     solana_account::{AccountSharedData, ReadableAccount},
     solana_clock::{Epoch, Slot},
     solana_pubkey::Pubkey,
@@ -14,8 +17,9 @@ use {
 
 const ACCOUNT_META_CF: &str = "account_meta";
 const ACCOUNT_DATA_CF: &str = "account_data";
-const DB_META_CF: &str = "db_meta";
 pub(crate) const ACCOUNT_DATA_MIN_BLOB_SIZE: u64 = 1024;
+const ACCOUNT_META_BLOCK_CACHE_SIZE: usize = 50 * 1024 * 1024 * 1024;
+const ACCOUNT_DATA_BLOB_CACHE_SIZE: usize = 10 * 1024 * 1024 * 1024;
 
 const ACCOUNT_META_LEN: usize = 8 + 32 + 8 + 1 + 8;
 
@@ -126,15 +130,27 @@ impl RocksAccountsDb {
         db_options.create_missing_column_families(true);
         db_options.set_max_background_jobs(4);
 
-        let db = DB::open_cf_descriptors(
-            &db_options,
-            &path,
-            [
-                ColumnFamilyDescriptor::new(ACCOUNT_META_CF, Self::account_meta_options()),
-                ColumnFamilyDescriptor::new(ACCOUNT_DATA_CF, Self::account_data_options()),
-                ColumnFamilyDescriptor::new(DB_META_CF, Self::db_meta_options()),
-            ],
-        )?;
+        let mut cf_descriptors = vec![
+            ColumnFamilyDescriptor::new(ACCOUNT_META_CF, Self::account_meta_options()),
+            ColumnFamilyDescriptor::new(ACCOUNT_DATA_CF, Self::account_data_options()),
+        ];
+
+        const LEGACY_DB_META_CF: &str = "db_meta";
+        let has_legacy_db_meta_cf = path.exists()
+            && DB::list_cf(&db_options, &path)
+                .map(|cfs| cfs.iter().any(|cf| cf == LEGACY_DB_META_CF))
+                .unwrap_or(false);
+        if has_legacy_db_meta_cf {
+            cf_descriptors.push(ColumnFamilyDescriptor::new(
+                LEGACY_DB_META_CF,
+                Options::default(),
+            ));
+        }
+
+        let mut db = DB::open_cf_descriptors(&db_options, &path, cf_descriptors)?;
+        if has_legacy_db_meta_cf {
+            db.drop_cf(LEGACY_DB_META_CF)?;
+        }
 
         Ok(Self { db, path })
     }
@@ -142,6 +158,12 @@ impl RocksAccountsDb {
     fn account_meta_options() -> Options {
         let mut options = Options::default();
         options.set_write_buffer_size(64 * 1024 * 1024);
+
+        let cache = Cache::new_lru_cache(ACCOUNT_META_BLOCK_CACHE_SIZE);
+        let mut block_options = BlockBasedOptions::default();
+        block_options.set_block_cache(&cache);
+        options.set_block_based_table_factory(&block_options);
+
         options
     }
 
@@ -150,12 +172,8 @@ impl RocksAccountsDb {
         options.set_write_buffer_size(256 * 1024 * 1024);
         options.set_enable_blob_files(true);
         options.set_min_blob_size(ACCOUNT_DATA_MIN_BLOB_SIZE);
-        options
-    }
-
-    fn db_meta_options() -> Options {
-        let mut options = Options::default();
-        options.set_write_buffer_size(1024 * 1024);
+        let blob_cache = Cache::new_lru_cache(ACCOUNT_DATA_BLOB_CACHE_SIZE);
+        options.set_blob_cache(&blob_cache);
         options
     }
 
@@ -386,7 +404,6 @@ impl RocksAccountsDb {
     pub(crate) fn flush(&self) -> Result<(), rocksdb::Error> {
         self.db.flush_cf(&self.meta_cf())?;
         self.db.flush_cf(&self.data_cf())?;
-        self.db.flush_cf(&self.cf(DB_META_CF))?;
         Ok(())
     }
 }
@@ -422,6 +439,49 @@ mod tests {
         assert!(loaded.executable());
         assert_eq!(loaded.rent_epoch(), 11);
         assert_eq!(loaded.data(), account.data());
+    }
+
+    #[test]
+    fn test_db_meta_column_family_is_not_created() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = RocksAccountsDb::open(temp_dir.path()).unwrap();
+        drop(db);
+
+        let column_families = DB::list_cf(&Options::default(), temp_dir.path()).unwrap();
+        assert!(column_families.iter().any(|cf| cf == ACCOUNT_META_CF));
+        assert!(column_families.iter().any(|cf| cf == ACCOUNT_DATA_CF));
+        assert!(!column_families.iter().any(|cf| cf == "db_meta"));
+    }
+
+    #[test]
+    fn test_legacy_db_meta_column_family_is_dropped() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut db_options = Options::default();
+        db_options.create_if_missing(true);
+        db_options.create_missing_column_families(true);
+        let db = DB::open_cf_descriptors(
+            &db_options,
+            temp_dir.path(),
+            [
+                ColumnFamilyDescriptor::new(
+                    ACCOUNT_META_CF,
+                    RocksAccountsDb::account_meta_options(),
+                ),
+                ColumnFamilyDescriptor::new(
+                    ACCOUNT_DATA_CF,
+                    RocksAccountsDb::account_data_options(),
+                ),
+                ColumnFamilyDescriptor::new("db_meta", Options::default()),
+            ],
+        )
+        .unwrap();
+        drop(db);
+
+        let db = RocksAccountsDb::open(temp_dir.path()).unwrap();
+        drop(db);
+
+        let column_families = DB::list_cf(&Options::default(), temp_dir.path()).unwrap();
+        assert!(!column_families.iter().any(|cf| cf == "db_meta"));
     }
 
     #[test]
