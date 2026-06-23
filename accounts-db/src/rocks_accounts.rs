@@ -17,6 +17,7 @@ const ACCOUNT_META_CF: &str = "account_meta";
 const ACCOUNT_DATA_CF: &str = "account_data";
 pub(crate) const ACCOUNT_DATA_MIN_BLOB_SIZE: u64 = 1024;
 const ACCOUNT_META_BLOCK_CACHE_SIZE: usize = 50 * 1024 * 1024 * 1024;
+const ACCOUNT_DATA_BLOCK_CACHE_SIZE: usize = 50 * 1024 * 1024 * 1024;
 const ACCOUNT_DATA_BLOB_CACHE_SIZE: usize = 10 * 1024 * 1024 * 1024;
 
 const ACCOUNT_META_LEN: usize = 8 + 32 + 8 + 1 + 8;
@@ -281,6 +282,7 @@ impl RocksAccountsDb {
         let cache = Cache::new_lru_cache(ACCOUNT_META_BLOCK_CACHE_SIZE);
         let mut block_options = BlockBasedOptions::default();
         block_options.set_block_cache(&cache);
+        block_options.set_cache_index_and_filter_blocks(true);
         options.set_block_based_table_factory(&block_options);
 
         options
@@ -292,6 +294,12 @@ impl RocksAccountsDb {
         options.set_merge_operator_associative("account data slot merge", merge_account_data);
         options.set_enable_blob_files(true);
         options.set_min_blob_size(ACCOUNT_DATA_MIN_BLOB_SIZE);
+        let block_cache = Cache::new_lru_cache(ACCOUNT_DATA_BLOCK_CACHE_SIZE);
+        let mut block_options = BlockBasedOptions::default();
+        block_options.set_block_cache(&block_cache);
+        block_options.set_cache_index_and_filter_blocks(true);
+        options.set_block_based_table_factory(&block_options);
+
         let blob_cache = Cache::new_lru_cache(ACCOUNT_DATA_BLOB_CACHE_SIZE);
         options.set_blob_cache(&blob_cache);
         options

@@ -3699,6 +3699,20 @@ fn test_load_with_read_only_accounts_cache() {
     assert_eq!(db.read_only_accounts_cache.cache_len(), 1);
     assert_eq!(slot, 1);
 
+    let _ = db.read_only_accounts_cache.get_and_reset_stats();
+    let (account, slot) = db
+        .load(
+            &Ancestors::default(),
+            &account_key,
+            LoadHint::Unspecified,
+            PopulateReadCache::False,
+        )
+        .unwrap();
+    let read_cache_stats = db.read_only_accounts_cache.get_and_reset_stats();
+    assert_eq!(account.lamports(), 1);
+    assert_eq!(slot, 1);
+    assert_eq!(read_cache_stats.hits, 1);
+
     db.store_for_tests((2, &[(&account_key, &zero_lamport_account)][..]));
     let account = db.load(
         &Ancestors::default(),
@@ -3748,6 +3762,50 @@ fn test_load_with_read_only_accounts_cache() {
     // The account shouldn't be added to read_only_cache because it is in write_cache.
     assert_eq!(db.read_only_accounts_cache.cache_len(), 0);
     assert_eq!(slot, 2);
+}
+
+#[test]
+fn test_rocks_flush_invalidates_read_only_accounts_cache() {
+    let db = AccountsDb::new_single_for_tests();
+
+    let account_key = Pubkey::new_unique();
+    let account1 = AccountSharedData::new(1, 1, AccountSharedData::default().owner());
+    db.store_for_tests((1, &[(&account_key, &account1)][..]));
+    db.add_root(1);
+    db.flush_accounts_cache(true, Some(1));
+
+    let (account, slot) = db
+        .load(
+            &Ancestors::default(),
+            &account_key,
+            LoadHint::Unspecified,
+            PopulateReadCache::True,
+        )
+        .unwrap();
+    assert_eq!(account.lamports(), 1);
+    assert_eq!(slot, 1);
+    assert_eq!(db.read_only_accounts_cache.cache_len(), 1);
+
+    let account2 = AccountSharedData::new(2, 1, AccountSharedData::default().owner());
+    db.store_for_tests((2, &[(&account_key, &account2)][..]));
+    db.add_root(2);
+    db.flush_accounts_cache(true, Some(2));
+    assert_eq!(db.read_only_accounts_cache.cache_len(), 0);
+
+    let _ = db.read_only_accounts_cache.get_and_reset_stats();
+    let (account, slot) = db
+        .load(
+            &Ancestors::default(),
+            &account_key,
+            LoadHint::Unspecified,
+            PopulateReadCache::False,
+        )
+        .unwrap();
+    let read_cache_stats = db.read_only_accounts_cache.get_and_reset_stats();
+    assert_eq!(account.lamports(), 2);
+    assert_eq!(slot, 2);
+    assert_eq!(read_cache_stats.hits, 0);
+    assert_eq!(read_cache_stats.misses, 1);
 }
 
 /// `select_pubkeys_to_flush` keeps only the newest version of each account across the

@@ -3994,11 +3994,14 @@ impl AccountsDb {
 
         let max_root = ancestors.min_slot().unwrap_or(Slot::MAX);
 
-        if let Some(account) = self.read_only_accounts_cache.load(*pubkey, max_root) {
+        if let Some((account, slot)) = self
+            .read_only_accounts_cache
+            .load_older_or_equal(*pubkey, max_root)
+        {
             self.load_account_stats
                 .num_loaded_from_read_cache
                 .fetch_add(1, Ordering::Relaxed);
-            return Some((account, max_root));
+            return Some((account, slot));
         }
 
         let (account, slot) = self
@@ -4728,6 +4731,10 @@ impl AccountsDb {
                 handle_reclaims_elapsed: 0,
             };
             flush_stats.store_accounts_total_us = Saturating(rocks_store_accounts_us);
+        }
+        for (pubkey, _) in &accounts {
+            self.read_only_accounts_cache
+                .remove_assume_not_present(pubkey);
         }
         self.accounts_cache.set_max_flush_root(slot);
 

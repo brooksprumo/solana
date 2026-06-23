@@ -181,6 +181,35 @@ impl ReadOnlyAccountsCache {
         account
     }
 
+    pub(crate) fn load_older_or_equal(
+        &self,
+        pubkey: Pubkey,
+        max_slot: Slot,
+    ) -> Option<(AccountSharedData, Slot)> {
+        let (account, load_us) = measure_us!({
+            let mut found = None;
+            if let Some(entry) = self.cache.get(&pubkey) {
+                let slot = entry.slot;
+                if slot <= max_slot {
+                    entry
+                        .last_update_time
+                        .store(self.timestamp(), Ordering::Relaxed);
+                    let account = entry.account.clone();
+                    drop(entry);
+                    self.stats.hits.fetch_add(1, Ordering::Relaxed);
+                    found = Some((account, slot));
+                }
+            }
+
+            if found.is_none() {
+                self.stats.misses.fetch_add(1, Ordering::Relaxed);
+            }
+            found
+        });
+        self.stats.load_us.fetch_add(load_us, Ordering::Relaxed);
+        account
+    }
+
     fn account_size(account: &AccountSharedData) -> usize {
         CACHE_ENTRY_SIZE + account.data().len()
     }
