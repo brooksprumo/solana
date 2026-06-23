@@ -1,7 +1,7 @@
 use {
     rocksdb::{
-        BlockBasedOptions, Cache, ColumnFamilyDescriptor, ColumnFamilyRef, DB, IteratorMode,
-        MergeOperands, Options, WriteBatch,
+        BlockBasedOptions, Cache, ColumnFamilyDescriptor, ColumnFamilyRef, DB, Direction,
+        IteratorMode, MergeOperands, Options, ReadOptions, WriteBatch,
     },
     solana_account::{AccountSharedData, ReadableAccount},
     solana_clock::{Epoch, Slot},
@@ -243,7 +243,10 @@ impl RocksAccountsDb {
         let mut db_options = Options::default();
         db_options.create_if_missing(true);
         db_options.create_missing_column_families(true);
-        db_options.set_max_background_jobs(4);
+        let rocks_parallelism = num_cpus::get().max(1).min(i32::MAX as usize) as i32;
+        db_options.increase_parallelism(rocks_parallelism);
+        db_options.set_max_background_jobs(rocks_parallelism);
+        db_options.set_max_subcompactions(rocks_parallelism as u32);
 
         let mut cf_descriptors = vec![
             ColumnFamilyDescriptor::new(ACCOUNT_META_CF, Self::account_meta_options()),
@@ -459,9 +462,34 @@ impl RocksAccountsDb {
         &self,
         mut callback: impl FnMut(&Pubkey, AccountSharedData, Slot),
     ) -> Result<(), rocksdb::Error> {
+        self.scan_accounts_with_key_range(None, None, |pubkey, account, slot| {
+            callback(pubkey, account, slot)
+        })
+    }
+
+    pub(crate) fn scan_accounts_with_key_range(
+        &self,
+        lower_bound: Option<Vec<u8>>,
+        upper_bound: Option<Vec<u8>>,
+        mut callback: impl FnMut(&Pubkey, AccountSharedData, Slot),
+    ) -> Result<(), rocksdb::Error> {
         let meta_cf = self.meta_cf();
         let data_cf = self.data_cf();
-        for item in self.db.iterator_cf(&meta_cf, IteratorMode::Start) {
+        let mut read_options = ReadOptions::default();
+        if let Some(lower_bound) = lower_bound.as_ref() {
+            read_options.set_iterate_lower_bound(lower_bound.clone());
+        }
+        if let Some(upper_bound) = upper_bound {
+            read_options.set_iterate_upper_bound(upper_bound);
+        }
+        let iterator_mode = lower_bound.as_deref().map_or(IteratorMode::Start, |lower| {
+            IteratorMode::From(lower, Direction::Forward)
+        });
+
+        for item in self
+            .db
+            .iterator_cf_opt(&meta_cf, read_options, iterator_mode)
+        {
             let (key, meta_bytes) = item?;
             if key.len() != 32 {
                 panic!("invalid Rocks account address key length: {}", key.len());

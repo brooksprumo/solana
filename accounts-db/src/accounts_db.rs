@@ -91,7 +91,7 @@ use {
         path::{Path, PathBuf},
         sync::{
             Arc, Mutex, RwLock,
-            atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+            atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         },
         thread,
         time::{Duration, Instant},
@@ -6235,53 +6235,225 @@ impl AccountsDb {
         const ROCKS_STARTUP_IMPORT_BATCH_ACCOUNTS_MIN: usize = 4_096;
         const ROCKS_STARTUP_IMPORT_BATCH_BYTES_MIN: usize = 8 * 1024 * 1024;
 
-        let num_threads = self.thread_pool_foreground.current_num_threads().max(1);
+        let num_threads = num_cpus::get().max(1);
         let batch_accounts_limit = ROCKS_STARTUP_IMPORT_BATCH_ACCOUNTS_TOTAL
             .div_ceil(num_threads)
             .max(ROCKS_STARTUP_IMPORT_BATCH_ACCOUNTS_MIN);
         let batch_bytes_limit = ROCKS_STARTUP_IMPORT_BATCH_BYTES_TOTAL
             .div_ceil(num_threads)
             .max(ROCKS_STARTUP_IMPORT_BATCH_BYTES_MIN);
+        info!(
+            "importing startup accounts to Rocks using {num_threads} threads, batch_accounts_limit \
+             {batch_accounts_limit}, batch_bytes_limit {batch_bytes_limit}"
+        );
 
-        let (accounts_scanned, stats) = self.thread_pool_foreground.install(|| {
-            storages
-                .par_iter()
-                .map(|storage| {
-                    self.import_rocks_accounts_from_storage(
-                        storage.as_ref(),
-                        batch_accounts_limit,
-                        batch_bytes_limit,
-                    )
+        let storages_orderer =
+            AccountStoragesOrderer::with_random_order(storages).into_concurrent_consumer();
+        let num_processed = AtomicU64::new(0);
+        let exit_logger = AtomicBool::new(false);
+
+        let (accounts_scanned, stats) = thread::scope(|s| {
+            let thread_handles = (0..num_threads)
+                .map(|i| {
+                    thread::Builder::new()
+                        .name(format!("solRocksImp{i:02}"))
+                        .spawn_scoped(s, || {
+                            let mut thread_accounts_scanned = 0;
+                            let mut thread_stats = RocksAccountsStoreStats::default();
+                            for next_item in storages_orderer.iter() {
+                                let (accounts_scanned, stats) =
+                                    self.import_rocks_accounts_from_storage(
+                                        next_item.storage,
+                                        batch_accounts_limit,
+                                        batch_bytes_limit,
+                                    );
+                                thread_accounts_scanned += accounts_scanned;
+                                thread_stats.accumulate(stats);
+                                num_processed.fetch_add(1, Ordering::Relaxed);
+                            }
+                            (thread_accounts_scanned, thread_stats)
+                        })
                 })
-                .reduce(
-                    || (0, RocksAccountsStoreStats::default()),
-                    |(accounts_scanned_a, mut stats_a), (accounts_scanned_b, stats_b)| {
-                        stats_a.accumulate(stats_b);
-                        (accounts_scanned_a + accounts_scanned_b, stats_a)
-                    },
-                )
+                .collect::<Result<Vec<_>, _>>()
+                .expect("spawn Rocks startup import threads");
+            let logger_thread_handle = thread::Builder::new()
+                .name("solRocksImpLog".to_string())
+                .spawn_scoped(s, || {
+                    let mut last_update = Instant::now();
+                    loop {
+                        if exit_logger.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let num_processed = num_processed.load(Ordering::Relaxed);
+                        if num_processed == storages.len() as u64 {
+                            info!("importing startup accounts to Rocks: processed all storages");
+                            break;
+                        }
+                        let now = Instant::now();
+                        if now - last_update > Duration::from_secs(2) {
+                            info!(
+                                "importing startup accounts to Rocks: processed {num_processed}/{} \
+                                 storages...",
+                                storages.len()
+                            );
+                            last_update = now;
+                        }
+                        thread::sleep(Duration::from_millis(500))
+                    }
+                })
+                .expect("spawn Rocks startup import logger thread");
+
+            let mut total_accounts_scanned = 0;
+            let mut total_stats = RocksAccountsStoreStats::default();
+            for thread_handle in thread_handles {
+                let Ok((thread_accounts_scanned, thread_stats)) = thread_handle.join() else {
+                    exit_logger.store(true, Ordering::Relaxed);
+                    panic!("Rocks startup import failed");
+                };
+                total_accounts_scanned += thread_accounts_scanned;
+                total_stats.accumulate(thread_stats);
+            }
+            exit_logger.store(true, Ordering::Relaxed);
+            logger_thread_handle
+                .join()
+                .expect("join Rocks startup import logger thread");
+            (total_accounts_scanned, total_stats)
         });
 
         self.rocks_accounts.flush().expect("flush startup Rocks import");
         (accounts_scanned, stats)
     }
 
-    fn calculate_index_generation_info_from_rocks(&self) -> IndexGenerationInfo {
-        let mut accounts_data_len = 0;
-        let mut lt_hash = LtHash::identity();
-        let mut capitalization = 0_u128;
+    fn rocks_scan_key_range(range_index: usize, num_ranges: usize) -> (Vec<u8>, Option<Vec<u8>>) {
+        const ROCKS_SCAN_PREFIX_SPACE: usize = 1 << 16;
 
-        self.rocks_accounts
-            .scan_accounts(|pubkey, account, _slot| {
-                if account.lamports() != 0 {
-                    accounts_data_len += account.data().len() as u64;
-                    lt_hash.mix_in(&Self::lt_hash_account(&account, pubkey).0);
-                }
-                capitalization = capitalization
-                    .checked_add(u128::from(account.lamports()))
+        let range_start = range_index * ROCKS_SCAN_PREFIX_SPACE / num_ranges;
+        let range_end = (range_index + 1) * ROCKS_SCAN_PREFIX_SPACE / num_ranges;
+        let lower_bound = vec![(range_start >> 8) as u8, range_start as u8];
+        let upper_bound = (range_end < ROCKS_SCAN_PREFIX_SPACE)
+            .then(|| vec![(range_end >> 8) as u8, range_end as u8]);
+
+        (lower_bound, upper_bound)
+    }
+
+    fn calculate_index_generation_info_from_rocks(&self) -> IndexGenerationInfo {
+        const ROCKS_STARTUP_SCAN_RANGES_PER_THREAD: usize = 16;
+        const ROCKS_SCAN_PREFIX_SPACE: usize = 1 << 16;
+
+        let num_threads = num_cpus::get().max(1);
+        let num_ranges = num_threads
+            .saturating_mul(ROCKS_STARTUP_SCAN_RANGES_PER_THREAD)
+            .clamp(1, ROCKS_SCAN_PREFIX_SPACE);
+        let next_range = AtomicUsize::new(0);
+        let num_processed = AtomicU64::new(0);
+        let exit_logger = AtomicBool::new(false);
+        info!(
+            "scanning startup Rocks accounts using {num_threads} threads across {num_ranges} key \
+             ranges"
+        );
+
+        let (accounts_data_len, lt_hash, capitalization) = thread::scope(|s| {
+            let thread_handles = (0..num_threads)
+                .map(|i| {
+                    thread::Builder::new()
+                        .name(format!("solRocksScan{i:02}"))
+                        .spawn_scoped(s, || {
+                            let mut thread_accounts_data_len = 0;
+                            let mut thread_lt_hash = LtHash::identity();
+                            let mut thread_capitalization = 0_u128;
+
+                            loop {
+                                let range_index = next_range.fetch_add(1, Ordering::Relaxed);
+                                if range_index >= num_ranges {
+                                    break;
+                                }
+
+                                let (lower_bound, upper_bound) =
+                                    Self::rocks_scan_key_range(range_index, num_ranges);
+                                self.rocks_accounts
+                                    .scan_accounts_with_key_range(
+                                        Some(lower_bound),
+                                        upper_bound,
+                                        |pubkey, account, _slot| {
+                                            if account.lamports() != 0 {
+                                                thread_accounts_data_len +=
+                                                    account.data().len() as u64;
+                                                thread_lt_hash.mix_in(
+                                                    &Self::lt_hash_account(&account, pubkey).0,
+                                                );
+                                            }
+                                            thread_capitalization = thread_capitalization
+                                                .checked_add(u128::from(account.lamports()))
+                                                .expect("capitalization cannot overflow");
+                                        },
+                                    )
+                                    .expect("scan Rocks accounts for startup index generation info");
+                                num_processed.fetch_add(1, Ordering::Relaxed);
+                            }
+
+                            (
+                                thread_accounts_data_len,
+                                thread_lt_hash,
+                                thread_capitalization,
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .expect("spawn Rocks startup scan threads");
+            let logger_thread_handle = thread::Builder::new()
+                .name("solRocksScanLog".to_string())
+                .spawn_scoped(s, || {
+                    let mut last_update = Instant::now();
+                    loop {
+                        if exit_logger.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let num_processed = num_processed.load(Ordering::Relaxed);
+                        if num_processed == num_ranges as u64 {
+                            info!("scanning startup Rocks accounts: processed all key ranges");
+                            break;
+                        }
+                        let now = Instant::now();
+                        if now - last_update > Duration::from_secs(2) {
+                            info!(
+                                "scanning startup Rocks accounts: processed {num_processed}/{} \
+                                 key ranges...",
+                                num_ranges
+                            );
+                            last_update = now;
+                        }
+                        thread::sleep(Duration::from_millis(500))
+                    }
+                })
+                .expect("spawn Rocks startup scan logger thread");
+
+            let mut total_accounts_data_len = 0;
+            let mut total_lt_hash = LtHash::identity();
+            let mut total_capitalization = 0_u128;
+            for thread_handle in thread_handles {
+                let Ok((thread_accounts_data_len, thread_lt_hash, thread_capitalization)) =
+                    thread_handle.join()
+                else {
+                    exit_logger.store(true, Ordering::Relaxed);
+                    panic!("Rocks startup scan failed");
+                };
+                total_accounts_data_len += thread_accounts_data_len;
+                total_lt_hash.mix_in(&thread_lt_hash);
+                total_capitalization = total_capitalization
+                    .checked_add(thread_capitalization)
                     .expect("capitalization cannot overflow");
-            })
-            .expect("scan Rocks accounts for startup index generation info");
+            }
+            exit_logger.store(true, Ordering::Relaxed);
+            logger_thread_handle
+                .join()
+                .expect("join Rocks startup scan logger thread");
+
+            (
+                total_accounts_data_len,
+                total_lt_hash,
+                total_capitalization,
+            )
+        });
 
         let calculated_capitalization = u64::try_from(capitalization).unwrap_or_else(|_| {
             panic!(
