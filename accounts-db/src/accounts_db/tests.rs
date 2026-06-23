@@ -302,6 +302,7 @@ fn test_generate_index_imports_accounts_to_rocks() {
     assert!(!db.accounts_index.contains(&pubkey));
     assert!(db.accounts_index.all_alive_roots().is_empty());
     assert_eq!(db.accounts_index.stats().total_count(), 0);
+    assert!(db.storage.get_slot_storage_entry(slot).is_none());
 
     let (loaded_account, loaded_slot) = db
         .rocks_accounts
@@ -310,6 +311,41 @@ fn test_generate_index_imports_accounts_to_rocks() {
         .expect("account was imported");
     assert_eq!(loaded_slot, slot);
     assert_eq!(loaded_account, account);
+}
+
+#[test]
+fn test_rocks_purge_slot_removes_legacy_storage_without_index_reclaims() {
+    let db = AccountsDb::new_single_for_tests();
+    let slot = 7;
+    let pubkey = Pubkey::new_unique();
+    let owner = Pubkey::new_unique();
+    let append_vec = db.create_and_insert_store(slot, 1000, "test");
+    let account = AccountSharedData::new(42, 8, &owner);
+
+    append_vec
+        .accounts
+        .write_accounts(&(slot, &[(&pubkey, &account)][..]), 0);
+
+    assert!(db.storage.get_slot_storage_entry(slot).is_some());
+    db.purge_slot(slot, 0, true);
+    assert!(db.storage.get_slot_storage_entry(slot).is_none());
+}
+
+#[test]
+fn test_rocks_purge_slot_skips_unflushed_root() {
+    let db = AccountsDb::new_single_for_tests();
+    let slot = 7;
+    let pubkey = Pubkey::new_unique();
+    let owner = Pubkey::new_unique();
+    let account = AccountSharedData::new(42, 8, &owner);
+
+    db.store_for_tests((slot, &[(&pubkey, &account)][..]));
+    db.add_root(slot);
+
+    assert!(db.accounts_cache.contains_unflushed_root(slot));
+    db.purge_slot(slot, 0, true);
+    assert!(db.accounts_cache.slot_cache(slot).is_some());
+    db.assert_load_account(slot, pubkey, account.lamports());
 }
 
 #[test]

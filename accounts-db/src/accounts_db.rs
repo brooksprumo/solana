@@ -4116,6 +4116,14 @@ impl AccountsDb {
         self.purge_slots(std::iter::once(&slot));
     }
 
+    fn is_alive_root_for_purge(&self, slot: Slot) -> bool {
+        if self.use_rocks_accounts() {
+            self.accounts_cache.contains_unflushed_root(slot)
+        } else {
+            self.accounts_index.is_alive_root(slot)
+        }
+    }
+
     /// Purges every slot in `removed_slots` from both the cache and storage. This includes
     /// entries in the accounts index, cache entries, and any backing storage entries.
     fn purge_slots_from_cache_and_store<'a>(
@@ -4261,6 +4269,13 @@ impl AccountsDb {
     }
 
     fn purge_slot_storage(&self, remove_slot: Slot, purge_stats: &PurgeStats) {
+        if self.use_rocks_accounts() {
+            // Rocks is the source of truth. Any AppendVec storage reachable here is legacy
+            // startup-import input and has no AccountsIndex entries to drive reclaim handling.
+            self.purge_dead_slots_from_storage(iter::once(&remove_slot), purge_stats);
+            return;
+        }
+
         // Because AccountsBackgroundService synchronously flushes from the accounts cache
         // and handles all Bank::drop() (the cleanup function that leads to this
         // function call), then we don't need to worry above an overlapping cache flush
@@ -4334,7 +4349,7 @@ impl AccountsDb {
             // it's safe to filter them out here as they won't need deletion from
             // self.scan_tracker.removed_bank_ids in
             // `purge_slots_from_cache_and_store()`.
-            .filter(|slot| !self.accounts_index.is_alive_root(**slot));
+            .filter(|slot| !self.is_alive_root_for_purge(**slot));
         safety_checks_elapsed.stop();
         self.external_purge_slots_stats
             .safety_checks_elapsed
@@ -4345,9 +4360,19 @@ impl AccountsDb {
     }
 
     pub fn remove_unrooted_slots(&self, remove_slots: &[(Slot, BankId)]) {
-        let rooted_slots = self
-            .accounts_index
-            .get_rooted_from_list(remove_slots.iter().map(|(slot, _)| slot));
+        let rooted_slots = if self.use_rocks_accounts() {
+            remove_slots
+                .iter()
+                .filter_map(|(slot, _)| {
+                    self.accounts_cache
+                        .contains_unflushed_root(*slot)
+                        .then_some(*slot)
+                })
+                .collect()
+        } else {
+            self.accounts_index
+                .get_rooted_from_list(remove_slots.iter().map(|(slot, _)| slot))
+        };
         assert!(
             rooted_slots.is_empty(),
             "Trying to remove accounts for rooted slots {rooted_slots:?}"
@@ -6272,6 +6297,12 @@ impl AccountsDb {
         }
     }
 
+    fn drop_startup_storages_after_rocks_import(&self, storages: &[Arc<AccountStorageEntry>]) {
+        let storage_slots: Vec<_> = storages.iter().map(|storage| storage.slot()).collect();
+        let purge_stats = PurgeStats::default();
+        self.purge_dead_slots_from_storage(storage_slots.iter(), &purge_stats);
+    }
+
     pub fn generate_index(
         &self,
         limit_load_slot_count_from_snapshot: Option<usize>,
@@ -6285,6 +6316,7 @@ impl AccountsDb {
             storages.truncate(limit); // get rid of the newer slots and keep just the older
         }
         let num_storages = storages.len();
+        let rocks_startup_max_storage_slot = storages.last().map(|storage| storage.slot());
 
         if self.use_rocks_accounts() {
             let mut import_rocks_accounts_time = Measure::start("import_rocks_accounts_time");
@@ -6306,10 +6338,11 @@ impl AccountsDb {
                 calculate_info_time.as_duration()
             );
 
-            if let Some(storage) = storages.last() {
-                self.accounts_cache.set_max_flush_root(storage.slot());
+            if let Some(storage_slot) = rocks_startup_max_storage_slot {
+                self.accounts_cache.set_max_flush_root(storage_slot);
             }
             self.accounts_index.clear_after_startup_import();
+            self.drop_startup_storages_after_rocks_import(&storages);
 
             if let Some(geyser_notifier) = &self.accounts_update_notifier {
                 geyser_notifier.notify_end_of_restore_from_snapshot();
