@@ -11,7 +11,7 @@ use {
         accounts_db::{
             AccountFromStorage, AccountsDb, AliveAccounts, GetUniqueAccountsResult, ShrinkCollect,
             ShrinkCollectAliveSeparatedByRefs,
-            stats::{ShrinkAncientStats, ShrinkStatsSub},
+            stats::{ShrinkAncientStats, SquashStatsSub},
         },
         active_stats::ActiveStatItem,
         storable_accounts::{StorableAccounts, StorableAccountsBySlot},
@@ -25,7 +25,7 @@ use {
         cmp,
         collections::{HashMap, VecDeque},
         num::{NonZeroU64, Saturating},
-        sync::{Arc, Mutex, atomic::Ordering},
+        sync::{Arc, Mutex},
     },
 };
 
@@ -150,7 +150,7 @@ impl AncientSlotInfos {
     fn filter_ancient_slots(
         &mut self,
         tuning: &PackedAncientStorageTuning,
-        stats: &ShrinkAncientStats,
+        stats: &mut ShrinkAncientStats,
     ) {
         // figure out which slots to combine
         // 1. should_shrink: largest bytes saved above some cutoff of ratio
@@ -234,7 +234,7 @@ impl AncientSlotInfos {
     fn truncate_to_max_storages(
         &mut self,
         tuning: &PackedAncientStorageTuning,
-        stats: &ShrinkAncientStats,
+        stats: &mut ShrinkAncientStats,
     ) {
         // these indexes into 'all_infos' are useless once we truncate 'all_infos', so make sure they're cleared out to avoid any issues
         self.shrink_indexes.clear();
@@ -275,15 +275,9 @@ impl AncientSlotInfos {
                 bytes_from_smallest_storages += info.alive_bytes;
             }
         }
-        stats
-            .bytes_from_must_shrink
-            .fetch_add(bytes_from_must_shrink, Ordering::Relaxed);
-        stats
-            .bytes_from_smallest_storages
-            .fetch_add(bytes_from_smallest_storages, Ordering::Relaxed);
-        stats
-            .bytes_from_newest_storages
-            .fetch_add(bytes_from_newest_storages, Ordering::Relaxed);
+        stats.bytes_from_must_shrink += bytes_from_must_shrink;
+        stats.bytes_from_smallest_storages += bytes_from_smallest_storages;
+        stats.bytes_from_newest_storages += bytes_from_newest_storages;
     }
 
     /// remove entries from 'all_infos' such that combining
@@ -296,7 +290,7 @@ impl AncientSlotInfos {
     fn filter_by_smallest_capacity(
         &mut self,
         tuning: &PackedAncientStorageTuning,
-        stats: &ShrinkAncientStats,
+        stats: &mut ShrinkAncientStats,
     ) {
         let total_storages = self.all_infos.len();
         if total_storages <= tuning.max_ancient_slots {
@@ -331,7 +325,7 @@ struct WriteAncientAccounts<'a> {
     /// 'ShrinkInProgress' instances created by starting a shrink operation
     shrinks_in_progress: HashMap<Slot, ShrinkInProgress<'a>>,
 
-    metrics: ShrinkStatsSub,
+    metrics: SquashStatsSub,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
