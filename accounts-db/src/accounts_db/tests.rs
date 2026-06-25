@@ -1317,7 +1317,7 @@ fn test_shrink_zero_lamport_single_ref_account() {
         }
 
         // Shrink the slot. The behavior on the zero lamport account will depend on `latest_full_snapshot_slot`.
-        accounts.shrink_slot_forced(slot);
+        accounts.shrink_slot_forced(slot, &ShrinkStats::default());
 
         assert!(
             accounts.storage.get_slot_storage_entry(1).is_some(),
@@ -1452,7 +1452,7 @@ fn test_shrink_marks_zero_lamport_single_ref_account_in_new_storage() {
         );
     }
 
-    accounts_db.shrink_slot_forced(slot1);
+    accounts_db.shrink_slot_forced(slot1, &ShrinkStats::default());
 
     let new_storage1 = accounts_db.get_and_assert_single_storage(slot1);
     let new_zero_lamport_single_ref_info = accounts_db
@@ -1608,7 +1608,11 @@ fn test_alive_bytes_after_shrink_with_zero_lamport_single_ref_accounts() {
             let (indexed_slot, acct_info) = slot_list.first().unwrap();
             assert_eq!(*indexed_slot, slot);
             assert!(acct_info.is_zero_lamport());
-            accounts_db.zero_lamport_single_ref_found(*indexed_slot, acct_info.offset());
+            accounts_db.zero_lamport_single_ref_found(
+                *indexed_slot,
+                acct_info.offset(),
+                &ShrinkStats::default(),
+            );
             AccountsIndexScanResult::KeepInMemory
         },
         None,
@@ -1629,7 +1633,7 @@ fn test_alive_bytes_after_shrink_with_zero_lamport_single_ref_accounts() {
         AppendVec::calculate_stored_size(alive_account.data().len()),
     );
 
-    accounts_db.shrink_slot_forced(slot);
+    accounts_db.shrink_slot_forced(slot, &ShrinkStats::default());
 
     let storage_after_shrink = accounts_db.get_storage_for_slot(slot).unwrap();
     assert_eq!(
@@ -3936,7 +3940,11 @@ define_accounts_db_test!(
 
                 let (slot, acct_info) = slot_list.first().unwrap();
                 assert_eq!(*slot, 0);
-                accounts_db.zero_lamport_single_ref_found(*slot, acct_info.offset());
+                accounts_db.zero_lamport_single_ref_found(
+                    *slot,
+                    acct_info.offset(),
+                    &ShrinkStats::default(),
+                );
                 AccountsIndexScanResult::OnlyKeepInMemoryIfDirty
             },
             None,
@@ -6256,7 +6264,11 @@ pub(crate) const CAN_RANDOMLY_SHRINK_FALSE: bool = false;
 
 define_accounts_db_test!(test_combine_ancient_slots_empty, |db| {
     // empty slots
-    db.combine_ancient_slots_packed(Vec::default(), CAN_RANDOMLY_SHRINK_FALSE);
+    db.combine_ancient_slots_packed(
+        Vec::default(),
+        CAN_RANDOMLY_SHRINK_FALSE,
+        &mut ShrinkAncientStats::default(),
+    );
 });
 
 #[test]
@@ -6469,7 +6481,11 @@ fn get_one_ancient_append_vec_and_others_with_account_size(
     let storage = db.get_storage_for_slot(slot1).unwrap();
     let created_accounts = db.get_unique_accounts_from_storage(&storage);
 
-    db.combine_ancient_slots_packed(vec![slot1], CAN_RANDOMLY_SHRINK_FALSE);
+    db.combine_ancient_slots_packed(
+        vec![slot1],
+        CAN_RANDOMLY_SHRINK_FALSE,
+        &mut ShrinkAncientStats::default(),
+    );
     let after_store = db.get_storage_for_slot(slot1).unwrap();
     let GetUniqueAccountsResult {
         stored_accounts: after_stored_accounts,
