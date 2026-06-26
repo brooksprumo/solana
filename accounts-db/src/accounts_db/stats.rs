@@ -483,7 +483,7 @@ pub struct ShrinkStats {
     pub purged_zero_lamports: AtomicU64,
     pub num_ancient_slots_shrunk: u64,
     pub ancient_slots_added_to_shrink: u64,
-    pub ancient_bytes_added_to_shrink: AtomicU64,
+    pub ancient_bytes_added_to_shrink: u64,
     pub num_dead_slots_added_to_clean: AtomicU64,
     pub num_slots_with_zero_lamport_accounts_added_to_shrink: AtomicU64,
     pub marking_zero_dead_accounts_in_non_shrinkable_store: AtomicU64,
@@ -536,8 +536,7 @@ impl ShrinkStats {
             ),
             (
                 "ancient_bytes_added_to_shrink",
-                self.ancient_bytes_added_to_shrink
-                    .swap(0, Ordering::Relaxed),
+                self.ancient_bytes_added_to_shrink,
                 i64
             ),
             (

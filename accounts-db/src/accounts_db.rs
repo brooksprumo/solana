@@ -3273,22 +3273,21 @@ impl AccountsDb {
             .then_some(|| self.active_stats.activate(ActiveStatItem::Shrink));
 
         let num_selected = shrink_slots.len();
-        let (_, shrink_all_us) = measure_us!({
+        let (num_ancient_slots_shrunk, shrink_all_us) = measure_us!({
             self.thread_pool_background.install(|| {
                 shrink_slots
                     .into_par_iter()
-                    .for_each(|(slot, slot_shrink_candidate)| {
-                        if self.ancient_append_vec_offset.is_some()
-                            && slot < oldest_non_ancient_slot
-                        {
-                            self.shrink_stats
-                                .num_ancient_slots_shrunk
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                        self.shrink_storage(slot_shrink_candidate);
-                    });
+                    .map(|(slot, slot_shrink_candidate)| {
+                        self.shrink_storage(slot_shrink_candidate, &shrink_stats);
+                        u64::from(
+                            self.ancient_append_vec_offset.is_some()
+                                && slot < oldest_non_ancient_slot,
+                        )
+                    })
+                    .sum()
             })
         });
+        shrink_stats.num_ancient_slots_shrunk = num_ancient_slots_shrunk;
 
         let mut pended_counts: usize = 0;
         if let Some(shrink_slots_next_batch) = shrink_slots_next_batch {
