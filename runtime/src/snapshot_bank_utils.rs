@@ -847,6 +847,7 @@ mod tests {
             SnapshotVersion, error::VerifySlotDeltasError, paths::get_bank_snapshot_dir,
         },
         semver::Version,
+        solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
         solana_accounts_db::{
             accounts_db::{ACCOUNTS_DB_CONFIG_FOR_TESTING, AccountsFileId},
             accounts_file::AccountsFile,
@@ -1180,6 +1181,76 @@ mod tests {
         )
         .unwrap();
         assert_eq!(*bank4, roundtrip_bank);
+    }
+
+    #[test]
+    fn test_roundtrip_full_snapshot_archive_with_split_external_data() {
+        let genesis_config = GenesisConfig::default();
+        let (bank0, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+        let leader = *bank0.leader();
+
+        let pubkey = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let account_data_len = 256 * 1024;
+        let mut account = AccountSharedData::new(123, account_data_len, &owner);
+        account.set_data((0..account_data_len).map(|i| (i % 251) as u8).collect());
+
+        bank0.store_account_and_update_capitalization(&pubkey, &account);
+        bank0.fill_bank_with_ticks_for_tests();
+        bank0.set_block_id(Some(Hash::default()));
+        bank0.squash();
+        bank0.force_flush_accounts_cache();
+
+        let bank1 = Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank0, leader, 1);
+        let mut metadata_only_update = account.clone();
+        metadata_only_update.set_lamports(account.lamports() + 1);
+        bank1.store_account_and_update_capitalization(&pubkey, &metadata_only_update);
+        bank1.fill_bank_with_ticks_for_tests();
+        bank1.set_block_id(Some(Hash::default()));
+
+        let (_tmp_dir, accounts_dir) = create_tmp_accounts_dir_for_tests();
+        let bank_snapshots_dir = tempfile::TempDir::new().unwrap();
+        let full_snapshot_archives_dir = tempfile::TempDir::new().unwrap();
+        let incremental_snapshot_archives_dir = tempfile::TempDir::new().unwrap();
+
+        let snapshot_config = snapshot_config_for_tests(
+            &bank_snapshots_dir,
+            &full_snapshot_archives_dir,
+            &incremental_snapshot_archives_dir,
+        );
+        let full_snapshot_archive_info =
+            bank_to_full_snapshot_archive(&snapshot_config, &bank1).unwrap();
+
+        let updated_storage = bank1
+            .get_snapshot_storages(None)
+            .into_iter()
+            .find(|storage| storage.slot() == bank1.slot())
+            .unwrap();
+        assert!(updated_storage.accounts.is_split());
+
+        let roundtrip_bank = bank_from_snapshot_archives(
+            &[accounts_dir],
+            &full_snapshot_archive_info,
+            None,
+            &snapshot_config,
+            &genesis_config,
+            &RuntimeConfig::default(),
+            None,
+            Some(leader),
+            None,
+            false,
+            false,
+            false,
+            ACCOUNTS_DB_CONFIG_FOR_TESTING,
+            None,
+            Arc::default(),
+        )
+        .unwrap();
+        let roundtrip_account = roundtrip_bank.get_account(&pubkey).unwrap();
+        assert_eq!(roundtrip_account.lamports(), metadata_only_update.lamports());
+        assert_eq!(roundtrip_account.data(), metadata_only_update.data());
+        assert_eq!(roundtrip_account.owner(), metadata_only_update.owner());
+        assert_eq!(*bank1, roundtrip_bank);
     }
 
     /// Test roundtrip of bank to snapshots, then back again, with incremental snapshots.  In this

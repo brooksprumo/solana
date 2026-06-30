@@ -54,11 +54,12 @@ use {
         accounts_update_notifier_interface::{AccountForGeyser, AccountsUpdateNotifier},
         active_stats::{ActiveStatItem, ActiveStats},
         ancestors::Ancestors,
-        append_vec::{self, AppendVec, STORE_META_OVERHEAD},
+        append_vec::{self, STORE_META_OVERHEAD},
         contains::Contains,
         is_zero_lamport::IsZeroLamport,
         partitioned_rewards::PartitionedEpochRewardsConfig,
         read_only_accounts_cache::ReadOnlyAccountsCache,
+        split_accounts_file::DataLocation,
         storable_accounts::{StorableAccounts, StorableAccountsBySlot},
         u64_align,
         utils::{self, create_account_shared_data},
@@ -283,6 +284,7 @@ struct LoadAccountsIndexForShrink<'a, T: ShrinkCollectRefs<'a>> {
 pub struct AccountFromStorage {
     pub index_info: AccountInfo,
     pub data_len: u64,
+    pub(crate) stored_size: usize,
     pub pubkey: Pubkey,
 }
 
@@ -297,17 +299,17 @@ impl AccountFromStorage {
         &self.pubkey
     }
     pub fn stored_size(&self) -> usize {
-        AppendVec::calculate_stored_size(self.data_len as usize)
+        self.stored_size
     }
     pub fn data_len(&self) -> usize {
         self.data_len as usize
     }
     #[cfg(test)]
-    pub(crate) fn new(offset: Offset, account: &StoredAccountInfoWithoutData) -> Self {
-        // the id is irrelevant in this account info. This structure is only used DURING shrink operations.
-        // In those cases, there is only 1 append vec id per slot when we read the accounts.
-        // Any value of storage id in account info works fine when we want the 'normal' storage.
-        let storage_id = 0;
+    pub(crate) fn new(
+        storage_id: AccountsFileId,
+        offset: Offset,
+        account: &StoredAccountInfoWithoutData,
+    ) -> Self {
         AccountFromStorage {
             index_info: AccountInfo::new(
                 StorageLocation::AppendVec(storage_id, offset),
@@ -315,6 +317,7 @@ impl AccountFromStorage {
             ),
             pubkey: *account.pubkey(),
             data_len: account.data_len as u64,
+            stored_size: append_vec::AppendVec::calculate_stored_size(account.data_len),
         }
     }
 }
@@ -653,7 +656,14 @@ pub enum PopulateReadCache {
 pub enum LoadedAccountAccessor {
     // StoredAccountInfo can't be held directly here due to its lifetime dependency on
     // AccountStorageEntry
-    Stored(Option<(Arc<AccountStorageEntry>, usize)>),
+    Stored(Option<LoadedStoredAccountAccessor>),
+}
+
+#[derive(Debug)]
+pub struct LoadedStoredAccountAccessor {
+    storage_entry: Arc<AccountStorageEntry>,
+    offset: usize,
+    external_data_storage_entry: Option<Arc<AccountStorageEntry>>,
 }
 
 impl LoadedAccountAccessor {
@@ -662,15 +672,33 @@ impl LoadedAccountAccessor {
         // ideal for representing this as rust type system....
 
         match self {
-            LoadedAccountAccessor::Stored(Some((maybe_storage_entry, offset))) => {
+            LoadedAccountAccessor::Stored(Some(stored_account_accessor)) => {
                 // If we do find the storage entry, we can guarantee that the storage entry is
                 // safe to read from because we grabbed a reference to the storage entry while it
                 // was still in the storage map. This means even if the storage entry is removed
                 // from the storage map after we grabbed the storage entry, the recycler should not
                 // reset the storage entry until we drop the reference to the storage entry.
-                maybe_storage_entry
+                let external_data_file = stored_account_accessor
+                    .external_data_storage_entry
+                    .as_ref()
+                    .map(|storage_entry| &storage_entry.accounts);
+                if external_data_file.is_none() {
+                    return stored_account_accessor
+                        .storage_entry
+                        .accounts
+                        .get_account_shared_data(stored_account_accessor.offset)
+                        .expect(
+                            "If a storage entry was found in the storage map, it must not have \
+                             been reset yet",
+                        );
+                }
+                stored_account_accessor
+                    .storage_entry
                     .accounts
-                    .get_account_shared_data(*offset)
+                    .get_account_shared_data_with_external_data(
+                        stored_account_accessor.offset,
+                        external_data_file,
+                    )
                     .expect(
                         "If a storage entry was found in the storage map, it must not have been \
                          reset yet",
@@ -719,12 +747,19 @@ impl LoadedAccountAccessor {
                 // get account meta from the storage entry here
                 maybe_storage_entry
                     .as_ref()
-                    .and_then(|(storage_entry, offset)| {
-                        storage_entry
+                    .and_then(|stored_account_accessor| {
+                        let external_data_file = stored_account_accessor
+                            .external_data_storage_entry
+                            .as_ref()
+                            .map(|storage_entry| &storage_entry.accounts);
+                        stored_account_accessor
+                            .storage_entry
                             .accounts
-                            .get_stored_account_callback(*offset, |account| {
-                                callback(LoadedAccount::Stored(account))
-                            })
+                            .get_stored_account_callback_with_external_data(
+                                stored_account_accessor.offset,
+                                external_data_file,
+                                |account| callback(LoadedAccount::Stored(account)),
+                            )
                     })
             }
         }
@@ -2521,11 +2556,10 @@ impl AccountsDb {
     ) -> GetUniqueAccountsResult {
         let capacity = store.capacity();
         let mut stored_accounts = Vec::with_capacity(store.count());
+        let file_id = store.id();
         store
             .accounts
             .scan_accounts_without_data(|offset, account| {
-                // file_id is unused and can be anything. We will always be loading whatever storage is in the slot.
-                let file_id = 0;
                 stored_accounts.push(AccountFromStorage {
                     index_info: AccountInfo::new(
                         StorageLocation::AppendVec(file_id, offset),
@@ -2533,6 +2567,9 @@ impl AccountsDb {
                     ),
                     pubkey: *account.pubkey(),
                     data_len: account.data_len as u64,
+                    stored_size: self
+                        .accounts_file_provider
+                        .calculate_stored_size(account.data_len),
                 });
             })
             .expect("must scan accounts storage");
@@ -2874,17 +2911,25 @@ impl AccountsDb {
 
         // This shouldn't happen if alive_bytes is accurate.
         // However, it is possible that the remaining alive bytes could be 0. In that case, the whole slot should be marked dead by clean.
-        if Self::should_not_shrink(
+        let should_not_shrink = Self::should_not_shrink(
             shrink_collect.alive_total_bytes as u64,
             shrink_collect.capacity,
-        ) || shrink_collect.alive_total_bytes == 0
+        );
+        if should_not_shrink || shrink_collect.alive_total_bytes == 0
         {
             if shrink_collect.alive_total_bytes == 0 {
                 // clean needs to take care of this dead slot
                 self.dirty_stores.insert(slot, store.clone());
             }
 
-            if !shrink_collect.all_are_zero_lamports {
+            // Shrink estimates bytes in the destination provider's format.  During mixed-format
+            // startup, an AppendVec source can legitimately require more bytes when rewritten as
+            // split storage, so `alive_total_bytes > capacity` is not an accounting bug.
+            let source_and_target_formats_differ = store.accounts.is_split()
+                != matches!(self.accounts_file_provider, AccountsFileProvider::Split);
+            if !shrink_collect.all_are_zero_lamports
+                && !(should_not_shrink && source_and_target_formats_differ)
+            {
                 // if all are zero lamports, then we expect that we would like to mark the whole slot dead, but we cannot. That's clean's job.
                 info!(
                     "Unexpected shrink for slot {} alive {} capacity {}, likely caused by a bug \
@@ -2968,19 +3013,41 @@ impl AccountsDb {
         let mut dead_storages = Vec::default();
 
         let mut not_retaining_store = |store: &Arc<AccountStorageEntry>| {
-            if add_dirty_stores {
+            let retain_for_split_external_data = store.has_split_external_data_refs();
+            if add_dirty_stores && !retain_for_split_external_data {
                 self.dirty_stores.insert(slot, store.clone());
             }
-            dead_storages.push(store.clone());
+            self.remove_split_external_data_refs_for_store(store);
+            if retain_for_split_external_data {
+                let alive_bytes = store.alive_bytes();
+                let alive_accounts = store.count();
+                if alive_accounts > 0 {
+                    store.remove_accounts(alive_bytes, alive_accounts);
+                }
+                self.storage
+                    .retain_split_external_data_storage(Arc::clone(store));
+            } else {
+                dead_storages.push(store.clone());
+            }
         };
 
         if let Some(shrink_in_progress) = shrink_in_progress {
             // shrink is in progress, so 1 new append vec to keep, 1 old one to throw away
             not_retaining_store(shrink_in_progress.old_storage());
             // dropping 'shrink_in_progress' removes the old append vec that was being shrunk from db's storage
-        } else if let Some(store) = self.storage.remove(&slot, shrink_can_be_active) {
-            // no shrink in progress, so all append vecs in this slot are dead
-            not_retaining_store(&store);
+        } else if let Some(store) = self
+            .storage
+            .get_slot_storage_entry_shrinking_in_progress_ok(slot)
+        {
+            // no shrink in progress, so all append vecs in this slot are dead unless split data is
+            // still referenced by newer metadata
+            if store.has_split_external_data_refs() {
+                if add_dirty_stores {
+                    self.dirty_stores.insert(slot, store);
+                }
+            } else if let Some(store) = self.storage.remove(&slot, shrink_can_be_active) {
+                not_retaining_store(&store);
+            }
         }
 
         dead_storages
@@ -3949,7 +4016,25 @@ impl AccountsDb {
                 let maybe_storage_entry = self
                     .storage
                     .get_account_storage_entry(slot, *store_id)
-                    .map(|account_storage_entry| (account_storage_entry, *offset));
+                    .and_then(|storage_entry| {
+                        let external_data_storage_entry =
+                            if let Some(location) =
+                                storage_entry.accounts.split_external_data_location(*offset)
+                            {
+                                Some(self.storage.get_account_storage_entry(
+                                    location.slot,
+                                    location.id,
+                                )?)
+                            } else {
+                                None
+                            };
+
+                        Some(LoadedStoredAccountAccessor {
+                            storage_entry,
+                            offset: *offset,
+                            external_data_storage_entry,
+                        })
+                    });
                 LoadedAccountAccessor::Stored(maybe_storage_entry)
             }
         }
@@ -4120,6 +4205,12 @@ impl AccountsDb {
 
         let mut remove_storage_entries_elapsed = Measure::start("remove_storage_entries_elapsed");
         for remove_slot in removed_slots {
+            if let Some(store) = self.storage.get_slot_storage_entry(*remove_slot) {
+                if store.has_split_external_data_refs() {
+                    continue;
+                }
+            }
+
             // Remove the storage entries and collect some metrics
             if let Some(store) = self.storage.remove(remove_slot, false) {
                 total_removed_stored_bytes += store.accounts.capacity();
@@ -4580,13 +4671,17 @@ impl AccountsDb {
                 };
                 if should_flush {
                     flush_stats.num_bytes_flushed +=
-                        AppendVec::calculate_stored_size(account.data().len()) as u64;
+                        self.accounts_file_provider
+                            .calculate_stored_size(account.data().len())
+                            as u64;
                     flush_stats.num_accounts_flushed += 1;
                     Some((key, account))
                 } else {
                     // A newer version wins, so this one isn't written
                     flush_stats.num_bytes_purged +=
-                        AppendVec::calculate_stored_size(account.data().len()) as u64;
+                        self.accounts_file_provider
+                            .calculate_stored_size(account.data().len())
+                            as u64;
                     flush_stats.num_accounts_purged += 1;
                     None
                 }
@@ -5155,6 +5250,10 @@ impl AccountsDb {
     /// Determines whether a given AccountStorageEntry instance is a
     /// candidate for shrinking.
     pub(crate) fn is_candidate_for_shrink(&self, store: &AccountStorageEntry) -> bool {
+        if store.has_split_external_data_refs() {
+            return false;
+        }
+
         // appended ancient append vecs should not be shrunk by the normal shrink codepath.
         // It is not possible to identify ancient append vecs when we pack, so no check for ancient when we are not appending.
         let total_bytes = store.capacity();
@@ -5211,19 +5310,36 @@ impl AccountsDb {
                     *slot
                 );
 
+                let mut sorted_offsets = offsets.iter().cloned().collect::<Vec<_>>();
+                sorted_offsets.sort_unstable();
+                self.remove_split_external_data_refs_for_offsets(&store, &sorted_offsets);
+
                 let remaining_accounts = if offsets.len() == store.count() {
+                    if store.has_split_external_data_refs() {
+                        if let MarkAccountsObsolete::Yes(slot_marked_obsolete) =
+                            mark_accounts_obsolete
+                        {
+                            let data_lens = store.accounts.get_account_data_lens(&sorted_offsets);
+                            store
+                                .obsolete_accounts
+                                .write()
+                                .unwrap()
+                                .mark_accounts_obsolete(
+                                    sorted_offsets.iter().copied().zip(data_lens),
+                                    slot_marked_obsolete,
+                                );
+                        }
+                    }
                     // all remaining alive accounts in the storage are being removed, so the entire storage/slot is dead
                     store.remove_accounts(store.alive_bytes(), offsets.len())
                 } else {
                     // not all accounts are being removed, so figure out sizes of accounts we are removing and update the alive bytes and alive account count
                     let (remaining_accounts, us) = measure_us!({
-                        let mut offsets = offsets.iter().cloned().collect::<Vec<_>>();
-                        // sort so offsets are in order. This improves efficiency of loading the accounts.
-                        offsets.sort_unstable();
-                        let data_lens = store.accounts.get_account_data_lens(&offsets);
-                        let dead_bytes = data_lens
-                            .iter()
-                            .map(|len| store.accounts.calculate_stored_size(*len))
+                        let data_lens = store.accounts.get_account_data_lens(&sorted_offsets);
+                        let dead_bytes = store
+                            .accounts
+                            .get_account_stored_sizes(&sorted_offsets)
+                            .into_iter()
                             .sum();
                         let remaining_accounts = store.remove_accounts(dead_bytes, offsets.len());
 
@@ -5235,7 +5351,7 @@ impl AccountsDb {
                                 .write()
                                 .unwrap()
                                 .mark_accounts_obsolete(
-                                    offsets.into_iter().zip(data_lens),
+                                    sorted_offsets.iter().copied().zip(data_lens),
                                     slot_marked_obsolete,
                                 );
                         }
@@ -5579,9 +5695,17 @@ impl AccountsDb {
 
         debug_assert!(self.accounts_cache.contains_unflushed_root(slot));
 
+        let reusable_data_refs =
+            self.reusable_split_data_refs_for_flush(slot, storage, &accounts);
+
         // Write the accounts to storage
         let write_accounts_time = Measure::start("write_accounts");
-        let infos = self.write_accounts_to_storage(slot, storage, &accounts);
+        let infos = self.write_accounts_to_storage_with_reusable_data_refs(
+            slot,
+            storage,
+            &accounts,
+            reusable_data_refs.as_deref(),
+        );
         let write_accounts_us = write_accounts_time.end_as_us();
 
         let mark_zero_lamport_time = Measure::start("mark_zero_lamport");
@@ -5710,17 +5834,241 @@ impl AccountsDb {
         (store_account, stats)
     }
 
+    fn reusable_split_data_refs_for_flush<'a>(
+        &self,
+        target_slot: Slot,
+        storage: &AccountStorageEntry,
+        accounts: &impl StorableAccounts<'a>,
+    ) -> Option<Vec<Option<DataLocation>>> {
+        if !storage.accounts.is_split() {
+            return None;
+        }
+
+        let mut reusable_data_refs = Vec::with_capacity(accounts.len());
+        for index in 0..accounts.len() {
+            let reusable_data_ref = if accounts.is_zero_lamport(index) {
+                None
+            } else {
+                accounts.account(index, |account| {
+                    self.reusable_split_data_ref_for_flush_account(
+                        target_slot,
+                        storage,
+                        account.pubkey(),
+                        account.data(),
+                    )
+                })
+            };
+            reusable_data_refs.push(reusable_data_ref);
+        }
+
+        reusable_data_refs
+            .iter()
+            .any(Option::is_some)
+            .then_some(reusable_data_refs)
+    }
+
+    fn reusable_split_data_ref_for_flush_account(
+        &self,
+        target_slot: Slot,
+        storage: &AccountStorageEntry,
+        pubkey: &Pubkey,
+        data: &[u8],
+    ) -> Option<DataLocation> {
+        if data.is_empty() {
+            return None;
+        }
+
+        let (old_slot, old_account_info) = self.accounts_index.get_and_then(pubkey, |entry| {
+            let Some(entry) = entry else {
+                return (false, None);
+            };
+
+            let slot_list = entry.slot_list_read_lock();
+            let old_account_info = slot_list
+                .iter()
+                .filter(|(slot, _account_info)| *slot < target_slot)
+                .max_by_key(|(slot, _account_info)| *slot)
+                .copied();
+            (false, old_account_info)
+        })?;
+
+        let old_storage = self
+            .storage
+            .get_account_storage_entry(old_slot, old_account_info.store_id())?;
+        if !storage.accounts.can_reuse_split_data_from(&old_storage.accounts) {
+            return None;
+        }
+
+        old_storage.accounts.reusable_split_data_location(
+            old_account_info.offset(),
+            pubkey,
+            data,
+        )
+    }
+
+    fn add_split_external_data_ref(&self, location: DataLocation) {
+        if let Some(storage) = self
+            .storage
+            .get_account_storage_entry(location.slot, location.id)
+        {
+            storage.add_split_external_data_ref();
+        } else {
+            warn!(
+                "unable to pin split data location: slot {}, id {}, offset {}",
+                location.slot, location.id, location.offset
+            );
+        }
+    }
+
+    fn remove_split_external_data_ref(&self, location: DataLocation) {
+        if let Some(storage) = self
+            .storage
+            .get_account_storage_entry(location.slot, location.id)
+        {
+            storage.remove_split_external_data_ref();
+            self.remove_unreferenced_dead_split_storage(storage);
+        } else {
+            warn!(
+                "unable to unpin split data location: slot {}, id {}, offset {}",
+                location.slot, location.id, location.offset
+            );
+        }
+    }
+
+    fn remove_unreferenced_dead_split_storage(&self, storage: Arc<AccountStorageEntry>) {
+        if !self.storage.no_shrink_in_progress() {
+            return;
+        }
+
+        if storage.count() != 0 || storage.has_split_external_data_refs() {
+            return;
+        }
+
+        let slot = storage.slot();
+        if self
+            .storage
+            .remove_split_external_data_storage(slot, storage.id())
+            .is_some()
+        {
+            self.stats.dropped_stores.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        if let Some(removed_storage) = self.storage.remove(&slot, false) {
+            if removed_storage.id() != storage.id() {
+                self.storage.insert(removed_storage);
+            }
+        }
+    }
+
+    fn remove_split_external_data_refs(&self, locations: impl IntoIterator<Item = DataLocation>) {
+        for location in locations {
+            self.remove_split_external_data_ref(location);
+        }
+    }
+
+    fn remove_split_external_data_refs_for_offsets(
+        &self,
+        storage: &AccountStorageEntry,
+        sorted_offsets: &[Offset],
+    ) {
+        self.remove_split_external_data_refs(
+            storage
+                .accounts
+                .split_external_data_locations(sorted_offsets),
+        );
+    }
+
+    fn remove_split_external_data_refs_for_store(&self, storage: &AccountStorageEntry) {
+        if !storage.accounts.is_split() {
+            return;
+        }
+
+        let obsolete_offsets: IntSet<_> = storage
+            .obsolete_accounts_read_lock()
+            .filter_obsolete_accounts(None)
+            .map(|(offset, _)| offset)
+            .collect();
+        let mut external_data_locations = Vec::new();
+        storage
+            .accounts
+            .scan_accounts_without_data(|offset, _account| {
+                if obsolete_offsets.contains(&offset) {
+                    return;
+                }
+                if let Some(location) = storage.accounts.split_external_data_location(offset) {
+                    external_data_locations.push(location);
+                }
+            })
+            .expect("must scan split accounts storage");
+        self.remove_split_external_data_refs(external_data_locations);
+    }
+
+    fn rebuild_split_external_data_refs_from_storage(&self) {
+        for (_slot, storage) in self.storage.iter() {
+            if !storage.accounts.is_split() {
+                continue;
+            }
+
+            let obsolete_offsets: IntSet<_> = storage
+                .obsolete_accounts_read_lock()
+                .filter_obsolete_accounts(None)
+                .map(|(offset, _)| offset)
+                .collect();
+            let mut external_data_locations = Vec::new();
+            storage
+                .accounts
+                .scan_accounts_without_data(|offset, _account| {
+                    if obsolete_offsets.contains(&offset) {
+                        return;
+                    }
+                    if let Some(location) = storage.accounts.split_external_data_location(offset) {
+                        external_data_locations.push(location);
+                    }
+                })
+                .expect("must scan split accounts storage");
+
+            for location in external_data_locations {
+                self.add_split_external_data_ref(location);
+            }
+        }
+    }
+
     fn write_accounts_to_storage<'a>(
         &self,
         slot: Slot,
         storage: &AccountStorageEntry,
         accounts_and_meta_to_store: &impl StorableAccounts<'a>,
     ) -> Vec<AccountInfo> {
+        self.write_accounts_to_storage_with_reusable_data_refs(
+            slot,
+            storage,
+            accounts_and_meta_to_store,
+            None,
+        )
+    }
+
+    fn write_accounts_to_storage_with_reusable_data_refs<'a>(
+        &self,
+        slot: Slot,
+        storage: &AccountStorageEntry,
+        accounts_and_meta_to_store: &impl StorableAccounts<'a>,
+        reusable_data_refs: Option<&[Option<DataLocation>]>,
+    ) -> Vec<AccountInfo> {
         let mut infos: Vec<AccountInfo> = Vec::with_capacity(accounts_and_meta_to_store.len());
         while infos.len() < accounts_and_meta_to_store.len() {
-            let stored_accounts_info = storage
-                .accounts
-                .write_accounts(accounts_and_meta_to_store, infos.len());
+            let skip = infos.len();
+            let stored_accounts_info = if let Some(reusable_data_refs) = reusable_data_refs {
+                storage
+                    .accounts
+                    .write_accounts_with_reusable_split_data_refs(
+                        accounts_and_meta_to_store,
+                        skip,
+                        reusable_data_refs,
+                    )
+            } else {
+                storage.accounts.write_accounts(accounts_and_meta_to_store, skip)
+            };
             let Some(stored_accounts_info) = stored_accounts_info else {
                 // See if an account overflows the storage in the slot.
                 let data_len = accounts_and_meta_to_store.data_len(infos.len());
@@ -5742,10 +6090,18 @@ impl AccountsDb {
 
             let store_id = storage.id();
             for (i, offset) in stored_accounts_info.offsets.iter().enumerate() {
+                let account_index = skip + i;
                 infos.push(AccountInfo::new(
                     StorageLocation::AppendVec(store_id, *offset),
-                    accounts_and_meta_to_store.is_zero_lamport(i),
+                    accounts_and_meta_to_store.is_zero_lamport(account_index),
                 ));
+                if let Some(location) = reusable_data_refs
+                    .and_then(|refs| refs.get(account_index))
+                    .copied()
+                    .flatten()
+                {
+                    self.add_split_external_data_ref(location);
+                }
             }
             storage.add_accounts(
                 stored_accounts_info.offsets.len(),
@@ -6029,7 +6385,16 @@ impl AccountsDb {
                 }
 
                 let data_len = account.data.len();
-                stored_size_alive += storage.accounts.calculate_stored_size(data_len);
+                stored_size_alive += if storage.accounts.is_split() {
+                    storage
+                        .accounts
+                        .get_account_stored_sizes(&[offset])
+                        .into_iter()
+                        .next()
+                        .unwrap_or_else(|| storage.accounts.calculate_stored_size(data_len))
+                } else {
+                    storage.accounts.calculate_stored_size(data_len)
+                };
                 let is_account_zero_lamport = account.is_zero_lamport();
                 if !is_account_zero_lamport {
                     accounts_data_len += data_len as u64;
@@ -6423,6 +6788,7 @@ impl AccountsDb {
         }
 
         self.set_storage_count_and_alive_bytes(total_accum.storage_info, &mut timings);
+        self.rebuild_split_external_data_refs_from_storage();
 
         let mut mark_obsolete_accounts_time = Measure::start("mark_obsolete_accounts_time");
         // Mark all reclaims at max_slot. This is safe because only the snapshot paths care about
@@ -6554,12 +6920,8 @@ impl AccountsDb {
                             // the info in 'max' is the most recent, current info for this pubkey
                             return;
                         }
-                        let maybe_storage_entry = self
-                            .storage
-                            .get_account_storage_entry(*slot, account_info.store_id());
-                        let mut accessor = LoadedAccountAccessor::Stored(
-                            maybe_storage_entry.map(|entry| (entry, account_info.offset())),
-                        );
+                        let mut accessor =
+                            self.get_account_accessor(*slot, &account_info.storage_location());
                         accessor.check_and_get_loaded_account(|loaded_account| {
                             let data_len = loaded_account.data_len();
                             let lamports = loaded_account.lamports();

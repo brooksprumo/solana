@@ -45,6 +45,13 @@ impl AccountsDb {
     fn get_storage_for_slot(&self, slot: Slot) -> Option<Arc<AccountStorageEntry>> {
         self.storage.get_slot_storage_entry(slot)
     }
+
+    fn new_single_for_tests_with_append_vec() -> Self {
+        Self::new_single_for_tests_with_provider_and_config(
+            AccountsFileProvider::AppendVec,
+            ACCOUNTS_DB_CONFIG_FOR_TESTING,
+        )
+    }
 }
 
 /// this tuple contains slot info PER account
@@ -224,6 +231,248 @@ define_accounts_db_test!(
 );
 
 #[test]
+fn test_split_accounts_file_provider_flush_and_load_from_storage() {
+    let accounts_db = AccountsDb::new_single_for_tests_with_provider_and_config(
+        AccountsFileProvider::Split,
+        ACCOUNTS_DB_CONFIG_FOR_TESTING,
+    );
+    let slot = 0;
+    let pubkey = Pubkey::new_unique();
+    let owner = Pubkey::new_unique();
+    let mut account = AccountSharedData::new(123, 8 * 1024, &owner);
+    account.set_data((0..account.data().len()).map(|i| (i % 251) as u8).collect());
+
+    accounts_db.store_for_tests((slot, [(&pubkey, &account)].as_slice()));
+    accounts_db.add_root_and_flush_write_cache(slot);
+
+    let storage = accounts_db.get_storage_for_slot(slot).unwrap();
+    assert!(storage.accounts.is_split());
+    assert_eq!(storage.path().extension().unwrap(), "meta");
+    assert!(storage.path().with_extension("data").exists());
+
+    let ancestors = Ancestors::from(vec![slot]);
+    let (loaded, loaded_slot) = accounts_db
+        .do_load_for_tests(&ancestors, &pubkey)
+        .unwrap();
+    assert_eq!(loaded_slot, slot);
+    assert!(accounts_equal(&loaded, &account));
+}
+
+#[test]
+fn test_split_flush_reuses_external_data_for_metadata_only_update() {
+    let (_temp_dirs, paths) = get_temp_accounts_paths(1).unwrap();
+    let accounts_db = AccountsDb::new_for_tests_with_provider_and_config(
+        paths,
+        AccountsFileProvider::Split,
+        ACCOUNTS_DB_CONFIG_FOR_TESTING,
+    );
+    let old_slot = 0;
+    let new_slot = 1;
+    let split_header_len = 4 * 1024;
+    let pubkey = Pubkey::new_unique();
+    let owner = Pubkey::new_unique();
+    let mut account = AccountSharedData::new(123, 8 * 1024, &owner);
+    account.set_data((0..account.data().len()).map(|i| (i % 251) as u8).collect());
+
+    accounts_db.store_for_tests((old_slot, [(&pubkey, &account)].as_slice()));
+    accounts_db.add_root(old_slot);
+    accounts_db.flush_rooted_accounts_cache(
+        Some(old_slot),
+        FlushShouldClean::Yes {
+            max_clean_root: None,
+        },
+    );
+
+    let old_storage = accounts_db.get_storage_for_slot(old_slot).unwrap();
+    let old_storage_id = old_storage.id();
+    assert!(old_storage.accounts.is_split());
+    assert!(old_storage.accounts.split_data_len_for_tests().unwrap() > split_header_len);
+
+    let mut metadata_only_update = account.clone();
+    metadata_only_update.set_lamports(account.lamports() + 1);
+    accounts_db.store_for_tests((new_slot, [(&pubkey, &metadata_only_update)].as_slice()));
+    accounts_db.add_root(new_slot);
+    accounts_db.flush_rooted_accounts_cache(
+        Some(new_slot),
+        FlushShouldClean::Yes {
+            max_clean_root: None,
+        },
+    );
+
+    let new_storage = accounts_db.get_storage_for_slot(new_slot).unwrap();
+    assert!(new_storage.accounts.is_split());
+    assert_eq!(
+        new_storage.accounts.split_data_len_for_tests().unwrap(),
+        split_header_len,
+    );
+
+    let pinned_old_storage = accounts_db
+        .storage
+        .get_account_storage_entry(old_slot, old_storage_id)
+        .unwrap();
+    assert_eq!(pinned_old_storage.count(), 0);
+    assert_eq!(pinned_old_storage.split_external_data_ref_count(), 1);
+    assert_eq!(accounts_db.get_storages(..=new_slot).0.len(), 1);
+
+    let ancestors = Ancestors::from(vec![new_slot]);
+    let (loaded, loaded_slot) = accounts_db
+        .do_load_for_tests(&ancestors, &pubkey)
+        .unwrap();
+    assert_eq!(loaded_slot, new_slot);
+    assert!(accounts_equal(&loaded, &metadata_only_update));
+}
+
+#[test]
+fn test_split_load_accessor_pins_external_data_storage() {
+    let (_temp_dirs, paths) = get_temp_accounts_paths(1).unwrap();
+    let accounts_db = AccountsDb::new_for_tests_with_provider_and_config(
+        paths,
+        AccountsFileProvider::Split,
+        ACCOUNTS_DB_CONFIG_FOR_TESTING,
+    );
+    let old_slot = 0;
+    let new_slot = 1;
+    let pubkey = Pubkey::new_unique();
+    let owner = Pubkey::new_unique();
+    let mut account = AccountSharedData::new(123, 8 * 1024, &owner);
+    account.set_data((0..account.data().len()).map(|i| (i % 251) as u8).collect());
+
+    accounts_db.store_for_tests((old_slot, [(&pubkey, &account)].as_slice()));
+    accounts_db.add_root(old_slot);
+    accounts_db.flush_rooted_accounts_cache(
+        Some(old_slot),
+        FlushShouldClean::Yes {
+            max_clean_root: None,
+        },
+    );
+
+    let old_storage_id = {
+        let old_storage = accounts_db.get_storage_for_slot(old_slot).unwrap();
+        assert!(old_storage.accounts.is_split());
+        old_storage.id()
+    };
+
+    let mut metadata_only_update = account.clone();
+    metadata_only_update.set_lamports(account.lamports() + 1);
+    accounts_db.store_for_tests((new_slot, [(&pubkey, &metadata_only_update)].as_slice()));
+    accounts_db.add_root(new_slot);
+    accounts_db.flush_rooted_accounts_cache(
+        Some(new_slot),
+        FlushShouldClean::Yes {
+            max_clean_root: None,
+        },
+    );
+
+    let (new_storage_id, new_offset) = {
+        let new_storage = accounts_db.get_storage_for_slot(new_slot).unwrap();
+        let mut new_offset = None;
+        new_storage
+            .accounts
+            .scan_accounts_without_data(|offset, account| {
+                if account.pubkey() == &pubkey {
+                    new_offset = Some(offset);
+                }
+            })
+            .expect("must scan split accounts storage");
+        (new_storage.id(), new_offset.unwrap())
+    };
+
+    let dirty_old_storage = accounts_db
+        .dirty_stores
+        .remove(&old_slot)
+        .map(|(_slot, storage)| storage);
+    let mut accessor = accounts_db.get_account_accessor(
+        new_slot,
+        &StorageLocation::AppendVec(new_storage_id, new_offset),
+    );
+    let removed_old_storage = accounts_db.storage.remove(&old_slot, false).unwrap();
+    assert_eq!(removed_old_storage.id(), old_storage_id);
+    drop(dirty_old_storage);
+    drop(removed_old_storage);
+
+    let loaded = accessor.check_and_get_loaded_account_shared_data();
+    assert!(accounts_equal(&loaded, &metadata_only_update));
+}
+
+#[test]
+fn test_shrink_retains_split_external_data_storage() {
+    let (_temp_dirs, paths) = get_temp_accounts_paths(1).unwrap();
+    let accounts_db = AccountsDb::new_for_tests_with_provider_and_config(
+        paths,
+        AccountsFileProvider::Split,
+        ACCOUNTS_DB_CONFIG_FOR_TESTING,
+    );
+    let old_slot = 0;
+    let new_slot = 1;
+    let reused_pubkey = Pubkey::new_unique();
+    let live_pubkey = Pubkey::new_unique();
+    let owner = Pubkey::new_unique();
+    let mut reused_account = AccountSharedData::new(123, 8 * 1024, &owner);
+    reused_account.set_data(
+        (0..reused_account.data().len())
+            .map(|i| (i % 251) as u8)
+            .collect(),
+    );
+    let live_account = AccountSharedData::new(456, 128, &owner);
+
+    accounts_db.store_for_tests((
+        old_slot,
+        [
+            (&reused_pubkey, &reused_account),
+            (&live_pubkey, &live_account),
+        ]
+        .as_slice(),
+    ));
+    accounts_db.add_root(old_slot);
+    accounts_db.flush_rooted_accounts_cache(
+        Some(old_slot),
+        FlushShouldClean::Yes {
+            max_clean_root: None,
+        },
+    );
+
+    let old_storage_id = accounts_db.get_storage_for_slot(old_slot).unwrap().id();
+
+    let mut metadata_only_update = reused_account.clone();
+    metadata_only_update.set_lamports(reused_account.lamports() + 1);
+    accounts_db.store_for_tests((new_slot, [(&reused_pubkey, &metadata_only_update)].as_slice()));
+    accounts_db.add_root(new_slot);
+    accounts_db.flush_rooted_accounts_cache(
+        Some(new_slot),
+        FlushShouldClean::Yes {
+            max_clean_root: None,
+        },
+    );
+
+    let pinned_old_storage = accounts_db
+        .storage
+        .get_account_storage_entry(old_slot, old_storage_id)
+        .unwrap();
+    assert_eq!(pinned_old_storage.count(), 1);
+    assert_eq!(pinned_old_storage.split_external_data_ref_count(), 1);
+
+    accounts_db.shrink_slot_forced(old_slot);
+
+    let active_storage_after_shrink = accounts_db.get_storage_for_slot(old_slot).unwrap();
+    assert_ne!(active_storage_after_shrink.id(), old_storage_id);
+    assert_eq!(active_storage_after_shrink.count(), 1);
+
+    let old_storage_after_shrink = accounts_db
+        .storage
+        .get_account_storage_entry(old_slot, old_storage_id)
+        .unwrap();
+    assert_eq!(old_storage_after_shrink.count(), 0);
+    assert_eq!(old_storage_after_shrink.split_external_data_ref_count(), 1);
+
+    let ancestors = Ancestors::from(vec![new_slot]);
+    let (loaded, loaded_slot) = accounts_db
+        .do_load_for_tests(&ancestors, &reused_pubkey)
+        .unwrap();
+    assert_eq!(loaded_slot, new_slot);
+    assert!(accounts_equal(&loaded, &metadata_only_update));
+}
+
+#[test]
 fn test_generate_index_for_single_ref_zero_lamport_slot() {
     let db = AccountsDb::new_single_for_tests();
     let slot0 = 0;
@@ -242,7 +491,7 @@ fn test_generate_index_for_single_ref_zero_lamport_slot() {
     assert_eq!(slot_list_len, 1);
     assert_eq!(
         append_vec.alive_bytes(),
-        AppendVec::calculate_stored_size(0),
+        append_vec.accounts.calculate_stored_size(0),
     );
     assert_eq!(append_vec.accounts_count(), 1);
     assert_eq!(append_vec.count(), 1);
@@ -1626,7 +1875,9 @@ fn test_alive_bytes_after_shrink_with_zero_lamport_single_ref_accounts() {
     assert!(expected_alive_bytes_after_shrink < alive_bytes_before_shrink);
     assert_eq!(
         expected_alive_bytes_after_shrink,
-        AppendVec::calculate_stored_size(alive_account.data().len()),
+        storage
+            .accounts
+            .calculate_stored_size(alive_account.data().len()),
     );
 
     accounts_db.shrink_slot_forced(slot);
@@ -2633,20 +2884,50 @@ fn test_shrink_candidate_slots_with_dead_ancient_account() {
     // and storage capacity shrunk to the sum of alive bytes of
     // accounts it holds.  This is the data lengths of the
     // accounts plus the length of their metadata.
-    assert_eq!(
-        created_accounts.capacity as usize,
-        AppendVec::calculate_stored_size(1000) + AppendVec::calculate_stored_size(2000),
-    );
-    // The above check works only when the AppendVec storage is
-    // used. More generally the pubkey of the smallest account
-    // shouldn't be present in the shrunk storage, which is
-    // validated by the following scan of the storage accounts.
+    if !storage.accounts.is_split() {
+        assert_eq!(
+            created_accounts.capacity as usize,
+            AppendVec::calculate_stored_size(1000) + AppendVec::calculate_stored_size(2000),
+        );
+    }
+    // The above check works only when the AppendVec storage is used. More generally the pubkey of
+    // the smallest account shouldn't be present in the shrunk storage, which is validated by the
+    // following scan of the storage accounts.
     storage
         .accounts
         .scan_pubkeys(|pubkey| {
             assert_ne!(pubkey, &modified_account_pubkey);
         })
         .expect("must scan accounts storage");
+}
+
+#[test]
+fn test_shrink_append_vec_source_into_split_storage() {
+    let db = AccountsDb::new_single_for_tests();
+    assert_eq!(db.accounts_file_provider, AccountsFileProvider::Split);
+
+    let slot = 1;
+    let id = 999;
+    let account_data_size = 16 * 4096;
+    let pubkey = Pubkey::new_unique();
+    let tf = crate::append_vec::test_utils::get_append_vec_path(
+        "test_shrink_append_vec_source_into_split_storage",
+    );
+    let storage =
+        sample_storage_with_entries_id(&tf, slot, &pubkey, id, true, Some(account_data_size));
+    assert!(!storage.accounts.is_split());
+
+    insert_store(&db, Arc::clone(&storage));
+    populate_index(&db, slot..slot + 1);
+
+    db.shrink_slot_forced(slot);
+
+    let storage_after_shrink = db.get_storage_for_slot(slot).unwrap();
+    assert!(storage_after_shrink.accounts.is_split());
+    let ancestors = Ancestors::from(vec![slot]);
+    let (loaded_account, loaded_slot) = db.do_load_for_tests(&ancestors, &pubkey).unwrap();
+    assert_eq!(loaded_slot, slot);
+    assert_eq!(loaded_account.data().len(), account_data_size as usize);
 }
 
 #[test]
@@ -3069,7 +3350,7 @@ fn test_account_balance_for_capitalization_native_program() {
 #[test]
 fn test_store_overhead() {
     agave_logger::setup();
-    let accounts = AccountsDb::new_single_for_tests();
+    let accounts = AccountsDb::new_single_for_tests_with_append_vec();
     let account = AccountSharedData::new(1, 0, &Pubkey::default());
     let pubkey = solana_pubkey::new_rand();
     accounts.store_for_tests((0, [(&pubkey, &account)].as_slice()));
@@ -3944,7 +4225,7 @@ define_accounts_db_test!(
 
         // assert the "alive_bytes_exclude_zero_lamport_single_ref_accounts"
         match accounts_db.accounts_file_provider {
-            AccountsFileProvider::AppendVec => {
+            AccountsFileProvider::AppendVec | AccountsFileProvider::Split => {
                 assert_eq!(
                     storage.alive_bytes_exclude_zero_lamport_single_ref_accounts(),
                     0
@@ -4006,6 +4287,10 @@ fn test_zero_lamport_single_ref_resweep_respects_last_swept(set_last_swept: bool
         ][..],
     ));
     db.add_root_and_flush_write_cache(slot_above_last_swept);
+
+    // Split storage may already be shrink-productive before the snapshot advances because its
+    // capacity includes split-file overhead. Isolate this test to the snapshot resweep behavior.
+    db.shrink_candidate_slots.lock().unwrap().clear();
 
     // Optionally mark slot 2 as already swept. `set_last_swept_full_snapshot_slot`
     // requires `last_swept <= latest`, so advance latest to slot 2 first (it gets
@@ -5964,7 +6249,7 @@ fn test_shrink_collect_simple() {
                                  {append_opposite_zero_lamport_account}, normal_account_count: \
                                  {normal_account_count}"
                             );
-                            let db = AccountsDb::new_single_for_tests();
+                            let db = AccountsDb::new_single_for_tests_with_append_vec();
                             let slot5 = 5;
                             // don't do special zero lamport account handling
                             db.set_latest_full_snapshot_slot(0);
@@ -6407,7 +6692,7 @@ pub(crate) fn create_db_with_storages_and_index(
 ) -> (AccountsDb, Slot) {
     agave_logger::setup();
 
-    let db = AccountsDb::new_single_for_tests();
+    let db = AccountsDb::new_single_for_tests_with_append_vec();
 
     // create a single append vec with a single account in a slot
     // add the pubkey to index if alive

@@ -83,6 +83,9 @@ impl SnapshotStorageRebuilder {
 
     fn process_append_vec_file(&mut self, file_info: FileInfo) -> Result<(), SnapshotError> {
         let filename = file_info.path.file_name().unwrap().to_str().unwrap();
+        if is_split_data_file(filename) {
+            return Ok(());
+        }
         if let Ok((slot, append_vec_id)) = get_slot_and_append_vec_id(filename) {
             if self.snapshot_from == SnapshotFrom::Dir {
                 // Keep track of the highest append_vec_id in the system, so the future append_vecs
@@ -140,12 +143,20 @@ impl SnapshotStorageRebuilder {
 
 /// Get the slot and append vec id from the filename
 pub(crate) fn get_slot_and_append_vec_id(filename: &str) -> Result<(Slot, usize), SnapshotError> {
+    let filename = filename
+        .strip_suffix(".meta")
+        .or_else(|| filename.strip_suffix(".data"))
+        .unwrap_or(filename);
     let mut parts = filename.splitn(2, '.');
     let slot = parts.next().and_then(|s| Slot::from_str(s).ok());
     let id = parts.next().and_then(|s| usize::from_str(s).ok());
 
     slot.zip(id)
         .ok_or_else(|| SnapshotError::InvalidAppendVecPath(PathBuf::from(filename)))
+}
+
+fn is_split_data_file(filename: &str) -> bool {
+    filename.ends_with(".data")
 }
 
 #[cfg(test)]
@@ -161,5 +172,15 @@ mod tests {
                 .unwrap();
         assert_eq!(expected_slot, slot);
         assert_eq!(expected_id as usize, id);
+
+        for suffix in ["meta", "data"] {
+            let filename = format!(
+                "{}.{suffix}",
+                AccountsFile::file_name(expected_slot, expected_id)
+            );
+            let (slot, id) = get_slot_and_append_vec_id(&filename).unwrap();
+            assert_eq!(expected_slot, slot);
+            assert_eq!(expected_id as usize, id);
+        }
     }
 }

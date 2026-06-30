@@ -96,6 +96,7 @@ static DEFAULT_ACCOUNT_SHARED_DATA: std::sync::LazyLock<AccountSharedData> =
 #[derive(Default, Debug)]
 pub struct StorableAccountsCacher {
     slot: Slot,
+    storage_id: crate::accounts_db::AccountsFileId,
     storage: Option<Arc<AccountStorageEntry>>,
 }
 
@@ -319,6 +320,7 @@ impl<'a> StorableAccounts<'a> for StorableAccountsBySlot<'a> {
         let slot = self.slots_and_accounts[indexes.0].0;
         let data = self.slots_and_accounts[indexes.0].1[indexes.1];
         let offset = data.index_info.offset();
+        let storage_id = data.index_info.store_id();
         let mut call_callback = |storage: &AccountStorageEntry| {
             storage
                 .accounts
@@ -327,22 +329,23 @@ impl<'a> StorableAccounts<'a> for StorableAccountsBySlot<'a> {
         };
         {
             let reader = self.cached_storage.read().unwrap();
-            if reader.slot == slot
-                && let Some(storage) = reader.storage.as_ref()
-            {
-                return call_callback(storage);
+            if reader.slot == slot && reader.storage_id == storage_id {
+                if let Some(storage) = reader.storage.as_ref() {
+                    return call_callback(storage);
+                }
             }
         }
-        // cache doesn't contain a storage for this slot, so lookup storage in db.
-        // note we do not use file id here. We just want the normal unshrunk storage for this slot.
+        // Cache doesn't contain this storage, so lookup the exact storage in db.
+        // Shrink/pack can have multiple storages for a slot while entries are being moved.
         let storage = self
             .db
             .storage
-            .get_slot_storage_entry_shrinking_in_progress_ok(slot)
+            .get_account_storage_entry(slot, storage_id)
             .expect("source slot has to have a storage to be able to store accounts");
         let ret = call_callback(&storage);
         let mut writer = self.cached_storage.write().unwrap();
         writer.slot = slot;
+        writer.storage_id = storage_id;
         writer.storage = Some(storage);
         ret
     }
@@ -606,6 +609,9 @@ mod tests {
                                     account.is_zero_lamport(),
                                 ),
                                 data_len: account.data.len() as u64,
+                                stored_size: crate::append_vec::AppendVec::calculate_stored_size(
+                                    account.data.len(),
+                                ),
                                 pubkey: *account.pubkey,
                             }
                         })
@@ -642,7 +648,7 @@ mod tests {
                             .zip(offsets.offsets.iter())
                             .for_each(|(account, offset)| {
                                 account.index_info = AccountInfo::new(
-                                    StorageLocation::AppendVec(0, *offset),
+                                    StorageLocation::AppendVec(storage.id(), *offset),
                                     account.is_zero_lamport(),
                                 )
                             });
@@ -677,8 +683,10 @@ mod tests {
         }
     }
 
-    fn setup_sample_storage(db: &AccountsDb, slot: Slot) -> Arc<AccountStorageEntry> {
-        let id = 2;
+    fn create_sample_storage(
+        slot: Slot,
+        id: crate::accounts_db::AccountsFileId,
+    ) -> Arc<AccountStorageEntry> {
         let file_size = 10_000;
         let (_temp_dirs, paths) = get_temp_accounts_paths(1).unwrap();
         let data = AccountStorageEntry::new(
@@ -688,9 +696,60 @@ mod tests {
             file_size,
             AccountsFileProvider::AppendVec,
         );
-        let storage = Arc::new(data);
+        Arc::new(data)
+    }
+
+    fn setup_sample_storage(db: &AccountsDb, slot: Slot) -> Arc<AccountStorageEntry> {
+        let storage = create_sample_storage(slot, 2);
         db.storage.insert(storage.clone());
         storage
+    }
+
+    #[test]
+    fn test_storable_accounts_by_slot_uses_storage_id() {
+        let db = AccountsDb::new_single_for_tests();
+        let slot = 7;
+        let old_storage = create_sample_storage(slot, 2);
+        db.storage.insert(old_storage.clone());
+        let new_storage = create_sample_storage(slot, 3);
+
+        let old_pubkey = Pubkey::new_unique();
+        let old_account = AccountSharedData::new(1, 0, &Pubkey::new_unique());
+        old_storage
+            .accounts
+            .write_accounts(&(slot, &[(&old_pubkey, &old_account)][..]), 0)
+            .unwrap();
+
+        let new_pubkey = Pubkey::new_unique();
+        let new_account = AccountSharedData::new(2, 0, &Pubkey::new_unique());
+        let offset = new_storage
+            .accounts
+            .write_accounts(&(slot, &[(&new_pubkey, &new_account)][..]), 0)
+            .unwrap()
+            .offsets[0];
+
+        let _shrink_in_progress =
+            db.storage
+                .shrinking_in_progress(slot, old_storage, new_storage.clone());
+        let account_from_storage = AccountFromStorage {
+            index_info: AccountInfo::new(
+                StorageLocation::AppendVec(new_storage.id(), offset),
+                new_account.is_zero_lamport(),
+            ),
+            data_len: new_account.data().len() as u64,
+            stored_size: crate::append_vec::AppendVec::calculate_stored_size(
+                new_account.data().len(),
+            ),
+            pubkey: new_pubkey,
+        };
+        let account_refs = [&account_from_storage];
+        let slot_accounts = [(slot, &account_refs[..])];
+        let storable_accounts = StorableAccountsBySlot::new(99, &slot_accounts, &db);
+
+        storable_accounts.account(0, |account| {
+            assert_eq!(account.pubkey(), &new_pubkey);
+            assert!(accounts_equal(&account, &new_account));
+        });
     }
 
     #[test]
@@ -733,6 +792,9 @@ mod tests {
                             account.is_zero_lamport(),
                         ),
                         data_len: account.data.len() as u64,
+                        stored_size: crate::append_vec::AppendVec::calculate_stored_size(
+                            account.data.len(),
+                        ),
                         pubkey: *account.pubkey,
                     }
                 })
@@ -769,7 +831,10 @@ mod tests {
                                         result.iter_mut().zip(offsets.offsets.iter()).for_each(
                                             |(account, offset)| {
                                                 account.index_info = AccountInfo::new(
-                                                    StorageLocation::AppendVec(0, *offset),
+                                                    StorageLocation::AppendVec(
+                                                        storage.id(),
+                                                        *offset,
+                                                    ),
                                                     account.is_zero_lamport(),
                                                 )
                                             },
@@ -823,6 +888,7 @@ mod tests {
                 account.is_zero_lamport(),
             ),
             data_len: account.data().len() as u64,
+            stored_size: crate::append_vec::AppendVec::calculate_stored_size(account.data().len()),
             pubkey: Pubkey::new_unique(),
         };
 
@@ -861,6 +927,7 @@ mod tests {
                 false,
             ),
             data_len: 0,
+            stored_size: crate::append_vec::AppendVec::calculate_stored_size(0),
             pubkey: Pubkey::new_unique(),
         })
         .take(11)
@@ -888,6 +955,7 @@ mod tests {
                 false,
             ),
             data_len: 0,
+            stored_size: crate::append_vec::AppendVec::calculate_stored_size(0),
             pubkey: Pubkey::new_unique(),
         })
         .take(5)

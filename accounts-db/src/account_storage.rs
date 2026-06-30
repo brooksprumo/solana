@@ -19,11 +19,16 @@ use {
 pub mod stored_account_info;
 
 pub type AccountStorageMap = DashMap<Slot, Arc<AccountStorageEntry>>;
+type SplitExternalDataStorageKey = (Slot, AccountsFileId);
+type SplitExternalDataStorageMap = DashMap<SplitExternalDataStorageKey, Arc<AccountStorageEntry>>;
 
 #[derive(Default, Debug)]
 pub struct AccountStorage {
     /// map from Slot -> the single append vec for the slot
     map: AccountStorageMap,
+    /// Replaced split storages that no longer hold live account metadata, but still own data
+    /// entries referenced by newer split metadata.
+    split_external_data_storages: SplitExternalDataStorageMap,
     /// while shrink is operating on a slot, there can be 2 append vecs active for that slot
     /// Once the index has been updated to only refer to the new append vec, the single entry for the slot in 'map' can be updated.
     /// Entries in 'shrink_in_progress_map' can be found by 'get_account_storage_entry'
@@ -67,6 +72,11 @@ impl AccountStorage {
                     .unwrap()
                     .get(&slot)
                     .and_then(|entry| (entry.id() == store_id).then(|| Arc::clone(entry)))
+            })
+            .or_else(|| {
+                self.split_external_data_storages
+                    .get(&(slot, store_id))
+                    .map(|entry| Arc::clone(entry.value()))
             })
             .or_else(lookup_in_map)
     }
@@ -173,6 +183,21 @@ impl AccountStorage {
     ) -> Option<Arc<AccountStorageEntry>> {
         assert!(shrink_can_be_active || self.shrink_in_progress_map.read().unwrap().is_empty());
         self.map.remove(slot).map(|(_, storage)| storage)
+    }
+
+    pub(crate) fn retain_split_external_data_storage(&self, storage: Arc<AccountStorageEntry>) {
+        let key = (storage.slot(), storage.id());
+        self.split_external_data_storages.entry(key).or_insert(storage);
+    }
+
+    pub(crate) fn remove_split_external_data_storage(
+        &self,
+        slot: Slot,
+        storage_id: AccountsFileId,
+    ) -> Option<Arc<AccountStorageEntry>> {
+        self.split_external_data_storages
+            .remove(&(slot, storage_id))
+            .map(|(_key, storage)| storage)
     }
 
     /// iterate through all (slot, append-vec)

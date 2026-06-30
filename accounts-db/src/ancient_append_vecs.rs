@@ -1116,8 +1116,9 @@ mod tests {
         super::*,
         crate::{
             account_info::{AccountInfo, StorageLocation},
+            accounts_file::AccountsFileProvider,
             accounts_db::{
-                ShrinkCollectRefs,
+                ACCOUNTS_DB_CONFIG_FOR_TESTING, ShrinkCollectRefs,
                 tests::{
                     CAN_RANDOMLY_SHRINK_FALSE, append_single_account_with_default_hash,
                     compare_all_accounts, create_db_with_storages_and_index,
@@ -1139,6 +1140,13 @@ mod tests {
         strum::IntoEnumIterator,
         strum_macros::EnumIter,
     };
+
+    fn new_append_vec_accounts_db_for_tests() -> AccountsDb {
+        AccountsDb::new_single_for_tests_with_provider_and_config(
+            AccountsFileProvider::AppendVec,
+            ACCOUNTS_DB_CONFIG_FOR_TESTING,
+        )
+    }
 
     fn get_sample_storages(
         slots: usize,
@@ -1218,12 +1226,11 @@ mod tests {
         let (db, storages, slots, _infos) = get_sample_storages(1, None);
         let accounts_to_combine = AccountsToCombine::default();
         let offset = 0;
-        let account = storages
-            .first()
-            .unwrap()
+        let storage = storages.first().unwrap();
+        let account = storage
             .accounts
             .get_stored_account_without_data_callback(offset, |account| {
-                AccountFromStorage::new(offset, &account)
+                AccountFromStorage::new(storage.id(), offset, &account)
             })
             .unwrap();
         let accounts = [&account];
@@ -3138,7 +3145,11 @@ mod tests {
                                 storage
                                     .accounts
                                     .scan_accounts_without_data(|offset, account| {
-                                        accounts.push(AccountFromStorage::new(offset, &account));
+                                        accounts.push(AccountFromStorage::new(
+                                            storage.id(),
+                                            offset,
+                                            &account,
+                                        ));
                                     })
                                     .expect("must scan accounts storage");
                                 (storage.slot(), accounts)
@@ -3485,7 +3496,7 @@ mod tests {
 
         // When we pack ancient append vecs, the packed append vecs are recycled first if possible. This means they aren't dropped directly.
         // This test tests that we are releasing Arc refcounts for storages when we pack them into ancient append vecs.
-        let db = AccountsDb::new_single_for_tests();
+        let db = new_append_vec_accounts_db_for_tests();
         let initial_slot = 0;
         // create append vecs that we'll fill the recycler with when we pack them into 1 packed append vec
         create_storages_and_update_index(&db, None, initial_slot, MAX_RECYCLE_STORES, true, None);
@@ -3579,7 +3590,7 @@ mod tests {
         storages[0]
             .accounts
             .get_stored_account_without_data_callback(offset, |stored_account| {
-                let account = AccountFromStorage::new(offset, &stored_account);
+                let account = AccountFromStorage::new(storages[0].id(), offset, &stored_account);
                 let slot = 1;
                 let capacity = 0;
                 for i in 0..4usize {
@@ -3752,7 +3763,7 @@ mod tests {
 
     #[test]
     fn test_shrink_ancient_expected_unref() {
-        let db = AccountsDb::new_single_for_tests();
+        let db = new_append_vec_accounts_db_for_tests();
         for count in 0..3 {
             let pubkeys_to_unref = (0..count)
                 .map(|_| solana_pubkey::new_rand())
