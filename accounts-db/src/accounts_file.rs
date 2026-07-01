@@ -459,11 +459,7 @@ impl AccountsFileProvider {
             Self::AppendVec => {
                 AccountsFile::AppendVec(AppendVec::new(path, true, file_size as usize))
             }
-            Self::Split => AccountsFile::Split(SplitAccountsFile::new(
-                path,
-                true,
-                file_size as usize,
-            )),
+            Self::Split => AccountsFile::Split(SplitAccountsFile::new(path, file_size)),
         }
     }
 }

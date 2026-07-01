@@ -16,10 +16,10 @@ use {
     solana_clock::{Epoch, Slot},
     solana_pubkey::Pubkey,
     std::{
-        convert::TryFrom,
         collections::HashSet,
+        convert::TryFrom,
         fs::{File, OpenOptions, remove_file},
-        io::{self, Seek, SeekFrom, Write},
+        io::{self, Seek, Write},
         mem::MaybeUninit,
         path::{Path, PathBuf},
         slice,
@@ -31,6 +31,7 @@ use {
 };
 
 const HEADER_SIZE: usize = 4 * 1024;
+const HEADER_SIZE_U64: u64 = HEADER_SIZE as u64;
 const FORMAT_VERSION: u16 = 1;
 const META_MAGIC: &[u8; 8] = b"AGMETA0\0";
 const DATA_MAGIC: &[u8; 8] = b"AGDATA0\0";
@@ -109,8 +110,8 @@ pub struct SplitAccountsFile {
     allow_writes: bool,
     meta_current_len: AtomicUsize,
     data_current_len: AtomicUsize,
-    meta_file_size: usize,
-    data_file_size: usize,
+    meta_file_size: u64,
+    data_file_size: u64,
     remove_file_on_drop: AtomicBool,
     is_dirty: AtomicBool,
     slot: Slot,
@@ -137,31 +138,27 @@ impl Drop for SplitAccountsFile {
 }
 
 impl SplitAccountsFile {
-    pub(crate) fn new(base_path: impl Into<PathBuf>, create: bool, payload_size: usize) -> Self {
+    pub(crate) fn new(base_path: impl Into<PathBuf>, payload_size: u64) -> Self {
         let base_path = base_path.into();
         let (slot, id) = parse_slot_and_id(&base_path).unwrap_or_default();
         let meta_path = meta_path_for_base(&base_path);
         let data_path = data_path_for_base(&base_path);
         let payload_size = payload_size.max(1);
-        let meta_file_size = HEADER_SIZE + payload_size;
-        let data_file_size = HEADER_SIZE + payload_size;
+        let meta_file_size = HEADER_SIZE_U64.saturating_add(payload_size);
+        let data_file_size = HEADER_SIZE_U64.saturating_add(payload_size);
 
-        if create {
-            let _ = remove_file(&meta_path);
-            let _ = remove_file(&data_path);
-        }
+        let _ = remove_file(&meta_path);
+        let _ = remove_file(&data_path);
 
-        let mut meta_file = open_sized_file(&meta_path, create, meta_file_size)
+        let mut meta_file = open_split_file(&meta_path)
             .unwrap_or_else(|err| panic!("Unable to open meta file {}: {err}", meta_path.display()));
-        let mut data_file = open_sized_file(&data_path, create, data_file_size)
+        let mut data_file = open_split_file(&data_path)
             .unwrap_or_else(|err| panic!("Unable to open data file {}: {err}", data_path.display()));
 
-        if create {
-            write_header(&mut meta_file, META_MAGIC, 3, slot, id, HEADER_SIZE)
-                .expect("must write split meta header");
-            write_header(&mut data_file, DATA_MAGIC, 12, slot, id, HEADER_SIZE)
-                .expect("must write split data header");
-        }
+        write_header(&mut meta_file, META_MAGIC, 3, slot, id, HEADER_SIZE)
+            .expect("must write split meta header");
+        write_header(&mut data_file, DATA_MAGIC, 12, slot, id, HEADER_SIZE)
+            .expect("must write split data header");
 
         Self {
             base_path,
@@ -176,7 +173,7 @@ impl SplitAccountsFile {
             meta_file_size,
             data_file_size,
             remove_file_on_drop: AtomicBool::new(true),
-            is_dirty: AtomicBool::new(create),
+            is_dirty: AtomicBool::new(true),
             slot,
             id,
         }
@@ -202,8 +199,8 @@ impl SplitAccountsFile {
             allow_writes: false,
             meta_current_len: AtomicUsize::new(meta_used_len),
             data_current_len: AtomicUsize::new(data_used_len),
-            meta_file_size: meta_file_info.size as usize,
-            data_file_size: data_file_info.size as usize,
+            meta_file_size: meta_file_info.size,
+            data_file_size: data_file_info.size,
             remove_file_on_drop: AtomicBool::new(true),
             is_dirty: AtomicBool::new(false),
             slot,
@@ -230,8 +227,8 @@ impl SplitAccountsFile {
             allow_writes: false,
             meta_current_len: AtomicUsize::new(self.meta_len()),
             data_current_len: AtomicUsize::new(self.data_len()),
-            meta_file_size: meta_file_info.size as usize,
-            data_file_size: data_file_info.size as usize,
+            meta_file_size: meta_file_info.size,
+            data_file_size: data_file_info.size,
             remove_file_on_drop: AtomicBool::new(true),
             is_dirty: AtomicBool::new(false),
             slot: self.slot,
@@ -258,19 +255,19 @@ impl SplitAccountsFile {
     }
 
     pub(crate) fn remaining_bytes(&self) -> u64 {
-        let meta_remaining = self.meta_file_size.saturating_sub(u64_align!(self.meta_len()));
+        let meta_remaining = self
+            .meta_file_size
+            .saturating_sub(u64_align!(self.meta_len()) as u64);
         let data_remaining = self
             .data_file_size
-            .saturating_sub(align_usize(self.data_len(), DATA_ALIGNMENT));
+            .saturating_sub(align_usize(self.data_len(), DATA_ALIGNMENT) as u64);
         // `write_accounts_to_storage()` compares an AppendVec-style
         // `STORE_META_OVERHEAD + data_len` requirement against this value after
         // an append fails.  External split data entries are page-aligned, so be
         // conservative here; otherwise the caller can spin on a store that is
         // large enough for the old layout but too small for one page-aligned
         // data entry.
-        meta_remaining
-            .min(data_remaining.saturating_sub(DATA_ALIGNMENT))
-            as u64
+        meta_remaining.min(data_remaining.saturating_sub(DATA_ALIGNMENT as u64))
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -282,7 +279,7 @@ impl SplitAccountsFile {
     }
 
     pub(crate) fn capacity(&self) -> u64 {
-        self.meta_file_size.saturating_add(self.data_file_size) as u64
+        self.meta_file_size.saturating_add(self.data_file_size)
     }
 
     pub(crate) fn dead_bytes_due_to_zero_lamport_single_ref(&self, count: usize) -> usize {
@@ -363,11 +360,9 @@ impl SplitAccountsFile {
         offset: usize,
         external_data_file: Option<&Self>,
     ) -> Option<AccountSharedData> {
-        self.get_stored_account_callback_with_external_data(
-            offset,
-            external_data_file,
-            |account| create_account_shared_data(&account),
-        )
+        self.get_stored_account_callback_with_external_data(offset, external_data_file, |account| {
+            create_account_shared_data(&account)
+        })
     }
 
     pub(crate) fn scan_accounts_without_data(
@@ -537,19 +532,19 @@ impl SplitAccountsFile {
                     .copied()
                     .flatten()
                     .filter(|_| data_len != 0 && !should_store_internal(data_len));
-                let data_stored_size = if should_store_internal(data_len)
-                    || reusable_data_ref.is_some()
-                {
-                    0
-                } else {
-                    Self::calculate_data_stored_size(data_len)
-                };
+                let data_stored_size =
+                    if should_store_internal(data_len) || reusable_data_ref.is_some() {
+                        0
+                    } else {
+                        Self::calculate_data_stored_size(data_len)
+                    };
                 let aligned_meta_offset = u64_align!(meta_offset);
                 let aligned_data_offset = align_usize(data_offset, DATA_ALIGNMENT);
                 let next_meta_offset = aligned_meta_offset.saturating_add(meta_stored_size);
                 let next_data_offset = aligned_data_offset.saturating_add(data_stored_size);
 
-                if next_meta_offset > self.meta_file_size || next_data_offset > self.data_file_size
+                if next_meta_offset as u64 > self.meta_file_size
+                    || next_data_offset as u64 > self.data_file_size
                 {
                     stop = true;
                     return;
@@ -648,7 +643,10 @@ impl SplitAccountsFile {
     }
 
     fn calculate_data_stored_size(data_len: usize) -> usize {
-        align_usize(DATA_ENTRY_FIXED_SIZE.saturating_add(data_len), DATA_ALIGNMENT)
+        align_usize(
+            DATA_ENTRY_FIXED_SIZE.saturating_add(data_len),
+            DATA_ALIGNMENT,
+        )
     }
 
     fn account_stored_size(&self, account: &SplitStoredAccount) -> usize {
@@ -656,9 +654,7 @@ impl SplitAccountsFile {
             SplitDataRef::External { len, location } if self.owns_data_location(location) => {
                 Self::calculate_data_stored_size(len)
             }
-            SplitDataRef::None | SplitDataRef::Internal { .. } | SplitDataRef::External { .. } => {
-                0
-            }
+            SplitDataRef::None | SplitDataRef::Internal { .. } | SplitDataRef::External { .. } => 0,
         };
         account.stored_size.saturating_add(data_stored_size)
     }
@@ -782,10 +778,10 @@ impl SplitAccountsFile {
 
                 let data_path = data_path_for_base(&self.base_path_for_location(location));
                 let data_file_info = FileInfo::new_from_path(&data_path)?;
-                read_header(&data_file_info.file, DATA_MAGIC)?;
+                let data_used_len = read_header(&data_file_info.file, DATA_MAGIC)?;
                 Self::read_data_entry_from_file(
                     &data_file_info.file,
-                    data_file_info.size as usize,
+                    data_used_len,
                     location.offset,
                     &account.pubkey,
                     len,
@@ -832,7 +828,12 @@ impl SplitAccountsFile {
         }
 
         let mut data = vec![0; expected_len];
-        read_exact_at(data_file, data_len, offset + DATA_ENTRY_FIXED_SIZE, &mut data)?;
+        read_exact_at(
+            data_file,
+            data_len,
+            offset + DATA_ENTRY_FIXED_SIZE,
+            &mut data,
+        )?;
         Ok(data)
     }
 
@@ -899,14 +900,13 @@ impl SplitAccountsFile {
                     .copy_from_slice(&location.slot.to_le_bytes());
                 fixed[META_DATA_ID_OFFSET..META_DATA_ID_OFFSET + 4]
                     .copy_from_slice(&location.id.to_le_bytes());
-                let reduced_offset = u32::try_from(location.offset >> DATA_OFFSET_SHIFT).map_err(
-                    |_| {
+                let reduced_offset =
+                    u32::try_from(location.offset >> DATA_OFFSET_SHIFT).map_err(|_| {
                         io::Error::new(
                             io::ErrorKind::InvalidInput,
                             "split data offset exceeds reduced offset limit",
                         )
-                    },
-                )?;
+                    })?;
                 fixed[META_DATA_OFFSET_REDUCED_OFFSET..META_DATA_OFFSET_REDUCED_OFFSET + 4]
                     .copy_from_slice(&reduced_offset.to_le_bytes());
             }
@@ -943,17 +943,13 @@ impl SplitDataRef {
     }
 }
 
-fn open_sized_file(path: &Path, create: bool, size: usize) -> io::Result<File> {
-    let mut file = OpenOptions::new()
+fn open_split_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
         .read(true)
         .write(true)
-        .create(create)
-        .open(path)?;
-    file.seek(SeekFrom::Start((size - 1) as u64))?;
-    file.write_all(&[0])?;
-    file.rewind()?;
-    file.flush()?;
-    Ok(file)
+        .create(true)
+        .truncate(true)
+        .open(path)
 }
 
 fn write_header(
@@ -1103,10 +1099,10 @@ mod tests {
         tempfile::TempDir,
     };
 
-    fn new_test_split_file(payload_size: usize) -> (TempDir, SplitAccountsFile) {
+    fn new_test_split_file(payload_size: u64) -> (TempDir, SplitAccountsFile) {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("42.7");
-        let split = SplitAccountsFile::new(path, true, payload_size);
+        let split = SplitAccountsFile::new(path, payload_size);
         (temp_dir, split)
     }
 
@@ -1116,6 +1112,40 @@ mod tests {
         let mut account = AccountSharedData::new(lamports, data_len, &owner);
         account.set_data((0..data_len).map(|i| (i % 251) as u8).collect());
         (pubkey, account)
+    }
+
+    #[test]
+    fn test_split_accounts_file_does_not_presize_files() {
+        let (temp_dir, split) = new_test_split_file(32 * 1024);
+        let meta_path = temp_dir.path().join("42.7.meta");
+        let data_path = temp_dir.path().join("42.7.data");
+
+        assert_eq!(
+            std::fs::metadata(&meta_path).unwrap().len() as usize,
+            HEADER_SIZE
+        );
+        assert_eq!(
+            std::fs::metadata(&data_path).unwrap().len() as usize,
+            HEADER_SIZE
+        );
+
+        let account = new_account(33, 128);
+        let accounts = [(&account.0, &account.1)];
+        split.write_accounts(&(42, &accounts[..]), 0).unwrap();
+        split.flush().unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&meta_path).unwrap().len() as usize,
+            split.meta_len()
+        );
+        assert_eq!(
+            std::fs::metadata(&data_path).unwrap().len() as usize,
+            HEADER_SIZE
+        );
+        assert_ne!(
+            std::fs::metadata(&meta_path).unwrap().len(),
+            (HEADER_SIZE + 32 * 1024) as u64,
+        );
     }
 
     #[test]
@@ -1162,8 +1192,8 @@ mod tests {
     #[test]
     fn test_split_accounts_file_reuses_external_data_from_sibling_file() {
         let temp_dir = TempDir::new().unwrap();
-        let old_split = SplitAccountsFile::new(temp_dir.path().join("42.7"), true, 32 * 1024);
-        let new_split = SplitAccountsFile::new(temp_dir.path().join("43.8"), true, 32 * 1024);
+        let old_split = SplitAccountsFile::new(temp_dir.path().join("42.7"), 32 * 1024);
+        let new_split = SplitAccountsFile::new(temp_dir.path().join("43.8"), 32 * 1024);
         assert!(new_split.can_reference_data_from(&old_split));
 
         let (pubkey, account) = new_account(22, HEADER_SIZE);
@@ -1192,7 +1222,9 @@ mod tests {
         assert_eq!(new_split.data_len(), HEADER_SIZE);
         assert_eq!(
             new_split.get_account_stored_sizes(&new_stored.offsets),
-            vec![SplitAccountsFile::calculate_meta_stored_size(account.data().len())],
+            vec![SplitAccountsFile::calculate_meta_stored_size(
+                account.data().len()
+            )],
         );
         let loaded = new_split
             .get_account_shared_data(new_stored.offsets[0])
@@ -1203,8 +1235,8 @@ mod tests {
     #[test]
     fn test_split_accounts_file_archive_bytes_follow_external_data() {
         let temp_dir = TempDir::new().unwrap();
-        let old_split = SplitAccountsFile::new(temp_dir.path().join("42.7"), true, 32 * 1024);
-        let new_split = SplitAccountsFile::new(temp_dir.path().join("43.8"), true, 32 * 1024);
+        let old_split = SplitAccountsFile::new(temp_dir.path().join("42.7"), 32 * 1024);
+        let new_split = SplitAccountsFile::new(temp_dir.path().join("43.8"), 32 * 1024);
 
         let (pubkey, account) = new_account(22, HEADER_SIZE);
         let accounts = [(&pubkey, &account)];
@@ -1253,7 +1285,10 @@ mod tests {
         let (temp_dir, split) = new_test_split_file(16 * 1024);
         let account = new_account(33, 128);
         let accounts = [(&account.0, &account.1)];
-        let offset = split.write_accounts(&(42, &accounts[..]), 0).unwrap().offsets[0];
+        let offset = split
+            .write_accounts(&(42, &accounts[..]), 0)
+            .unwrap()
+            .offsets[0];
         split.flush().unwrap();
 
         let meta_path = temp_dir.path().join("42.7.meta");
@@ -1261,8 +1296,9 @@ mod tests {
         assert!(meta_path.exists());
         assert!(data_path.exists());
 
-        let reopened = SplitAccountsFile::new_for_startup(FileInfo::new_from_path(meta_path).unwrap())
-            .unwrap();
+        let reopened =
+            SplitAccountsFile::new_for_startup(FileInfo::new_from_path(meta_path).unwrap())
+                .unwrap();
         let loaded = reopened.get_account_shared_data(offset).unwrap();
         assert!(accounts_equal(&loaded, &account.1));
     }
