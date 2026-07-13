@@ -3204,8 +3204,14 @@ impl AccountsDb {
             };
             let alive_bytes_after_shrink = self.alive_bytes_after_shrink(&store) as u64;
             total_alive_bytes += alive_bytes_after_shrink;
-            total_bytes += store.capacity();
-            let alive_ratio = alive_bytes_after_shrink as f64 / store.capacity() as f64;
+            let written_bytes = store.written_bytes();
+            total_bytes += written_bytes;
+            debug_assert!(
+                written_bytes > 0,
+                "shrink candidate has zero written bytes! slot: {slot} id: {}",
+                store.id(),
+            );
+            let alive_ratio = alive_bytes_after_shrink as f64 / written_bytes as f64;
             store_usages.push(StoreUsageInfo {
                 slot: *slot,
                 alive_ratio,
@@ -3249,7 +3255,7 @@ impl AccountsDb {
                     break;
                 }
             } else {
-                let current_store_size = store.capacity();
+                let current_store_size = store.written_bytes();
                 let after_shrink_size = store_usage.alive_bytes_after_shrink;
                 let bytes_saved = current_store_size.saturating_sub(after_shrink_size);
                 total_bytes -= bytes_saved;
