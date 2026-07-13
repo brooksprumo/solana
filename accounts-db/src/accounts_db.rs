@@ -290,6 +290,7 @@ pub struct AccountFromStorage {
     pub index_info: AccountInfo,
     pub data_len: u64,
     pub pubkey: Pubkey,
+    pub stored_size: usize,
 }
 
 impl IsZeroLamport for AccountFromStorage {
@@ -303,7 +304,7 @@ impl AccountFromStorage {
         &self.pubkey
     }
     pub fn stored_size(&self) -> usize {
-        AppendVec::calculate_stored_size(self.data_len as usize)
+        self.stored_size
     }
     pub fn data_len(&self) -> usize {
         self.data_len as usize
@@ -321,6 +322,7 @@ impl AccountFromStorage {
             ),
             pubkey: *account.pubkey(),
             data_len: account.data_len as u64,
+            stored_size: AppendVec::calculate_stored_size(account.data_len),
         }
     }
 }
@@ -2623,6 +2625,7 @@ impl AccountsDb {
                     ),
                     pubkey: *account.pubkey(),
                     data_len: account.data_len as u64,
+                    stored_size: store.accounts.calculate_stored_size(account.data_len),
                 });
             })
             .expect("must scan accounts storage");
@@ -4742,7 +4745,7 @@ impl AccountsDb {
         };
 
         if !accounts.is_empty() {
-            // This ensures that all updates are written to an AppendVec, before any
+            // This ensures that all updates are written to an AccountsFile before any
             // updates to the index happen, so anybody that sees a real entry in the index,
             // will be able to find the account in storage
             let flushed_store = Arc::new(self.create_store(slot, flush_stats.num_bytes_flushed.0));
@@ -4757,7 +4760,7 @@ impl AccountsDb {
             flush_stats.accumulate_store_accounts_for_flush(store_accounts_for_flush_stats);
             flush_stats.store_accounts_total_us += Saturating(store_accounts_for_flush_us);
 
-            // If the above sizing function is correct, just one AppendVec is enough to hold
+            // If the above sizing function is correct, just one storage is enough to hold
             // all the data for the slot
             assert!(self.storage.get_slot_storage_entry(slot).is_some());
             self.reopen_storage_as_readonly_shrinking_in_progress_ok(slot);

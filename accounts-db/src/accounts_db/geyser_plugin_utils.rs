@@ -107,27 +107,24 @@ mod tests {
         // Need to add root and flush write cache for each slot to ensure accounts are written
         // to correct slots. Cache flush can skip writes if accounts have already been written to
         // a newer slot
+        let create_storage = |slot, key| {
+            let storage = accounts_db.create_store(slot, 4_096);
+            storage
+                .accounts
+                .write_accounts(&(slot, [(key, &account)].as_slice()));
+            let storage = Arc::new(storage);
+            accounts_db.storage.insert(Arc::clone(&storage));
+            storage
+        };
         let slot0 = 0;
-        let storage0 = accounts_db.create_store(slot0, /*size*/ 4_096);
-        storage0
-            .accounts
-            .write_accounts(&(slot0, [(&key1, &account)].as_slice()));
-        accounts_db.storage.insert(Arc::new(storage0));
+        let _storage0 = create_storage(slot0, &key1);
 
         let slot1 = 1;
-        let storage1 = accounts_db.create_store(slot1, /*size*/ 4_096);
-        storage1
-            .accounts
-            .write_accounts(&(slot1, [(&key1, &account)].as_slice()));
-        accounts_db.storage.insert(Arc::new(storage1));
+        let _storage1 = create_storage(slot1, &key1);
 
         // Account with key2 is updated in a single slot, should get notified once
         let slot2 = 2;
-        let storage2 = accounts_db.create_store(slot2, /*size*/ 4_096);
-        storage2
-            .accounts
-            .write_accounts(&(slot2, [(&key2, &account)].as_slice()));
-        accounts_db.storage.insert(Arc::new(storage2));
+        let _storage2 = create_storage(slot2, &key2);
 
         // Do the notification
         let notifier = GeyserTestPlugin::default();

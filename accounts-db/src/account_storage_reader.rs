@@ -1,15 +1,25 @@
 use {
     crate::{
-        account_info::Offset, account_storage_entry::AccountStorageEntry,
-        accounts_file::OpenFileForArchive,
+        account_info::Offset, account_storage::stored_account_info::StoredAccountInfo,
+        account_storage_entry::AccountStorageEntry, accounts_file::OpenFileForArchive, u64_align,
     },
     agave_fs::{
         buffered_reader::{self, FileBufRead},
         io_setup::IoSetupState,
     },
     solana_clock::Slot,
-    std::io::{self, Read},
+    std::{
+        collections::HashSet,
+        io::{self, Cursor, Read},
+    },
 };
+
+const LEGACY_APPEND_VEC_STORED_META_SIZE: usize = 0x30;
+const LEGACY_APPEND_VEC_ACCOUNT_META_SIZE: usize = 0x38;
+const LEGACY_APPEND_VEC_ACCOUNT_HASH_SIZE: usize = 32;
+const LEGACY_APPEND_VEC_ACCOUNT_OVERHEAD: usize = LEGACY_APPEND_VEC_STORED_META_SIZE
+    + LEGACY_APPEND_VEC_ACCOUNT_META_SIZE
+    + LEGACY_APPEND_VEC_ACCOUNT_HASH_SIZE;
 
 // Read-ahead buffer capacity, sized as a multiple of the default io-uring
 // reader's read size (1 MiB) and large enough that almost any account storage
@@ -79,10 +89,17 @@ pub enum TombstonesFilter {
 /// via `set_file` (typically using a file opened with [`open_storage_files`])
 /// before constructing the reader.
 pub struct AccountStorageReader<'r, R> {
-    sorted_excluded_accounts: Vec<(Offset, usize)>,
-    reader: &'r mut R,
+    inner: AccountStorageReaderInner<'r, R>,
     num_alive_bytes: usize,
-    num_total_bytes: usize,
+}
+
+enum AccountStorageReaderInner<'r, R> {
+    Raw {
+        sorted_excluded_accounts: Vec<(Offset, usize)>,
+        reader: &'r mut R,
+        num_total_bytes: usize,
+    },
+    Bytes(Cursor<Vec<u8>>),
 }
 
 impl<'a, 'r, R: FileBufRead<'a>> AccountStorageReader<'r, R> {
@@ -98,12 +115,29 @@ impl<'a, 'r, R: FileBufRead<'a>> AccountStorageReader<'r, R> {
         file_reader: &'r mut R,
     ) -> io::Result<Self> {
         let num_total_bytes = storage.accounts.len();
-        let mut num_alive_bytes = num_total_bytes - storage.get_obsolete_bytes(snapshot_slot);
-
         let mut sorted_excluded_accounts: Vec<_> = storage
             .obsolete_accounts_read_lock()
             .filter_obsolete_accounts(snapshot_slot)
             .collect();
+        let mut excluded_offsets: HashSet<_> = sorted_excluded_accounts
+            .iter()
+            .map(|(offset, _data_len)| *offset)
+            .collect();
+
+        if tombstones_filter == TombstonesFilter::Exclude {
+            excluded_offsets.extend(storage.tombstone_offsets_read_lock().iter().copied());
+        }
+
+        if !storage.accounts.can_archive_raw() {
+            let bytes = append_vec_archive_bytes(storage, &excluded_offsets)?;
+            let num_alive_bytes = bytes.len();
+            return Ok(Self {
+                inner: AccountStorageReaderInner::Bytes(Cursor::new(bytes)),
+                num_alive_bytes,
+            });
+        }
+
+        let mut num_alive_bytes = num_total_bytes - storage.get_obsolete_bytes(snapshot_slot);
 
         // Convert the length to the size
         sorted_excluded_accounts
@@ -129,10 +163,12 @@ impl<'a, 'r, R: FileBufRead<'a>> AccountStorageReader<'r, R> {
             .sort_unstable_by(|(a_offset, _), (b_offset, _)| b_offset.cmp(a_offset));
 
         Ok(Self {
-            sorted_excluded_accounts,
-            reader: file_reader,
+            inner: AccountStorageReaderInner::Raw {
+                sorted_excluded_accounts,
+                reader: file_reader,
+                num_total_bytes,
+            },
             num_alive_bytes,
-            num_total_bytes,
         })
     }
 
@@ -147,18 +183,27 @@ impl<'a, 'r, R: FileBufRead<'a>> AccountStorageReader<'r, R> {
 
 impl<'a, R: FileBufRead<'a>> Read for AccountStorageReader<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let (sorted_excluded_accounts, reader, num_total_bytes) = match &mut self.inner {
+            AccountStorageReaderInner::Raw {
+                sorted_excluded_accounts,
+                reader,
+                num_total_bytes,
+            } => (sorted_excluded_accounts, reader, num_total_bytes),
+            AccountStorageReaderInner::Bytes(reader) => return reader.read(buf),
+        };
+
         let mut total_read = 0;
         let buf_len = buf.len();
 
         while total_read < buf_len {
-            let next_excluded_account = self.sorted_excluded_accounts.last();
-            let file_offset = self.reader.get_file_offset() as usize;
+            let next_excluded_account = sorted_excluded_accounts.last();
+            let file_offset = reader.get_file_offset() as usize;
             if let Some(&(excluded_start, excluded_size)) = next_excluded_account
                 && file_offset == excluded_start
             {
-                let skip_len = excluded_size.min(self.num_total_bytes - excluded_start);
-                self.reader.consume_or_skip(skip_len);
-                self.sorted_excluded_accounts.pop();
+                let skip_len = excluded_size.min(*num_total_bytes - excluded_start);
+                reader.consume_or_skip(skip_len);
+                sorted_excluded_accounts.pop();
                 continue;
             }
 
@@ -169,12 +214,12 @@ impl<'a, R: FileBufRead<'a>> Read for AccountStorageReader<'_, R> {
             let bytes_to_read_from_file = if let Some((excluded_start, _)) = next_excluded_account {
                 excluded_start.saturating_sub(file_offset)
             } else {
-                self.num_total_bytes.saturating_sub(file_offset)
+                num_total_bytes.saturating_sub(file_offset)
             };
 
             let bytes_to_read = bytes_left_in_buffer.min(bytes_to_read_from_file);
 
-            let read_size = self.reader.read(&mut buf[total_read..][..bytes_to_read])?;
+            let read_size = reader.read(&mut buf[total_read..][..bytes_to_read])?;
 
             if read_size == 0 {
                 break; // EOF
@@ -187,6 +232,62 @@ impl<'a, R: FileBufRead<'a>> Read for AccountStorageReader<'_, R> {
     }
 }
 
+fn append_vec_archive_bytes(
+    storage: &AccountStorageEntry,
+    excluded_offsets: &HashSet<Offset>,
+) -> io::Result<Vec<u8>> {
+    let mut live_offsets = Vec::new();
+    storage
+        .accounts
+        .scan_accounts_without_data(|offset, _account| {
+            if !excluded_offsets.contains(&offset) {
+                live_offsets.push(offset);
+            }
+        })
+        .map_err(accounts_file_error_to_io)?;
+
+    let mut bytes = Vec::new();
+    for offset in live_offsets {
+        storage
+            .accounts
+            .get_stored_account_callback(offset, |account| {
+                append_legacy_account_bytes(&mut bytes, &account);
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing account while building snapshot archive bytes",
+                )
+            })?;
+    }
+    Ok(bytes)
+}
+
+fn append_legacy_account_bytes(bytes: &mut Vec<u8>, account: &StoredAccountInfo<'_>) {
+    let start = bytes.len();
+    let record_len = LEGACY_APPEND_VEC_ACCOUNT_OVERHEAD + account.data.len();
+    bytes.resize(start + record_len, 0);
+    let record = &mut bytes[start..start + record_len];
+
+    record[0x00..0x08].copy_from_slice(&0u64.to_le_bytes());
+    record[0x08..0x10].copy_from_slice(&(account.data.len() as u64).to_le_bytes());
+    record[0x10..0x30].copy_from_slice(account.pubkey.as_ref());
+
+    let account_meta = LEGACY_APPEND_VEC_STORED_META_SIZE;
+    record[account_meta..account_meta + 8].copy_from_slice(&account.lamports.to_le_bytes());
+    record[account_meta + 8..account_meta + 16].copy_from_slice(&account.rent_epoch.to_le_bytes());
+    record[account_meta + 16..account_meta + 48].copy_from_slice(account.owner.as_ref());
+    record[account_meta + 48] = account.executable.into();
+
+    let data_start = LEGACY_APPEND_VEC_ACCOUNT_OVERHEAD;
+    record[data_start..data_start + account.data.len()].copy_from_slice(account.data);
+    bytes.resize(u64_align!(bytes.len()), 0);
+}
+
+fn accounts_file_error_to_io(err: crate::accounts_file::AccountsFileError) -> io::Error {
+    io::Error::other(err.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use {
@@ -196,6 +297,9 @@ mod tests {
             account_storage_entry::AccountStorageEntry,
             accounts_db::get_temp_accounts_paths,
             accounts_file::{AccountsFile, AccountsFileProvider},
+            append_vec::new_scan_accounts_reader,
+            u64_align,
+            utils::create_account_shared_data,
         },
         agave_fs::io_setup::IoSetupState,
         log::*,
@@ -204,7 +308,7 @@ mod tests {
             rngs::StdRng,
             seq::{IndexedMutRandom as _, IndexedRandom},
         },
-        solana_account::AccountSharedData,
+        solana_account::{AccountSharedData, ReadableAccount, accounts_equal},
         solana_pubkey::Pubkey,
         std::{fs::File, iter},
         test_case::test_case,
@@ -398,6 +502,83 @@ mod tests {
             // Verify that the new storage has the same length as the reader
             assert_eq!(new_storage.accounts.len(), reader.len());
         }
+    }
+
+    #[test]
+    fn test_account_storage_reader_split_archives_as_append_vec() {
+        let slot = 0;
+        let id = 0;
+        let (temp_dirs, paths) = get_temp_accounts_paths(1).unwrap();
+        let small_key = Pubkey::new_unique();
+        let large_key = Pubkey::new_unique();
+        let small_account = AccountSharedData::new(1, 16, &Pubkey::new_unique());
+        let large_account = AccountSharedData::new(2, 8 * 1024, &Pubkey::new_unique());
+        let accounts = [(&small_key, &small_account), (&large_key, &large_account)];
+
+        let storage = AccountStorageEntry::new(
+            &paths[0],
+            slot,
+            id,
+            1024 * 1024,
+            AccountsFileProvider::SplitStorage,
+        );
+        let stored_info = storage
+            .accounts
+            .write_accounts(&(slot, &accounts[..]))
+            .unwrap();
+        storage.add_accounts(stored_info.offsets.len(), stored_info.size);
+
+        let obsolete_offset = stored_info.offsets[0];
+        let obsolete_data_len = storage.accounts.get_account_data_lens(&[obsolete_offset])[0];
+        storage
+            .obsolete_accounts()
+            .write()
+            .unwrap()
+            .mark_accounts_obsolete(iter::once((obsolete_offset, obsolete_data_len)), 0);
+
+        let files = open_storage_files(iter::once(&storage), false)
+            .collect::<io::Result<Vec<_>>>()
+            .unwrap();
+        let mut file_reader = storage_file_buf_reader(
+            ACCOUNT_STORAGE_MAX_BUFFER_SIZE,
+            false,
+            &IoSetupState::default(),
+        )
+        .unwrap();
+        file_reader
+            .set_file(files[0].as_ref(), storage.accounts.len() as u64)
+            .unwrap();
+        let mut reader =
+            AccountStorageReader::new(&storage, None, TombstonesFilter::Include, &mut file_reader)
+                .unwrap();
+        assert_eq!(
+            reader.len(),
+            u64_align!(LEGACY_APPEND_VEC_ACCOUNT_OVERHEAD + large_account.data().len())
+        );
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_file_path = temp_dir.path().join("output_file");
+        let mut output_file = File::create(&temp_file_path).unwrap();
+        let bytes_written = io::copy(&mut reader, &mut output_file).unwrap();
+        assert_eq!(bytes_written as usize, reader.len());
+        drop(output_file);
+
+        let (accounts_file, num_accounts) =
+            AccountsFile::new_from_file(temp_file_path, reader.len()).unwrap();
+        assert_eq!(num_accounts, 1);
+
+        let mut scan_reader = new_scan_accounts_reader();
+        let mut loaded = Vec::new();
+        accounts_file
+            .scan_accounts(&mut scan_reader, |_offset, account| {
+                loaded.push((*account.pubkey(), create_account_shared_data(&account)));
+            })
+            .unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].0, large_key);
+        assert!(accounts_equal(&loaded[0].1, &large_account));
+
+        drop(temp_dirs);
     }
 
     #[test]

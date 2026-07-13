@@ -2119,23 +2119,18 @@ mod tests {
             // assert that we wrote the 2_ref account to the newly shrunk append vec
             let shrink_in_progress = shrinks_in_progress.first().unwrap().1;
             let mut count = 0;
+            let mut account = None;
             shrink_in_progress
                 .new_storage()
                 .accounts
-                .scan_accounts(&mut reader, |_offset, _| {
+                .scan_accounts(&mut reader, |_offset, stored_account| {
                     count += 1;
+                    assert_eq!(stored_account.pubkey(), pk_with_2_refs);
+                    account = Some(create_account_shared_data(&stored_account));
                 })
                 .expect("must scan accounts storage");
             assert_eq!(count, 1);
-            let account = shrink_in_progress
-                .new_storage()
-                .accounts
-                .get_stored_account_callback(0, |account| {
-                    assert_eq!(account.pubkey(), pk_with_2_refs);
-                    create_account_shared_data(&account)
-                })
-                .unwrap();
-            assert_eq!(account, account_shared_data_with_2_refs);
+            assert_eq!(account.unwrap(), account_shared_data_with_2_refs);
         }
     }
 

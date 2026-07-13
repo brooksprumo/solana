@@ -691,6 +691,7 @@ pub fn execute(
         .unwrap_or_default();
 
     let accounts_db_config = AccountsDbConfig {
+        accounts_file_provider: AccountsFileProvider::SplitStorage,
         index: Some(accounts_index_config),
         account_indexes: Some(account_indexes.clone()),
         bank_hash_details_dir: ledger_path.clone(),

@@ -8,6 +8,8 @@ use {
 };
 
 mod append_vec;
+#[allow(dead_code)]
+mod split_storage;
 
 // re-export these fns that live in impl.rs because ancient append vec tests use them...
 pub(crate) use append_vec::r#impl::{

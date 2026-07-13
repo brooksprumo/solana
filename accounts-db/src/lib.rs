@@ -35,6 +35,7 @@ pub mod read_only_accounts_cache;
 mod read_only_accounts_cache;
 mod rolling_bit_field;
 pub mod sorted_storages;
+mod split_accounts_file;
 pub mod stake_rewards;
 pub mod storable_accounts;
 pub mod utils;

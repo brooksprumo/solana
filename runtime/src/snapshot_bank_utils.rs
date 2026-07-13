@@ -849,7 +849,7 @@ mod tests {
         semver::Version,
         solana_accounts_db::{
             accounts_db::{ACCOUNTS_DB_CONFIG_FOR_TESTING, AccountsFileId},
-            accounts_file::AccountsFile,
+            accounts_file::{AccountsFile, AccountsFileProvider},
         },
         solana_hash::Hash,
         solana_keypair::Keypair,
@@ -957,10 +957,24 @@ mod tests {
 
     /// Test roundtrip of bank to a full snapshot, then back again.  This test creates the simplest
     /// bank possible, so the contents of the snapshot archive will be quite minimal.
-    #[test]
-    fn test_roundtrip_bank_to_and_from_full_snapshot_simple() {
+    #[test_case(AccountsFileProvider::AppendVec)]
+    #[test_case(AccountsFileProvider::SplitStorage)]
+    fn test_roundtrip_bank_to_and_from_full_snapshot_simple(
+        accounts_file_provider: AccountsFileProvider,
+    ) {
         let genesis_config = GenesisConfig::default();
-        let original_bank = Bank::new_for_tests(&genesis_config);
+        let accounts_db_config = AccountsDbConfig {
+            accounts_file_provider,
+            ..ACCOUNTS_DB_CONFIG_FOR_TESTING
+        };
+        let original_bank = Bank::new_with_paths_for_tests(
+            &genesis_config,
+            Some(BankTestConfig {
+                accounts_db_config: accounts_db_config.clone(),
+            }),
+            vec![],
+            None,
+        );
 
         original_bank.fill_bank_with_ticks_for_tests();
         original_bank.set_block_id(Some(Hash::default()));
@@ -991,7 +1005,7 @@ mod tests {
             false,
             false,
             false,
-            ACCOUNTS_DB_CONFIG_FOR_TESTING,
+            accounts_db_config,
             None,
             Arc::default(),
         )

@@ -391,6 +391,7 @@ mod tests {
             account_storage_entry::AccountStorageEntry,
             accounts_db::get_temp_accounts_paths,
             accounts_file::AccountsFileProvider,
+            append_vec::AppendVec,
         },
         rand::Rng,
         solana_account::{AccountSharedData, accounts_equal},
@@ -607,6 +608,7 @@ mod tests {
                                 ),
                                 data_len: account.data.len() as u64,
                                 pubkey: *account.pubkey,
+                                stored_size: AppendVec::calculate_stored_size(account.data.len()),
                             }
                         })
                         .collect();
@@ -733,6 +735,7 @@ mod tests {
                         ),
                         data_len: account.data.len() as u64,
                         pubkey: *account.pubkey,
+                        stored_size: AppendVec::calculate_stored_size(account.data.len()),
                     }
                 })
                 .collect();
@@ -823,6 +826,7 @@ mod tests {
             ),
             data_len: account.data().len() as u64,
             pubkey: Pubkey::new_unique(),
+            stored_size: AppendVec::calculate_stored_size(account.data().len()),
         };
 
         let mut slot_accounts = Vec::new();
@@ -861,6 +865,7 @@ mod tests {
             ),
             data_len: 0,
             pubkey: Pubkey::new_unique(),
+            stored_size: AppendVec::calculate_stored_size(0),
         })
         .take(11)
         .collect();
@@ -888,6 +893,7 @@ mod tests {
             ),
             data_len: 0,
             pubkey: Pubkey::new_unique(),
+            stored_size: AppendVec::calculate_stored_size(0),
         })
         .take(5)
         .collect();

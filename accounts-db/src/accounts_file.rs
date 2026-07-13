@@ -4,6 +4,7 @@ use {
         account_storage::stored_account_info::{StoredAccountInfo, StoredAccountInfoWithoutData},
         accounts_db::AccountsFileId,
         append_vec::{AppendVec, AppendVecError},
+        split_accounts_file::SplitAccountsFile,
         storable_accounts::StorableAccounts,
     },
     agave_fs::{FileInfo, buffered_reader::RequiredLenBufFileRead, file_io::open_for_reading},
@@ -46,6 +47,7 @@ pub enum AccountsFileError {
 /// under different formats.
 pub enum AccountsFile {
     AppendVec(AppendVec),
+    SplitStorage(SplitAccountsFile),
 }
 
 impl AccountsFile {
@@ -73,6 +75,7 @@ impl AccountsFile {
     pub(crate) fn reopen_as_readonly(&self) -> Option<Self> {
         match self {
             Self::AppendVec(av) => av.reopen_as_readonly_file_io().map(Self::AppendVec),
+            Self::SplitStorage(split) => split.reopen_as_readonly_file_io().map(Self::SplitStorage),
         }
     }
 
@@ -81,6 +84,7 @@ impl AccountsFile {
     pub fn disable_remove_on_drop(&self) {
         match self {
             Self::AppendVec(av) => av.disable_remove_on_drop(),
+            Self::SplitStorage(split) => split.disable_remove_on_drop(),
         }
     }
 
@@ -89,6 +93,7 @@ impl AccountsFile {
     pub(crate) fn dead_bytes_due_to_zero_lamport_single_ref(&self, count: usize) -> usize {
         match self {
             Self::AppendVec(av) => av.dead_bytes_due_to_zero_lamport_single_ref(count),
+            Self::SplitStorage(split) => split.dead_bytes_due_to_zero_lamport_single_ref(count),
         }
     }
 
@@ -96,6 +101,7 @@ impl AccountsFile {
     pub fn flush(&self) -> Result<()> {
         match self {
             Self::AppendVec(av) => av.flush()?,
+            Self::SplitStorage(split) => split.flush()?,
         }
         Ok(())
     }
@@ -104,12 +110,14 @@ impl AccountsFile {
     pub fn len(&self) -> usize {
         match self {
             Self::AppendVec(av) => av.len(),
+            Self::SplitStorage(split) => split.len(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
         match self {
             Self::AppendVec(av) => av.is_empty(),
+            Self::SplitStorage(split) => split.is_empty(),
         }
     }
 
@@ -131,6 +139,7 @@ impl AccountsFile {
     ) -> Option<Ret> {
         match self {
             Self::AppendVec(av) => av.get_stored_account_without_data_callback(offset, callback),
+            Self::SplitStorage(split) => split.get_account_without_data(offset, callback),
         }
     }
 
@@ -148,6 +157,7 @@ impl AccountsFile {
     ) -> Option<Ret> {
         match self {
             Self::AppendVec(av) => av.get_stored_account_callback(offset, callback),
+            Self::SplitStorage(split) => split.get_account(offset, callback),
         }
     }
 
@@ -155,6 +165,7 @@ impl AccountsFile {
     pub(crate) fn get_account_shared_data(&self, offset: usize) -> Option<AccountSharedData> {
         match self {
             Self::AppendVec(av) => av.get_account_shared_data(offset),
+            Self::SplitStorage(split) => split.get_account_shared_data(offset),
         }
     }
 
@@ -162,6 +173,7 @@ impl AccountsFile {
     pub fn path(&self) -> &Path {
         match self {
             Self::AppendVec(av) => av.path(),
+            Self::SplitStorage(split) => split.path(),
         }
     }
 
@@ -178,6 +190,7 @@ impl AccountsFile {
     ) -> Result<()> {
         match self {
             Self::AppendVec(av) => av.scan_accounts_without_data(callback)?,
+            Self::SplitStorage(split) => split.scan_accounts_without_data(callback)?,
         }
         Ok(())
     }
@@ -197,6 +210,7 @@ impl AccountsFile {
     ) -> Result<()> {
         match self {
             Self::AppendVec(av) => av.scan_accounts(reader, callback)?,
+            Self::SplitStorage(split) => split.scan_accounts(callback)?,
         }
         Ok(())
     }
@@ -206,6 +220,7 @@ impl AccountsFile {
     pub(crate) fn calculate_stored_size(&self, data_len: usize) -> usize {
         match self {
             Self::AppendVec(_) => AppendVec::calculate_stored_size(data_len),
+            Self::SplitStorage(_) => SplitAccountsFile::calculate_stored_size(data_len),
         }
     }
 
@@ -213,6 +228,7 @@ impl AccountsFile {
     pub(crate) fn get_account_data_lens(&self, sorted_offsets: &[usize]) -> Vec<usize> {
         match self {
             Self::AppendVec(av) => av.get_account_data_lens(sorted_offsets),
+            Self::SplitStorage(split) => split.get_account_data_lens(sorted_offsets),
         }
     }
 
@@ -220,6 +236,7 @@ impl AccountsFile {
     pub fn scan_pubkeys(&self, callback: impl FnMut(&Pubkey)) -> Result<()> {
         match self {
             Self::AppendVec(av) => av.scan_pubkeys(callback)?,
+            Self::SplitStorage(split) => split.scan_pubkeys(callback)?,
         }
         Ok(())
     }
@@ -229,15 +246,19 @@ impl AccountsFile {
     /// Otherwise, returns the starting offset of each account metadata.
     /// Plus, the final return value is the offset where the next entry would be appended.
     /// So, return.len() is 1 + (number of accounts written)
-    /// After each account is appended, the internal `current_len` is updated
-    /// and will be available to other threads.
+    /// After each account is appended, the internal length is updated and available to readers.
     pub fn write_accounts<'a>(
         &self,
         accounts: &impl StorableAccounts<'a>,
     ) -> Option<StoredAccountsInfo> {
         match self {
             Self::AppendVec(av) => av.append_accounts(accounts),
+            Self::SplitStorage(split) => split.write_accounts(accounts).ok(),
         }
+    }
+
+    pub fn can_archive_raw(&self) -> bool {
+        matches!(self, Self::AppendVec(_))
     }
 
     /// Returns a file handle suitable for archive-style reads. With
@@ -249,6 +270,9 @@ impl AccountsFile {
         } else {
             Ok(match self {
                 Self::AppendVec(av) => av.open_file_for_archive(),
+                Self::SplitStorage(split) => {
+                    OpenFileForArchive::Borrowed(split.open_file_for_archive())
+                }
             })
         }
     }
@@ -257,14 +281,18 @@ impl AccountsFile {
 /// An enum that creates AccountsFile instance with the specified format.
 #[derive(Debug, Default, Copy, Clone, Eq, PartialEq)]
 pub enum AccountsFileProvider {
-    #[default]
     AppendVec,
+    #[default]
+    SplitStorage,
 }
 
 impl AccountsFileProvider {
     pub fn new_writable(&self, path: impl Into<PathBuf>, file_size: u64) -> AccountsFile {
         match self {
             Self::AppendVec => AccountsFile::AppendVec(AppendVec::new(path, file_size as usize)),
+            Self::SplitStorage => AccountsFile::SplitStorage(
+                SplitAccountsFile::new(path).expect("must create writable split accounts file"),
+            ),
         }
     }
 }

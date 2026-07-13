@@ -362,6 +362,7 @@ pub fn get_accounts_db_config(
         .unwrap_or_default();
 
     AccountsDbConfig {
+        accounts_file_provider: AccountsFileProvider::AppendVec,
         index: Some(accounts_index_config),
         account_indexes: None,
         bank_hash_details_dir: ledger_tool_ledger_path,
