@@ -5223,14 +5223,24 @@ fn test_is_shrinking_productive() {
 fn test_is_candidate_for_shrink() {
     let mut accounts = AccountsDb::new_single_for_tests();
     let (_temp_dirs, common_store_path) = get_temp_accounts_paths(1).unwrap();
+    let slot = 0;
     let store_file_size = 100_000;
     let entry = Arc::new(AccountStorageEntry::new(
         &common_store_path[0],
-        0,
+        slot,
         1,
         store_file_size,
         accounts.accounts_file_provider,
     ));
+    entry.accounts.write_accounts(&(
+        slot,
+        [(
+            Pubkey::new_unique(),
+            AccountSharedData::new(1, 100, &Pubkey::default()),
+        )]
+        .as_slice(),
+    ));
+    let written_bytes = entry.written_bytes() as usize;
     match accounts.shrink_ratio {
         AccountShrinkThreshold::TotalSpace { shrink_ratio } => {
             assert_eq!(
@@ -5245,15 +5255,15 @@ fn test_is_candidate_for_shrink() {
 
     entry
         .num_alive_bytes
-        .store(store_file_size as usize - 1, Ordering::Release);
+        .store(written_bytes - 1, Ordering::Release);
     assert!(accounts.is_candidate_for_shrink(&entry));
     entry
         .num_alive_bytes
-        .store(store_file_size as usize, Ordering::Release);
+        .store(written_bytes, Ordering::Release);
     assert!(!accounts.is_candidate_for_shrink(&entry));
 
     let shrink_ratio = 0.3;
-    let file_size_shrink_limit = (store_file_size as f64 * shrink_ratio) as usize;
+    let file_size_shrink_limit = (written_bytes as f64 * shrink_ratio) as usize;
     entry
         .num_alive_bytes
         .store(file_size_shrink_limit + 1, Ordering::Release);
