@@ -3024,6 +3024,15 @@ mod tests {
                         storage
                     })
                     .collect::<Vec<_>>();
+                for storage in &storages {
+                    append_single_account_with_default_hash(
+                        storage,
+                        &Pubkey::new_unique(),
+                        &AccountSharedData::default(),
+                        false,
+                        None,
+                    );
+                }
                 let alive_bytes_expected = storages
                     .iter()
                     .map(|storage| storage.alive_bytes() as u64)
