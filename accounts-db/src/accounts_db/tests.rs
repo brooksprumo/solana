@@ -5185,11 +5185,12 @@ fn test_remove_uncleaned_slots_and_collect_pubkeys_up_to_slot() {
 }
 
 #[test]
-fn test_shrink_productive() {
+fn test_is_shrinking_productive() {
     let accounts = AccountsDb::new_single_for_tests();
     let (_temp_dirs, path) = get_temp_accounts_paths(1).unwrap();
 
-    let file_size = 100;
+    let account_size = 100;
+    let file_size = 10_000;
     let slot = 11;
 
     let store = Arc::new(AccountStorageEntry::new(
@@ -5199,22 +5200,22 @@ fn test_shrink_productive() {
         file_size,
         accounts.accounts_file_provider,
     ));
-    store.add_account(file_size as usize);
+    store.accounts.write_accounts(&(
+        slot,
+        [(
+            Pubkey::new_unique(),
+            AccountSharedData::new(1, account_size, &Pubkey::default()),
+        )]
+        .as_slice(),
+    ));
+
+    store.add_accounts(5, store.written_bytes() as usize);
     assert!(!accounts.is_shrinking_productive(&store));
 
-    let store = Arc::new(AccountStorageEntry::new(
-        &path[0],
-        slot,
-        slot as AccountsFileId,
-        file_size,
-        accounts.accounts_file_provider,
-    ));
-    store.add_account(file_size as usize / 2);
-    store.add_account(file_size as usize / 4);
-    store.remove_accounts(file_size as usize / 4, 1);
+    store.remove_accounts(account_size, 1);
     assert!(accounts.is_shrinking_productive(&store));
 
-    store.add_account(file_size as usize / 2);
+    store.add_accounts(1, account_size);
     assert!(!accounts.is_shrinking_productive(&store));
 }
 

@@ -5250,7 +5250,7 @@ impl AccountsDb {
 
     fn is_shrinking_productive(&self, store: &AccountStorageEntry) -> bool {
         let alive_count = store.count();
-        let total_bytes = store.capacity();
+        let total_bytes = store.written_bytes();
         let alive_bytes = self.alive_bytes_after_shrink(store) as u64;
         if Self::should_not_shrink(alive_bytes, total_bytes) {
             trace!(
