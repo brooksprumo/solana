@@ -160,27 +160,16 @@ impl Bank {
             let curr_account = accounts.account(index, |account| {
                 (account.lamports() != 0).then(|| account.take_account())
             });
-            if prev_account.is_none() && curr_account.is_none() {
-                // the account was ephemeral; skip it
-                log::warn!(
-                    "brooks DEBUG: lt hash enqueue off chain() found ephemeral account: {address}",
-                );
-            } else {
-                // the account was modified; enqueue this update
-                let async_progress = Arc::clone(&self.accounts_lt_hash_async_progress);
-                async_progress
-                    .num_jobs_pending
-                    .fetch_add(1, Ordering::Relaxed);
-                async_progress.spawn(
-                    thread_pool_for_hashing_accounts,
-                    AccountsLtHashUpdate {
-                        address: *address,
-                        prev_account,
-                        curr_account,
-                    },
-                    1,
-                );
-            }
+            let async_progress = Arc::clone(&self.accounts_lt_hash_async_progress);
+            async_progress.spawn(
+                thread_pool_for_hashing_accounts,
+                AccountsLtHashUpdate {
+                    address: *address,
+                    prev_account,
+                    curr_account,
+                },
+                1,
+            );
         };
 
         if let Some(thread_pool_for_loading_accounts) = thread_pool_for_loading_accounts {
@@ -194,6 +183,10 @@ impl Bank {
         } else {
             (0..accounts.len()).for_each(load_then_spawn);
         }
+
+        self.accounts_lt_hash_async_progress
+            .num_jobs_pending
+            .fetch_add(accounts.len(), Ordering::Relaxed);
     }
 
     /// Updates the accounts lt hash.
