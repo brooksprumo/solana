@@ -49,11 +49,15 @@ impl Bank {
         let mut seen_accounts = seen_accounts_freelist.try_pop().unwrap_or_default();
         let manager = accounts_lt_hash_manager();
 
+        let mut accounts_seen_multiple_times = Vec::new();
+
         // process accounts in reverse because we must only count the latest version of each account
+        let mut num_enqueued = 0;
         for index in (0..accounts.len()).rev() {
             let address = accounts.pubkey(index);
             if !seen_accounts.insert(*address) {
                 // we've already enqueued a newer update for the same account; skip this one
+                accounts_seen_multiple_times.push(*address);
                 continue;
             }
             let prev_account = self
@@ -67,11 +71,8 @@ impl Bank {
             if prev_account.is_none() && curr_account.is_none() {
                 // the account was ephemeral; skip it
             } else {
-                // the account was modified; process this update
+                // the account was modified; enqueue this update
                 let async_progress = Arc::clone(&self.accounts_lt_hash_async_progress);
-                async_progress
-                    .num_jobs_pending
-                    .fetch_add(1, Ordering::Relaxed);
                 manager.queue.push(QueuedAccountsLtHashUpdate {
                     async_progress,
                     update: AccountsLtHashUpdate {
@@ -81,7 +82,20 @@ impl Bank {
                     },
                     num_updates: 1,
                 });
+                num_enqueued += 1;
             }
+        }
+        self.accounts_lt_hash_async_progress
+            .num_jobs_pending
+            .fetch_add(num_enqueued, Ordering::Relaxed);
+
+        if !accounts_seen_multiple_times.is_empty() {
+            accounts_seen_multiple_times.sort_unstable();
+            log::error!(
+                "brooks DEBUG: slot: {}, lt hash accounts seen multiple times ({}): {accounts_seen_multiple_times:?}",
+                self.slot(),
+                accounts_seen_multiple_times.len(),
+            );
         }
 
         // reclaim the seen accounts hashset
@@ -148,8 +162,11 @@ impl Bank {
             });
             if prev_account.is_none() && curr_account.is_none() {
                 // the account was ephemeral; skip it
+                log::warn!(
+                    "brooks DEBUG: lt hash enqueue off chain() found ephemeral account: {address}",
+                );
             } else {
-                // the account was modified; process this update
+                // the account was modified; enqueue this update
                 let async_progress = Arc::clone(&self.accounts_lt_hash_async_progress);
                 async_progress
                     .num_jobs_pending
@@ -349,7 +366,6 @@ impl AccountsLtHashManager {
     const DEDUP_INTERVAL: Duration = Duration::from_millis(2);
 
     fn new() -> Self {
-        use std::collections::hash_map::Entry;
         let queue = Arc::new(SegQueue::<QueuedAccountsLtHashUpdate>::new());
         thread::Builder::new()
             .name("solAcctsHashMgr".into())
@@ -366,23 +382,7 @@ impl AccountsLtHashManager {
                         // separate.
                         // brooks TODO: remove the deduplication hashmap from the original enqueue()?
                         while let Some(queued_update) = queue.pop() {
-                            // Deduplicates updates in queue order, retaining the oldest previous account and newest current
-                            // account for each Bank/account pair.
-                            let key = (
-                                Arc::as_ptr(&queued_update.async_progress) as usize,
-                                queued_update.update.address,
-                            );
-                            match deduplicated_updates.entry(key) {
-                                Entry::Vacant(entry) => {
-                                    entry.insert(queued_update);
-                                }
-                                Entry::Occupied(mut entry) => {
-                                    let existing = entry.get_mut();
-                                    existing.update.curr_account =
-                                        queued_update.update.curr_account;
-                                    existing.num_updates += queued_update.num_updates;
-                                }
-                            }
+                            Self::deduplicate_update(&mut deduplicated_updates, queued_update);
                         }
 
                         for (_, queued_update) in deduplicated_updates.drain() {
@@ -398,6 +398,30 @@ impl AccountsLtHashManager {
             })
             .expect("new accounts hasher manager thread");
         Self { queue }
+    }
+
+    /// Deduplicates updates in queue order, retaining the oldest previous account and newest
+    /// current account for each Bank/account pair.
+    fn deduplicate_update(
+        deduplicated_updates: &mut ahash::HashMap<(usize, Pubkey), QueuedAccountsLtHashUpdate>,
+        queued_update: QueuedAccountsLtHashUpdate,
+    ) {
+        use std::collections::hash_map::Entry;
+
+        let key = (
+            Arc::as_ptr(&queued_update.async_progress) as usize,
+            queued_update.update.address,
+        );
+        match deduplicated_updates.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert(queued_update);
+            }
+            Entry::Occupied(mut entry) => {
+                let existing = entry.get_mut();
+                existing.update.curr_account = queued_update.update.curr_account;
+                existing.num_updates += queued_update.num_updates;
+            }
+        }
     }
 }
 
@@ -604,15 +628,13 @@ mod tests {
     }
 
     fn queued_update(
-        progress: &AccountsLtHashAsyncProgress,
+        async_progress: Arc<AccountsLtHashAsyncProgress>,
         address: Pubkey,
         prev_lamports: u64,
         curr_lamports: u64,
     ) -> QueuedAccountsLtHashUpdate {
         QueuedAccountsLtHashUpdate {
-            accumulators: Arc::clone(&progress.accumulators),
-            num_jobs_pending: Arc::clone(&progress.num_jobs_pending),
-            num_jobs_total: Arc::clone(&progress.num_jobs_total),
+            async_progress,
             update: AccountsLtHashUpdate {
                 address,
                 prev_account: Some(AccountSharedData::new(prev_lamports, 0, &Pubkey::default())),
@@ -625,26 +647,26 @@ mod tests {
     #[test]
     fn test_deduplicate_updates() {
         let address = Pubkey::new_unique();
-        let progress = AccountsLtHashAsyncProgress::new();
-        let other_progress = AccountsLtHashAsyncProgress::new();
+        let progress = Arc::new(AccountsLtHashAsyncProgress::new());
+        let other_progress = Arc::new(AccountsLtHashAsyncProgress::new());
         let mut deduplicated_updates = ahash::HashMap::default();
 
-        deduplicate_update(
+        AccountsLtHashManager::deduplicate_update(
             &mut deduplicated_updates,
-            queued_update(&progress, address, 11, 12),
+            queued_update(Arc::clone(&progress), address, 11, 12),
         );
-        deduplicate_update(
+        AccountsLtHashManager::deduplicate_update(
             &mut deduplicated_updates,
-            queued_update(&progress, address, 12, 13),
+            queued_update(Arc::clone(&progress), address, 12, 13),
         );
         // The same address in another Bank must not be deduplicated with these updates.
-        deduplicate_update(
+        AccountsLtHashManager::deduplicate_update(
             &mut deduplicated_updates,
-            queued_update(&other_progress, address, 21, 22),
+            queued_update(other_progress, address, 21, 22),
         );
 
         assert_eq!(deduplicated_updates.len(), 2);
-        let key = (Arc::as_ptr(&progress.accumulators) as usize, address);
+        let key = (Arc::as_ptr(&progress) as usize, address);
         let update = deduplicated_updates.get(&key).unwrap();
         assert_eq!(update.num_updates, 2);
         assert_eq!(update.update.prev_account.as_ref().unwrap().lamports(), 11);
