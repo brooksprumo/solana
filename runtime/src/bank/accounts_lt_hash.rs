@@ -199,12 +199,16 @@ impl Bank {
     /// This function waits for any queued or in-flight jobs on the accounts hasher threads,
     /// computes their combined delta lt hash, then mixes it into the bank.
     pub fn finish_accounts_lt_hash_updates(&self) {
+        let manager = accounts_lt_hash_manager();
+
         let timer = Instant::now();
+        manager.num_banks_freezing.fetch_add(1, Ordering::Relaxed);
         let num_jobs_total = {
             let mut accounts_lt_hash = self.accounts_lt_hash.lock().unwrap();
             self.accounts_lt_hash_async_progress
                 .finish(&mut accounts_lt_hash.0)
         };
+        manager.num_banks_freezing.fetch_sub(1, Ordering::Relaxed);
         let finish_time = timer.elapsed();
 
         let seen_accounts_freelist_stats = seen_accounts_freelist().stats();
@@ -352,6 +356,7 @@ fn accounts_lt_hash_manager() -> &'static AccountsLtHashManager {
 /// Queues accounts lt hash updates for the thread that manages batching and hashing.
 struct AccountsLtHashManager {
     queue: Arc<SegQueue<QueuedAccountsLtHashUpdate>>,
+    num_banks_freezing: Arc<AtomicUsize>,
 }
 
 impl AccountsLtHashManager {
@@ -360,10 +365,12 @@ impl AccountsLtHashManager {
 
     fn new() -> Self {
         let queue = Arc::new(SegQueue::<QueuedAccountsLtHashUpdate>::new());
+        let num_banks_freezing = Arc::new(AtomicUsize::new(0));
         thread::Builder::new()
             .name("solAcctsHashMgr".into())
             .spawn({
                 let queue = Arc::clone(&queue);
+                let num_banks_freezing = Arc::clone(&num_banks_freezing);
                 move || {
                     let thread_pool = accounts_hasher_thread_pool();
                     let mut deduplicated_updates = ahash::HashMap::default();
@@ -374,10 +381,12 @@ impl AccountsLtHashManager {
                             while let Some(queued_update) = queue.pop() {
                                 Self::deduplicate_update(&mut deduplicated_updates, queued_update);
                             }
-                            let is_bank_freezing = false; // brooks TODO: also check if Bank::freeze has started. If yes, also break
-                            if is_bank_freezing
-                                || Instant::now().duration_since(start_time) > Self::DEDUP_INTERVAL
+                            if Instant::now().duration_since(start_time) > Self::DEDUP_INTERVAL
+                                || num_banks_freezing.load(Ordering::Relaxed) > 0
                             {
+                                // If we've been polling the queue for longer than the dedup
+                                // interval OR a bank is actively freezing, then break and
+                                // immediately spawn the updates we have.
                                 break;
                             }
                             // Spin, do not yield! We don't want to delay spawning updates.
@@ -397,7 +406,10 @@ impl AccountsLtHashManager {
                 }
             })
             .expect("new accounts hasher manager thread");
-        Self { queue }
+        Self {
+            queue,
+            num_banks_freezing,
+        }
     }
 
     /// Deduplicates updates in queue order, retaining the oldest previous account and newest
