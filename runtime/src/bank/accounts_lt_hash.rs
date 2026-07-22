@@ -368,16 +368,23 @@ impl AccountsLtHashManager {
                     let thread_pool = accounts_hasher_thread_pool();
                     let mut deduplicated_updates = ahash::HashMap::default();
                     loop {
-                        thread::sleep(Self::DEDUP_INTERVAL);
-
-                        // Include the accumulator identity in the key: updates for the same address
-                        // can belong to different Banks (including different forks) and must remain
-                        // separate.
-                        // brooks TODO: remove the deduplication hashmap from the original enqueue()?
-                        while let Some(queued_update) = queue.pop() {
-                            Self::deduplicate_update(&mut deduplicated_updates, queued_update);
+                        // poll the queue for up to DEDUP_INTERVAL
+                        let start_time = Instant::now();
+                        loop {
+                            while let Some(queued_update) = queue.pop() {
+                                Self::deduplicate_update(&mut deduplicated_updates, queued_update);
+                            }
+                            let is_bank_freezing = false; // brooks TODO: also check if Bank::freeze has started. If yes, also break
+                            if is_bank_freezing
+                                || Instant::now().duration_since(start_time) > Self::DEDUP_INTERVAL
+                            {
+                                break;
+                            }
+                            // Spin, do not yield! We don't want to delay spawning updates.
+                            hint::spin_loop();
                         }
 
+                        // spawn updates into thread pool for processing
                         for (_, queued_update) in deduplicated_updates.drain() {
                             let QueuedAccountsLtHashUpdate {
                                 async_progress,
@@ -401,6 +408,8 @@ impl AccountsLtHashManager {
     ) {
         use std::collections::hash_map::Entry;
 
+        // Include the accumulator identity in the key: updates for the same address can belong to
+        // different Banks (including different forks) and must remain separate.
         let key = (
             Arc::as_ptr(&queued_update.async_progress) as usize,
             queued_update.update.address,
