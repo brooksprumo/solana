@@ -350,10 +350,19 @@ fn accounts_lt_hash_manager() -> &'static AccountsLtHashManager {
     &MANAGER
 }
 
-/// Queues accounts lt hash updates for the thread that manages batching and hashing.
+/// Manages account updates.
+///
+/// Replay/etc threads push account updates into a queue owned by the manager.
+/// The manager handles deduplicating updates and spawning into the thread pool.
+/// This helps speed up the replay/etc threads since they don't need to wait
+/// for spawning into the thread pool to complete.
 struct AccountsLtHashManager {
+    /// the queue of account updates
     queue: Arc<SegQueue<QueuedAccountsLtHashUpdate>>,
+    /// thread unparker, used to wake up early and break out of the dedup loop
     unparker: Unparker,
+    /// A count used to signal when banks are waiting on updates.
+    /// When non-zero, updates are spawned immediately; the manager does not wait to dedup.
     num_banks_waiting: Arc<AtomicUsize>,
 }
 
