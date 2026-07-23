@@ -389,8 +389,7 @@ impl AccountsLtHashManager {
                                 // immediately spawn the updates we have.
                                 break;
                             }
-                            // Spin, do not yield! We don't want to delay spawning updates.
-                            hint::spin_loop();
+                            thread::yield_now();
                         }
 
                         // spawn updates into thread pool for processing
