@@ -50,9 +50,9 @@ impl Bank {
             return;
         }
 
+        let manager = accounts_lt_hash_manager();
         let seen_accounts_freelist = seen_accounts_freelist();
         let mut seen_accounts = seen_accounts_freelist.try_pop().unwrap_or_default();
-        let manager = accounts_lt_hash_manager();
 
         let mut accounts_seen_multiple_times = Vec::new();
 
@@ -80,12 +80,12 @@ impl Bank {
                 let async_progress = Arc::clone(&self.accounts_lt_hash_async_progress);
                 manager.queue.push(QueuedAccountsLtHashUpdate {
                     async_progress,
-                    update: AccountsLtHashUpdate {
+                    num_updates: 1,
+                    inner: AccountsLtHashUpdate {
                         address: *address,
                         prev_account,
                         curr_account,
                     },
-                    num_updates: 1,
                 });
                 num_enqueued += 1;
             }
@@ -344,7 +344,9 @@ impl AccountsLtHashAsyncProgress {
     }
 }
 
-/// Returns the global accounts lt hash manager, creating its queue and thread on first use.
+/// Returns the global accounts lt hash manager.
+///
+/// Note, the manager instance will be created on first call.
 fn accounts_lt_hash_manager() -> &'static AccountsLtHashManager {
     static MANAGER: LazyLock<AccountsLtHashManager> = LazyLock::new(AccountsLtHashManager::new);
     &MANAGER
@@ -409,10 +411,10 @@ impl AccountsLtHashManager {
                         for (_, queued_update) in deduplicated_updates.drain() {
                             let QueuedAccountsLtHashUpdate {
                                 async_progress,
-                                update,
                                 num_updates,
+                                inner: account_update,
                             } = queued_update;
-                            async_progress.spawn(thread_pool, update, num_updates);
+                            async_progress.spawn(thread_pool, account_update, num_updates);
                         }
                     }
                 }
@@ -440,7 +442,7 @@ impl AccountsLtHashManager {
         // Since updates for the same address can apply to different banks/forks.
         let key = (
             Arc::as_ptr(&queued_update.async_progress) as usize,
-            queued_update.update.address,
+            queued_update.inner.address,
         );
         match deduplicated_updates.entry(key) {
             Entry::Vacant(entry) => {
@@ -448,11 +450,22 @@ impl AccountsLtHashManager {
             }
             Entry::Occupied(mut entry) => {
                 let value = entry.get_mut();
-                value.update.curr_account = queued_update.update.curr_account;
                 value.num_updates += queued_update.num_updates;
+                value.inner.curr_account = queued_update.inner.curr_account;
             }
         }
     }
+}
+
+/// An account update, queued to the manager.
+struct QueuedAccountsLtHashUpdate {
+    /// The async progress instance this account update should apply to.
+    async_progress: Arc<AccountsLtHashAsyncProgress>,
+    /// The number of total updates this instance represents.
+    /// When updates are deduplicated, this count is incremented.
+    num_updates: usize,
+    // The actual account update.
+    inner: AccountsLtHashUpdate,
 }
 
 /// A single accounts lt hash update to process.
@@ -461,14 +474,6 @@ struct AccountsLtHashUpdate {
     address: Pubkey,
     prev_account: Option<AccountSharedData>,
     curr_account: Option<AccountSharedData>,
-}
-
-/// An accounts lt hash update together with the Bank-specific progress it contributes to.
-struct QueuedAccountsLtHashUpdate {
-    async_progress: Arc<AccountsLtHashAsyncProgress>,
-    update: AccountsLtHashUpdate,
-    /// Number of original queue entries represented by this update.
-    num_updates: usize,
 }
 
 /// Get the freelist of hashsets to use for seen accounts.
@@ -1146,12 +1151,12 @@ mod tests {
             &mut deduplicated_updates,
             QueuedAccountsLtHashUpdate {
                 async_progress: Arc::clone(&async_progress1),
-                update: AccountsLtHashUpdate {
+                num_updates: 1,
+                inner: AccountsLtHashUpdate {
                     address,
                     prev_account: Some(AccountSharedData::new(11, 0, &Pubkey::default())),
                     curr_account: Some(AccountSharedData::new(12, 0, &Pubkey::default())),
                 },
-                num_updates: 1,
             },
         );
         // An update for the same account; should be deduplicated.
@@ -1159,12 +1164,12 @@ mod tests {
             &mut deduplicated_updates,
             QueuedAccountsLtHashUpdate {
                 async_progress: Arc::clone(&async_progress1),
-                update: AccountsLtHashUpdate {
+                num_updates: 1,
+                inner: AccountsLtHashUpdate {
                     address,
                     prev_account: Some(AccountSharedData::new(12, 0, &Pubkey::default())),
                     curr_account: Some(AccountSharedData::new(13, 0, &Pubkey::default())),
                 },
-                num_updates: 1,
             },
         );
         // An update for the same account, but in a different slot/bank;
@@ -1173,12 +1178,12 @@ mod tests {
             &mut deduplicated_updates,
             QueuedAccountsLtHashUpdate {
                 async_progress: Arc::clone(&async_progress2),
-                update: AccountsLtHashUpdate {
+                num_updates: 1,
+                inner: AccountsLtHashUpdate {
                     address,
                     prev_account: Some(AccountSharedData::new(21, 0, &Pubkey::default())),
                     curr_account: Some(AccountSharedData::new(22, 0, &Pubkey::default())),
                 },
-                num_updates: 1,
             },
         );
 
@@ -1186,8 +1191,8 @@ mod tests {
         let key = (Arc::as_ptr(&async_progress1) as usize, address);
         let update = deduplicated_updates.get(&key).unwrap();
         assert_eq!(update.num_updates, 2);
-        assert_eq!(update.update.prev_account.as_ref().unwrap().lamports(), 11);
-        assert_eq!(update.update.curr_account.as_ref().unwrap().lamports(), 13);
+        assert_eq!(update.inner.prev_account.as_ref().unwrap().lamports(), 11);
+        assert_eq!(update.inner.curr_account.as_ref().unwrap().lamports(), 13);
     }
 
     /// Ensure freelist respects max size.
