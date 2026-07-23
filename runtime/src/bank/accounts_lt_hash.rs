@@ -94,15 +94,6 @@ impl Bank {
             .num_jobs_pending
             .fetch_add(num_enqueued, Ordering::Relaxed);
 
-        if !accounts_seen_multiple_times.is_empty() {
-            accounts_seen_multiple_times.sort_unstable();
-            log::error!(
-                "brooks DEBUG: slot: {}, lt hash accounts seen multiple times ({}): {accounts_seen_multiple_times:?}",
-                self.slot(),
-                accounts_seen_multiple_times.len(),
-            );
-        }
-
         // reclaim the seen accounts hashset
         seen_accounts_freelist.try_push(seen_accounts);
     }
