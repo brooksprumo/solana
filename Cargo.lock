@@ -10330,6 +10330,7 @@ dependencies = [
  "bytemuck",
  "criterion",
  "crossbeam-channel",
+ "crossbeam-queue",
  "crossbeam-utils",
  "dashmap",
  "imbl",
