@@ -54,15 +54,12 @@ impl Bank {
         let mut seen_accounts = seen_accounts_freelist.try_pop().unwrap_or_default();
         let manager = accounts_lt_hash_manager();
 
-        let mut accounts_seen_multiple_times = Vec::new();
-
         // process accounts in reverse because we must only count the latest version of each account
         let mut num_enqueued = 0;
         for index in (0..accounts.len()).rev() {
             let address = accounts.pubkey(index);
             if !seen_accounts.insert(*address) {
                 // we've already enqueued a newer update for the same account; skip this one
-                accounts_seen_multiple_times.push(*address);
                 continue;
             }
             let prev_account = self
@@ -93,15 +90,6 @@ impl Bank {
         self.accounts_lt_hash_async_progress
             .num_jobs_pending
             .fetch_add(num_enqueued, Ordering::Relaxed);
-
-        if !accounts_seen_multiple_times.is_empty() {
-            accounts_seen_multiple_times.sort_unstable();
-            log::error!(
-                "brooks DEBUG: slot: {}, lt hash accounts seen multiple times ({}): {accounts_seen_multiple_times:?}",
-                self.slot(),
-                accounts_seen_multiple_times.len(),
-            );
-        }
 
         // reclaim the seen accounts hashset
         seen_accounts_freelist.try_push(seen_accounts);
