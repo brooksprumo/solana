@@ -657,52 +657,6 @@ mod tests {
         All,
     }
 
-    fn queued_update(
-        async_progress: Arc<AccountsLtHashAsyncProgress>,
-        address: Pubkey,
-        prev_lamports: u64,
-        curr_lamports: u64,
-    ) -> QueuedAccountsLtHashUpdate {
-        QueuedAccountsLtHashUpdate {
-            async_progress,
-            update: AccountsLtHashUpdate {
-                address,
-                prev_account: Some(AccountSharedData::new(prev_lamports, 0, &Pubkey::default())),
-                curr_account: Some(AccountSharedData::new(curr_lamports, 0, &Pubkey::default())),
-            },
-            num_updates: 1,
-        }
-    }
-
-    #[test]
-    fn test_deduplicate_updates() {
-        let address = Pubkey::new_unique();
-        let progress = Arc::new(AccountsLtHashAsyncProgress::new());
-        let other_progress = Arc::new(AccountsLtHashAsyncProgress::new());
-        let mut deduplicated_updates = ahash::HashMap::default();
-
-        AccountsLtHashManager::deduplicate_update(
-            &mut deduplicated_updates,
-            queued_update(Arc::clone(&progress), address, 11, 12),
-        );
-        AccountsLtHashManager::deduplicate_update(
-            &mut deduplicated_updates,
-            queued_update(Arc::clone(&progress), address, 12, 13),
-        );
-        // The same address in another Bank must not be deduplicated with these updates.
-        AccountsLtHashManager::deduplicate_update(
-            &mut deduplicated_updates,
-            queued_update(other_progress, address, 21, 22),
-        );
-
-        assert_eq!(deduplicated_updates.len(), 2);
-        let key = (Arc::as_ptr(&progress) as usize, address);
-        let update = deduplicated_updates.get(&key).unwrap();
-        assert_eq!(update.num_updates, 2);
-        assert_eq!(update.update.prev_account.as_ref().unwrap().lamports(), 11);
-        assert_eq!(update.update.curr_account.as_ref().unwrap().lamports(), 13);
-    }
-
     /// Creates a genesis config with `features` enabled
     fn genesis_config_with(features: Features) -> (GenesisConfig, Keypair) {
         let mint_keypair = Keypair::new();
@@ -1179,6 +1133,61 @@ mod tests {
         accounts.shuffle(&mut rand::rng());
 
         bank.store_accounts((bank.slot(), accounts.as_slice()), None);
+    }
+
+    #[test]
+    fn test_deduplicate_account_updates() {
+        let address = Pubkey::new_unique();
+        let async_progress1 = Arc::new(AccountsLtHashAsyncProgress::new());
+        let async_progress2 = Arc::new(AccountsLtHashAsyncProgress::new());
+        let mut deduplicated_updates = ahash::HashMap::default();
+
+        AccountsLtHashManager::deduplicate_update(
+            &mut deduplicated_updates,
+            QueuedAccountsLtHashUpdate {
+                async_progress: Arc::clone(&async_progress1),
+                update: AccountsLtHashUpdate {
+                    address,
+                    prev_account: Some(AccountSharedData::new(11, 0, &Pubkey::default())),
+                    curr_account: Some(AccountSharedData::new(12, 0, &Pubkey::default())),
+                },
+                num_updates: 1,
+            },
+        );
+        // An update for the same account; should be deduplicated.
+        AccountsLtHashManager::deduplicate_update(
+            &mut deduplicated_updates,
+            QueuedAccountsLtHashUpdate {
+                async_progress: Arc::clone(&async_progress1),
+                update: AccountsLtHashUpdate {
+                    address,
+                    prev_account: Some(AccountSharedData::new(12, 0, &Pubkey::default())),
+                    curr_account: Some(AccountSharedData::new(13, 0, &Pubkey::default())),
+                },
+                num_updates: 1,
+            },
+        );
+        // An update for the same account, but in a different slot/bank;
+        // should *NOT* be deduplicated.
+        AccountsLtHashManager::deduplicate_update(
+            &mut deduplicated_updates,
+            QueuedAccountsLtHashUpdate {
+                async_progress: Arc::clone(&async_progress2),
+                update: AccountsLtHashUpdate {
+                    address,
+                    prev_account: Some(AccountSharedData::new(21, 0, &Pubkey::default())),
+                    curr_account: Some(AccountSharedData::new(22, 0, &Pubkey::default())),
+                },
+                num_updates: 1,
+            },
+        );
+
+        assert_eq!(deduplicated_updates.len(), 2);
+        let key = (Arc::as_ptr(&async_progress1) as usize, address);
+        let update = deduplicated_updates.get(&key).unwrap();
+        assert_eq!(update.num_updates, 2);
+        assert_eq!(update.update.prev_account.as_ref().unwrap().lamports(), 11);
+        assert_eq!(update.update.curr_account.as_ref().unwrap().lamports(), 13);
     }
 
     /// Ensure freelist respects max size.
