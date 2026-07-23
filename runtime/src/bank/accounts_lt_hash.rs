@@ -1,7 +1,10 @@
 use {
     super::Bank,
     crossbeam_queue::SegQueue,
-    crossbeam_utils::CachePadded,
+    crossbeam_utils::{
+        CachePadded,
+        sync::{Parker, Unparker},
+    },
     rayon::{
         ThreadPool, ThreadPoolBuilder,
         iter::{IntoParallelIterator, ParallelIterator},
@@ -11,7 +14,9 @@ use {
     solana_lattice_hash::lt_hash::LtHash,
     solana_pubkey::Pubkey,
     std::{
-        array, hint,
+        array,
+        collections::hash_map::Entry,
+        hint,
         mem::size_of,
         sync::{
             Arc, LazyLock, Mutex,
@@ -202,13 +207,14 @@ impl Bank {
         let manager = accounts_lt_hash_manager();
 
         let timer = Instant::now();
-        manager.num_banks_freezing.fetch_add(1, Ordering::Relaxed);
+        manager.num_banks_waiting.fetch_add(1, Ordering::Relaxed);
+        manager.unparker.unpark();
         let num_jobs_total = {
             let mut accounts_lt_hash = self.accounts_lt_hash.lock().unwrap();
             self.accounts_lt_hash_async_progress
                 .finish(&mut accounts_lt_hash.0)
         };
-        manager.num_banks_freezing.fetch_sub(1, Ordering::Relaxed);
+        manager.num_banks_waiting.fetch_sub(1, Ordering::Relaxed);
         let finish_time = timer.elapsed();
 
         let seen_accounts_freelist_stats = seen_accounts_freelist().stats();
@@ -356,7 +362,8 @@ fn accounts_lt_hash_manager() -> &'static AccountsLtHashManager {
 /// Queues accounts lt hash updates for the thread that manages batching and hashing.
 struct AccountsLtHashManager {
     queue: Arc<SegQueue<QueuedAccountsLtHashUpdate>>,
-    num_banks_freezing: Arc<AtomicUsize>,
+    unparker: Unparker,
+    num_banks_waiting: Arc<AtomicUsize>,
 }
 
 impl AccountsLtHashManager {
@@ -365,12 +372,14 @@ impl AccountsLtHashManager {
 
     fn new() -> Self {
         let queue = Arc::new(SegQueue::<QueuedAccountsLtHashUpdate>::new());
-        let num_banks_freezing = Arc::new(AtomicUsize::new(0));
+        let num_banks_waiting = Arc::new(AtomicUsize::new(0));
+        let parker = Parker::new();
+        let unparker = parker.unparker().clone();
         thread::Builder::new()
             .name("solAcctsHashMgr".into())
             .spawn({
                 let queue = Arc::clone(&queue);
-                let num_banks_freezing = Arc::clone(&num_banks_freezing);
+                let num_banks_waiting = Arc::clone(&num_banks_waiting);
                 move || {
                     let thread_pool = accounts_hasher_thread_pool();
                     let mut deduplicated_updates = ahash::HashMap::default();
@@ -381,15 +390,19 @@ impl AccountsLtHashManager {
                             while let Some(queued_update) = queue.pop() {
                                 Self::deduplicate_update(&mut deduplicated_updates, queued_update);
                             }
-                            if Instant::now().duration_since(start_time) > Self::DEDUP_INTERVAL
-                                || num_banks_freezing.load(Ordering::Relaxed) > 0
+
+                            let remaining_time =
+                                Self::DEDUP_INTERVAL.saturating_sub(start_time.elapsed());
+                            if remaining_time == Duration::ZERO
+                                || num_banks_waiting.load(Ordering::Relaxed) > 0
                             {
                                 // If we've been polling the queue for longer than the dedup
-                                // interval OR a bank is actively freezing, then break and
-                                // immediately spawn the updates we have.
+                                // interval OR a bank is actively waiting (i.e. freezing),
+                                // then break and immediately spawn the updates we have.
                                 break;
                             }
-                            thread::sleep(Duration::from_micros(7));
+
+                            parker.park_timeout(remaining_time);
                         }
 
                         // spawn updates into thread pool for processing
@@ -407,20 +420,24 @@ impl AccountsLtHashManager {
             .expect("new accounts hasher manager thread");
         Self {
             queue,
-            num_banks_freezing,
+            unparker,
+            num_banks_waiting,
         }
     }
 
-    /// Deduplicates updates in queue order, retaining the oldest previous account and newest
-    /// current account for each Bank/account pair.
+    /// Deduplicates account updates.
+    ///
+    /// Given an account update, `queued_updated`, check `deduplicated_updates`
+    /// if this account already has a pending update.
+    /// If yes, deduplicate the update by merging the two: retain the existing
+    /// update's 'previous' version, and use `queued_update`'s 'current' version.
+    /// If no, insert `queued_update` into `deduplicated_updates`.
     fn deduplicate_update(
         deduplicated_updates: &mut ahash::HashMap<(usize, Pubkey), QueuedAccountsLtHashUpdate>,
         queued_update: QueuedAccountsLtHashUpdate,
     ) {
-        use std::collections::hash_map::Entry;
-
-        // Include the accumulator identity in the key: updates for the same address can belong to
-        // different Banks (including different forks) and must remain separate.
+        // Include the AsyncProgress instance in the hashmap key as a proxy for the Bank.
+        // Since updates for the same address can apply to different banks/forks.
         let key = (
             Arc::as_ptr(&queued_update.async_progress) as usize,
             queued_update.update.address,
@@ -430,9 +447,9 @@ impl AccountsLtHashManager {
                 entry.insert(queued_update);
             }
             Entry::Occupied(mut entry) => {
-                let existing = entry.get_mut();
-                existing.update.curr_account = queued_update.update.curr_account;
-                existing.num_updates += queued_update.num_updates;
+                let value = entry.get_mut();
+                value.update.curr_account = queued_update.update.curr_account;
+                value.num_updates += queued_update.num_updates;
             }
         }
     }
