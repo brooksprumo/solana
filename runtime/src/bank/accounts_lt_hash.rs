@@ -389,7 +389,7 @@ impl AccountsLtHashManager {
                                 // immediately spawn the updates we have.
                                 break;
                             }
-                            thread::yield_now();
+                            thread::sleep(Duration::from_micros(7));
                         }
 
                         // spawn updates into thread pool for processing
