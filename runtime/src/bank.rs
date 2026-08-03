@@ -6671,6 +6671,12 @@ impl Bank {
         let genesis_cert = self.get_alpenglow_genesis_certificate()?;
         Some(genesis_cert.block.slot)
     }
+
+    // brooks TODO: doc
+    pub fn set_accounts_lt_hash_async_progress_is_at_end(&self) {
+        self.accounts_lt_hash_async_progress
+            .signal_that_bank_is_waiting();
+    }
 }
 
 impl InvokeContextCallback for Bank {

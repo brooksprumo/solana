@@ -20,7 +20,7 @@ use {
         mem::size_of,
         sync::{
             Arc, LazyLock, Mutex,
-            atomic::{AtomicU64, AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         },
         thread,
         time::{Duration, Instant},
@@ -195,8 +195,8 @@ impl Bank {
         let manager = accounts_lt_hash_manager();
 
         let timer = Instant::now();
-        manager.num_banks_waiting.fetch_add(1, Ordering::Relaxed);
-        manager.unparker.unpark();
+        self.accounts_lt_hash_async_progress
+            .signal_that_bank_is_waiting();
         let num_jobs_total = {
             let mut accounts_lt_hash = self.accounts_lt_hash.lock().unwrap();
             self.accounts_lt_hash_async_progress
@@ -261,6 +261,8 @@ pub struct AccountsLtHashAsyncProgress {
     accumulators: [Mutex<CachePadded<LtHash>>; NUM_ACCOUNTS_HASHER_THREADS],
     num_jobs_pending: AtomicUsize,
     num_jobs_total: AtomicU64,
+    // brooks TODO: doc
+    is_at_end: AtomicBool,
 }
 
 impl AccountsLtHashAsyncProgress {
@@ -270,6 +272,7 @@ impl AccountsLtHashAsyncProgress {
             accumulators: array::from_fn(|_| Mutex::new(CachePadded::new(LtHash::identity()))),
             num_jobs_pending: AtomicUsize::new(0),
             num_jobs_total: AtomicU64::new(0),
+            is_at_end: AtomicBool::new(false),
         }
     }
 
@@ -337,6 +340,15 @@ impl AccountsLtHashAsyncProgress {
         if let Some(curr_account) = curr_account {
             let curr_lt_hash = AccountsDb::lt_hash_account(&curr_account, &address);
             accum_lt_hash.mix_in(&curr_lt_hash.0);
+        }
+    }
+
+    // brooks TODO: doc
+    pub fn signal_that_bank_is_waiting(&self) {
+        if !self.is_at_end.swap(true, Ordering::Relaxed) {
+            let manager = accounts_lt_hash_manager();
+            manager.num_banks_waiting.fetch_add(1, Ordering::Relaxed);
+            manager.unparker.unpark();
         }
     }
 }
