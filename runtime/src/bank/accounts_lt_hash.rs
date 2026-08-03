@@ -366,7 +366,7 @@ struct AccountsLtHashManager {
 }
 
 impl AccountsLtHashManager {
-    /// How often the accounts lt hash manager drains and deduplicates queued updates.
+    /// How long to deduplicate queued updates before sending them for processing.
     const DEDUP_INTERVAL: Duration = Duration::from_millis(2);
 
     fn new() -> Self {
