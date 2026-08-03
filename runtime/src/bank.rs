@@ -6673,9 +6673,15 @@ impl Bank {
     }
 
     // brooks TODO: doc
+    /// Signals that all shreds for this bank's slot have been received.
     pub fn set_accounts_lt_hash_async_progress_is_at_end(&self) {
-        self.accounts_lt_hash_async_progress
-            .signal_that_bank_is_waiting();
+        self.accounts_lt_hash_async_progress.set_bank_is_waiting();
+    }
+
+    // brooks TODO: doc
+    /// Clears the end-of-slot signal when this bank freezes or is discarded.
+    pub fn clear_accounts_lt_hash_async_progress_is_at_end(&self) {
+        self.accounts_lt_hash_async_progress.clear_bank_is_waiting();
     }
 }
 
@@ -7177,6 +7183,7 @@ fn calculate_data_size_delta(old_data_size: usize, new_data_size: usize) -> i64 
 
 impl Drop for Bank {
     fn drop(&mut self) {
+        self.clear_accounts_lt_hash_async_progress_is_at_end();
         if let Some(drop_callback) = self.drop_callback.read().unwrap().0.as_ref() {
             drop_callback.callback(self);
         } else {

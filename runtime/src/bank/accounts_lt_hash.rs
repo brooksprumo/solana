@@ -192,17 +192,14 @@ impl Bank {
     /// This function waits for any queued or in-flight jobs on the accounts hasher threads,
     /// computes their combined delta lt hash, then mixes it into the bank.
     pub fn finish_accounts_lt_hash_updates(&self) {
-        let manager = accounts_lt_hash_manager();
-
         let timer = Instant::now();
-        self.accounts_lt_hash_async_progress
-            .signal_that_bank_is_waiting();
+        self.accounts_lt_hash_async_progress.set_bank_is_waiting();
         let num_jobs_total = {
             let mut accounts_lt_hash = self.accounts_lt_hash.lock().unwrap();
             self.accounts_lt_hash_async_progress
                 .finish(&mut accounts_lt_hash.0)
         };
-        manager.num_banks_waiting.fetch_sub(1, Ordering::Relaxed);
+        self.accounts_lt_hash_async_progress.clear_bank_is_waiting();
         let finish_time = timer.elapsed();
 
         let seen_accounts_freelist_stats = seen_accounts_freelist().stats();
@@ -224,6 +221,13 @@ impl Bank {
             (
                 "seen_accounts_freelist_capacity_bytes",
                 seen_accounts_freelist_stats.capacity_bytes,
+                i64
+            ),
+            (
+                "num_banks_waiting",
+                accounts_lt_hash_manager()
+                    .num_banks_waiting
+                    .load(Ordering::Relaxed),
                 i64
             ),
         );
@@ -344,11 +348,24 @@ impl AccountsLtHashAsyncProgress {
     }
 
     // brooks TODO: doc
-    pub fn signal_that_bank_is_waiting(&self) {
+    /// Signals the manager that this bank has reached the end of its slot and will need all of its
+    /// queued updates immediately. This operation is idempotent for each bank.
+    pub fn set_bank_is_waiting(&self) {
         if !self.is_at_end.swap(true, Ordering::Relaxed) {
             let manager = accounts_lt_hash_manager();
             manager.num_banks_waiting.fetch_add(1, Ordering::Relaxed);
             manager.unparker.unpark();
+        }
+    }
+
+    // brooks TODO: doc
+    /// Clears this bank's signal to the manager, either after freezing or when the bank is
+    /// discarded without being frozen. This operation is idempotent for each bank.
+    pub fn clear_bank_is_waiting(&self) {
+        if self.is_at_end.swap(false, Ordering::Relaxed) {
+            accounts_lt_hash_manager()
+                .num_banks_waiting
+                .fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
