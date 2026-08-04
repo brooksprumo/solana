@@ -6672,16 +6672,18 @@ impl Bank {
         Some(genesis_cert.block.slot)
     }
 
-    // brooks TODO: doc
-    /// Signals that all shreds for this bank's slot have been received.
+    /// Signals to the accounts lt hash manager that this bank has reached the end
+    /// of its slot and needs all of its account updates as soon as possible.
     pub fn set_accounts_lt_hash_async_progress_is_at_end(&self) {
-        self.accounts_lt_hash_async_progress.set_bank_is_waiting();
+        self.accounts_lt_hash_async_progress.set_is_at_end_of_slot();
     }
 
-    // brooks TODO: doc
-    /// Clears the end-of-slot signal when this bank freezes or is discarded.
+    /// Clears the bank-is-at-end-of-slot from `set_accounts_lt_hash_async_progress_is_at_end()`.
+    ///
+    /// To be called when a bank is EOL. Either during Bank::freeze(), or being discarded.
     pub fn clear_accounts_lt_hash_async_progress_is_at_end(&self) {
-        self.accounts_lt_hash_async_progress.clear_bank_is_waiting();
+        self.accounts_lt_hash_async_progress
+            .clear_is_at_end_of_slot();
     }
 }
 

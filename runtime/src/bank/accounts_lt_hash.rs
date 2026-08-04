@@ -193,13 +193,14 @@ impl Bank {
     /// computes their combined delta lt hash, then mixes it into the bank.
     pub fn finish_accounts_lt_hash_updates(&self) {
         let timer = Instant::now();
-        self.accounts_lt_hash_async_progress.set_bank_is_waiting();
+        self.accounts_lt_hash_async_progress.set_is_at_end_of_slot();
         let num_jobs_total = {
             let mut accounts_lt_hash = self.accounts_lt_hash.lock().unwrap();
             self.accounts_lt_hash_async_progress
                 .finish(&mut accounts_lt_hash.0)
         };
-        self.accounts_lt_hash_async_progress.clear_bank_is_waiting();
+        self.accounts_lt_hash_async_progress
+            .clear_is_at_end_of_slot();
         let finish_time = timer.elapsed();
 
         let seen_accounts_freelist_stats = seen_accounts_freelist().stats();
@@ -265,8 +266,10 @@ pub struct AccountsLtHashAsyncProgress {
     accumulators: [Mutex<CachePadded<LtHash>>; NUM_ACCOUNTS_HASHER_THREADS],
     num_jobs_pending: AtomicUsize,
     num_jobs_total: AtomicU64,
-    // brooks TODO: doc
-    is_at_end: AtomicBool,
+    /// Flag to indicate if the bank has reached the end of the slot.
+    /// When true, this causes the manager to send account updates to
+    /// the thread pool as quickly as possible.
+    is_at_end_of_slot: AtomicBool,
 }
 
 impl AccountsLtHashAsyncProgress {
@@ -276,7 +279,7 @@ impl AccountsLtHashAsyncProgress {
             accumulators: array::from_fn(|_| Mutex::new(CachePadded::new(LtHash::identity()))),
             num_jobs_pending: AtomicUsize::new(0),
             num_jobs_total: AtomicU64::new(0),
-            is_at_end: AtomicBool::new(false),
+            is_at_end_of_slot: AtomicBool::new(false),
         }
     }
 
@@ -347,22 +350,21 @@ impl AccountsLtHashAsyncProgress {
         }
     }
 
-    // brooks TODO: doc
-    /// Signals the manager that this bank has reached the end of its slot and will need all of its
-    /// queued updates immediately. This operation is idempotent for each bank.
-    pub fn set_bank_is_waiting(&self) {
-        if !self.is_at_end.swap(true, Ordering::Relaxed) {
+    /// Signals to the accounts lt hash manager that this bank has reached the end
+    /// of its slot and needs all of its account updates as soon as possible.
+    pub fn set_is_at_end_of_slot(&self) {
+        if !self.is_at_end_of_slot.swap(true, Ordering::Relaxed) {
             let manager = accounts_lt_hash_manager();
             manager.num_banks_waiting.fetch_add(1, Ordering::Relaxed);
             manager.unparker.unpark();
         }
     }
 
-    // brooks TODO: doc
-    /// Clears this bank's signal to the manager, either after freezing or when the bank is
-    /// discarded without being frozen. This operation is idempotent for each bank.
-    pub fn clear_bank_is_waiting(&self) {
-        if self.is_at_end.swap(false, Ordering::Relaxed) {
+    /// Clears the bank-is-at-end-of-slot signal from `set_is_at_end_of_slot()`.
+    ///
+    /// To be called when a bank is EOL. Either during Bank::freeze(), or being discarded.
+    pub fn clear_is_at_end_of_slot(&self) {
+        if self.is_at_end_of_slot.swap(false, Ordering::Relaxed) {
             accounts_lt_hash_manager()
                 .num_banks_waiting
                 .fetch_sub(1, Ordering::Relaxed);
@@ -419,18 +421,22 @@ impl AccountsLtHashManager {
                                 Self::deduplicate_update(&mut deduplicated_updates, queued_update);
                             }
 
-                            let remaining_time =
-                                Self::DEDUP_INTERVAL.saturating_sub(start_time.elapsed());
-                            if remaining_time == Duration::ZERO
-                                || num_banks_waiting.load(Ordering::Relaxed) > 0
-                            {
-                                // If we've been polling the queue for longer than the dedup
-                                // interval OR a bank is actively waiting (i.e. freezing),
-                                // then break and immediately spawn the updates we have.
+                            if num_banks_waiting.load(Ordering::Relaxed) > 0 {
+                                // If there are banks actively waiting (i.e. freezing),
+                                // then break immediately and spawn the updates we have.
+                                // Do the num_bank_waiting check first, so that if it is non-zero
+                                // we can skip doing an unnecessary Instant::now().
                                 break;
+                            } else {
+                                // Else, check if we've been polling the queue for longer than the
+                                // dedup interval, and either break the loop or park the thread.
+                                let remaining_time =
+                                    Self::DEDUP_INTERVAL.saturating_sub(start_time.elapsed());
+                                if remaining_time == Duration::ZERO {
+                                    break;
+                                }
+                                parker.park_timeout(remaining_time);
                             }
-
-                            parker.park_timeout(remaining_time);
                         }
 
                         // spawn updates into thread pool for processing
