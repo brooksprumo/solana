@@ -268,12 +268,13 @@ pub struct AccountsLtHashAsyncProgress {
     num_jobs_total: AtomicU64,
     /// Flag to indicate if the bank has reached the end of the slot.
     /// When true, this causes the manager to send account updates to
-    /// the thread pool as quickly as possible.
+    /// the thread pool for processing as quickly as possible.
+    /// See AccountsLtHashManager::num_banks_waiting for more info.
     is_at_end_of_slot: AtomicBool,
 }
 
 impl AccountsLtHashAsyncProgress {
-    /// Creates a new AccountsLtHashAsyncProgress variable, which is suitable for a new Bank.
+    /// Creates a new AccountsLtHashAsyncProgress instance that is suitable for a new Bank.
     pub fn new() -> Self {
         Self {
             accumulators: array::from_fn(|_| Mutex::new(CachePadded::new(LtHash::identity()))),
