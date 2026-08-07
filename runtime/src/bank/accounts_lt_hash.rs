@@ -105,6 +105,11 @@ impl Bank {
                 .fetch_sub(num_skipped, Ordering::Relaxed);
         }
 
+        // Wake up the manager in case updates were enqueued and banks are waiting.
+        if num_enqueued > 0 && manager.num_banks_waiting.load(Ordering::Relaxed) > 0 {
+            manager.unparker.unpark();
+        }
+
         // reclaim the seen accounts hashset
         seen_accounts_freelist.try_push(seen_accounts);
     }
@@ -416,6 +421,8 @@ struct AccountsLtHashManager {
 impl AccountsLtHashManager {
     /// How long to deduplicate queued updates before sending them for processing.
     const DEDUP_INTERVAL: Duration = Duration::from_millis(2);
+    /// How long to park in case banks are waiting but no updates need processing.
+    const BANKS_WAITING_INTERVAL: Duration = Duration::from_micros(9);
 
     fn new() -> Self {
         let queue = Arc::new(SegQueue::<QueuedAccountsLtHashUpdate>::new());
@@ -439,11 +446,17 @@ impl AccountsLtHashManager {
                             }
 
                             if num_banks_waiting.load(Ordering::Relaxed) > 0 {
-                                // If there are banks actively waiting (i.e. freezing),
-                                // then break immediately and spawn the updates we have.
-                                // Do the num_bank_waiting check first, so that if it is non-zero
-                                // we can skip doing an unnecessary Instant::now().
-                                break;
+                                // If there are banks actively waiting (i.e. freezing), and updates
+                                // to process, then break immediately and spawn the updates we have.
+                                // If there are no updates, park the thread briefly.
+                                //
+                                // Do not check the remaining time until the `else` branch below.
+                                // This lets us skip doing an unnecessary Instant::now().
+                                if !deduplicated_updates.is_empty() {
+                                    break;
+                                } else {
+                                    parker.park_timeout(Self::BANKS_WAITING_INTERVAL);
+                                }
                             } else {
                                 // Else, check if we've been polling the queue for longer than the
                                 // dedup interval, and either break the loop or park the thread.
