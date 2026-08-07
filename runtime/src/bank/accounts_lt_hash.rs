@@ -421,6 +421,9 @@ struct AccountsLtHashManager {
 impl AccountsLtHashManager {
     /// How long to deduplicate queued updates before sending them for processing.
     const DEDUP_INTERVAL: Duration = Duration::from_millis(2);
+    /// The maximum number of updates to pop off the queue before
+    /// we stop to check how long we have be deduplicating for.
+    const MAX_UPDATES_TO_POP: usize = 10_000;
 
     fn new() -> Self {
         let queue = Arc::new(SegQueue::<QueuedAccountsLtHashUpdate>::new());
@@ -439,27 +442,43 @@ impl AccountsLtHashManager {
                         // poll the queue for up to DEDUP_INTERVAL
                         let start_time = Instant::now();
                         loop {
-                            while let Some(queued_update) = queue.pop() {
+                            // Pop updates off the queue and deduplicate them.
+                            // Break out of the loop if the queue is empty,
+                            // or if we've already popped MAX_UPDATES_TO_POP.
+                            // This ensures we don't loop infinitely, popping off
+                            // the queue and never processing the updates.
+                            let mut queue_was_empty = false;
+                            for _ in 0..Self::MAX_UPDATES_TO_POP {
+                                let Some(queued_update) = queue.pop() else {
+                                    queue_was_empty = true;
+                                    break;
+                                };
                                 Self::deduplicate_update(&mut deduplicated_updates, queued_update);
                             }
 
+                            // If there are banks actively waiting (i.e. freezing), and updates
+                            // to process, then break immediately and spawn the updates we have.
+                            //
+                            // Do not check the remaining time until after this `if` block.
+                            // It lets us skip doing an unnecessary Instant::now().
                             if !deduplicated_updates.is_empty()
                                 && num_banks_waiting.load(Ordering::Relaxed) > 0
                             {
-                                // If there are banks actively waiting (i.e. freezing), and updates
-                                // to process, then break immediately and spawn the updates we have.
-                                //
-                                // Do not check the remaining time until the `else` branch below.
-                                // This lets us skip doing an unnecessary Instant::now().
                                 break;
-                            } else {
-                                // Else, check if we've been polling the queue for longer than the
-                                // dedup interval, and either break the loop or park the thread.
-                                let remaining_time =
-                                    Self::DEDUP_INTERVAL.saturating_sub(start_time.elapsed());
-                                if remaining_time == Duration::ZERO {
-                                    break;
-                                }
+                            }
+
+                            // Now, check if we've been polling the queue for longer than the
+                            // dedup interval, and either break the loop or park the thread.
+                            let remaining_time =
+                                Self::DEDUP_INTERVAL.saturating_sub(start_time.elapsed());
+                            if remaining_time == Duration::ZERO {
+                                break;
+                            }
+
+                            // If the queue was empty, park the thread to wait for more.
+                            // Because if the queue was _not_ empty, loop around to pop
+                            // and deduplicate more updates.
+                            if queue_was_empty {
                                 parker.park_timeout(remaining_time);
                             }
                         }
