@@ -54,12 +54,20 @@ impl Bank {
         let seen_accounts_freelist = seen_accounts_freelist();
         let mut seen_accounts = seen_accounts_freelist.try_pop().unwrap_or_default();
 
+        // The number of pending jobs ensures a bank during freeze()
+        // waits for all the account updates to complete.
+        self.accounts_lt_hash_async_progress
+            .num_jobs_pending
+            .fetch_add(accounts.len(), Ordering::Relaxed);
+
         // process accounts in reverse because we must only count the latest version of each account
         let mut num_enqueued = 0;
+        let mut num_skipped = 0;
         for index in (0..accounts.len()).rev() {
             let address = accounts.pubkey(index);
             if !seen_accounts.insert(*address) {
                 // we've already enqueued a newer update for the same account; skip this one
+                num_skipped += 1;
                 continue;
             }
             let prev_account = self
@@ -72,6 +80,7 @@ impl Bank {
             });
             if prev_account.is_none() && curr_account.is_none() {
                 // the account was ephemeral; skip it
+                num_skipped += 1;
             } else {
                 // the account was modified; enqueue this update
                 let async_progress = Arc::clone(&self.accounts_lt_hash_async_progress);
@@ -87,9 +96,14 @@ impl Bank {
                 num_enqueued += 1;
             }
         }
-        self.accounts_lt_hash_async_progress
-            .num_jobs_pending
-            .fetch_add(num_enqueued, Ordering::Relaxed);
+        debug_assert_eq!(num_enqueued + num_skipped, accounts.len());
+
+        // If any accounts were skipped, then we need to correct the number of pending jobs.
+        if num_skipped > 0 {
+            self.accounts_lt_hash_async_progress
+                .num_jobs_pending
+                .fetch_sub(num_skipped, Ordering::Relaxed);
+        }
 
         // reclaim the seen accounts hashset
         seen_accounts_freelist.try_push(seen_accounts);
@@ -165,6 +179,12 @@ impl Bank {
             );
         };
 
+        // The number of pending jobs ensures a bank during freeze()
+        // waits for all the account updates to complete.
+        self.accounts_lt_hash_async_progress
+            .num_jobs_pending
+            .fetch_add(accounts.len(), Ordering::Relaxed);
+
         if let Some(thread_pool_for_loading_accounts) = thread_pool_for_loading_accounts {
             // The previous version of accounts must be loaded before subsequent account
             // modifications occur, so ThreadPool::spawn() canot be used here.
@@ -176,10 +196,6 @@ impl Bank {
         } else {
             (0..accounts.len()).for_each(load_then_spawn);
         }
-
-        self.accounts_lt_hash_async_progress
-            .num_jobs_pending
-            .fetch_add(accounts.len(), Ordering::Relaxed);
     }
 
     /// Updates the accounts lt hash.
