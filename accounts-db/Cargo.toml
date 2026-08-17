@@ -41,6 +41,7 @@ frozen-abi = [
 ]
 
 [dependencies]
+agave-address-hasher = { workspace = true }
 agave-fs = { workspace = true }
 ahash = { workspace = true }
 blake3 = { workspace = true }

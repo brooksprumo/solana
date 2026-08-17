@@ -6982,6 +6982,7 @@ dependencies = [
 name = "solana-accounts-db"
 version = "4.4.0-alpha.0"
 dependencies = [
+ "agave-address-hasher",
  "agave-fs",
  "agave-logger",
  "agave-reserved-account-keys",

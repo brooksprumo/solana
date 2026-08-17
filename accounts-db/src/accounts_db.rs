@@ -63,6 +63,7 @@ use {
         u64_align,
         utils::{self, create_account_shared_data},
     },
+    agave_address_hasher::AddressHasherBuilder,
     agave_fs::buffered_reader::RequiredLenBufFileRead,
     ahash::HashMapExt,
     bv::BitVec,
@@ -80,7 +81,7 @@ use {
     },
     solana_measure::{measure::Measure, measure_us},
     solana_nohash_hasher::{BuildNoHashHasher, IntMap, IntSet},
-    solana_pubkey::{Pubkey, PubkeyHasherBuilder},
+    solana_pubkey::Pubkey,
     solana_rayon_threadlimit::get_thread_count,
     std::{
         borrow::Cow,
@@ -830,7 +831,7 @@ pub fn get_temp_accounts_paths(count: u32) -> io::Result<(Vec<TempDir>, Vec<Path
 }
 
 /// One accounts index bin's worth of pubkeys that are candidates for cleaning
-type CleaningCandidatesBin = HashSet<Pubkey, PubkeyHasherBuilder>;
+type CleaningCandidatesBin = HashSet<Pubkey, AddressHasherBuilder>;
 /// This is the return type of AccountsDb::construct_candidate_clean_keys.
 /// It's a collection of pubkeys that are candidates for cleaning
 type CleaningCandidates = Box<[RwLock<CleaningCandidatesBin>]>;
@@ -2729,8 +2730,10 @@ impl AccountsDb {
         // pubkey. Hold the Arc<CachedAccount> to keep the data alive even if the cache flushes
         // between now and step 3 (Arc clone is just a refcount bump).
         let cached_pubkeys = self.accounts_cache.cached_pubkeys();
-        let mut cached_versions =
-            HashMap::with_capacity_and_hasher(cached_pubkeys.len(), PubkeyHasherBuilder::default());
+        let mut cached_versions = HashMap::with_capacity_and_hasher(
+            cached_pubkeys.len(),
+            AddressHasherBuilder::default(),
+        );
         for pubkey in cached_pubkeys {
             if config.is_aborted() {
                 break;
@@ -3865,7 +3868,7 @@ impl AccountsDb {
             .and_then(|&root| self.accounts_cache.slot_cache(root))
             .map_or(0, |slot_cache| slot_cache.len() * 2);
         let mut written_accounts =
-            HashSet::with_capacity_and_hasher(dedup_capacity, PubkeyHasherBuilder::default());
+            HashSet::with_capacity_and_hasher(dedup_capacity, AddressHasherBuilder::default());
 
         // Iterate from newest root to oldest root being flushed in this batch
         for &root in flushed_roots.iter().rev() {
@@ -4867,7 +4870,8 @@ impl AccountsDb {
         ancestors: &Ancestors,
     ) -> (BitVec, WriteAccountsToCacheStats) {
         let len = accounts_and_meta_to_store.len();
-        let mut pubkey_set = HashSet::with_capacity_and_hasher(len, PubkeyHasherBuilder::default());
+        let mut pubkey_set =
+            HashSet::with_capacity_and_hasher(len, AddressHasherBuilder::default());
         let mut stats = WriteAccountsToCacheStats {
             num_initial_accounts_to_store: len as u64,
             ..Default::default()
@@ -5800,7 +5804,7 @@ enum PubkeysToStore {
     All,
     /// Store only these pubkeys (the newest version of each, per `select_pubkeys_to_store`),
     /// purging the rest from the index and reclaiming older versions.
-    Only(HashSet<Pubkey, PubkeyHasherBuilder>),
+    Only(HashSet<Pubkey, AddressHasherBuilder>),
 }
 
 /// Specify whether obsolete accounts should be marked or not during reclaims
