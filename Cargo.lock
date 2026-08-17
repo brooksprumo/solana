@@ -61,6 +61,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "agave-address-hasher"
+version = "4.4.0-alpha.0"
+dependencies = [
+ "rand 0.9.4",
+ "solana-pubkey 4.3.0",
+]
+
+[[package]]
 name = "agave-banking-stage-ingress-types"
 version = "4.4.0-alpha.0"
 dependencies = [

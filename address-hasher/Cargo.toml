@@ -1,0 +1,32 @@
+[package]
+name = "agave-address-hasher"
+description = "Hasher for a solana address"
+documentation = "https://docs.rs/agave-address-hasher"
+version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+all-features = true
+rustdoc-args = ["--cfg=docsrs"]
+
+[lib]
+crate-type = ["lib"]
+name = "agave_address_hasher"
+
+[features]
+agave-unstable-api = []
+
+[dependencies]
+rand = { workspace = true }
+
+[dev-dependencies]
+solana-pubkey = { workspace = true, features = ["rand"] }
+
+[lints]
+workspace = true
