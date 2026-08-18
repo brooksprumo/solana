@@ -4,7 +4,7 @@ use {
         account_storage::stored_account_info::StoredAccountInfo,
         accounts_db::{
             AccountsAddRootTiming, AccountsDb, LoadHint, LoadedAccount, PopulateReadCache,
-            ScanAccountStorageData, ScanStorageResult, UpdateIndexThreadSelection,
+            ScanAccountStorageData, ScanStorageResult,
         },
         accounts_index::IndexKey,
         accounts_scan::{ScanConfig, ScanError, ScanResult},
@@ -503,13 +503,7 @@ impl Accounts {
         transactions: Option<&'a [&'a SanitizedTransaction]>,
         ancestors: &Ancestors,
     ) {
-        self._store_accounts(
-            accounts,
-            bank_id,
-            transactions,
-            UpdateIndexThreadSelection::Inline,
-            ancestors,
-        );
+        self._store_accounts(accounts, bank_id, transactions, ancestors);
     }
 
     /// Store `accounts` into the DB
@@ -523,13 +517,7 @@ impl Accounts {
         transactions: Option<&'a [&'a SanitizedTransaction]>,
         ancestors: &Ancestors,
     ) {
-        self._store_accounts(
-            accounts,
-            bank_id,
-            transactions,
-            UpdateIndexThreadSelection::PoolWithThreshold,
-            ancestors,
-        );
+        self._store_accounts(accounts, bank_id, transactions, ancestors);
     }
 
     /// Store `accounts` into the DB
@@ -542,7 +530,6 @@ impl Accounts {
         accounts: impl StorableAccounts<'a>,
         bank_id: BankId,
         transactions: Option<&'a [&'a SanitizedTransaction]>,
-        update_index_thread_selection: UpdateIndexThreadSelection,
         ancestors: &Ancestors,
     ) {
         let accounts_db = &self.accounts_db;
@@ -568,7 +555,7 @@ impl Accounts {
             }
         }
 
-        accounts_db.store_accounts_unfrozen(accounts, update_index_thread_selection, ancestors);
+        accounts_db.store_accounts_unfrozen(accounts, ancestors);
     }
 
     /// Add a slot to root.  Root slots cannot be purged
