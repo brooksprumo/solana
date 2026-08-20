@@ -4,6 +4,7 @@ use {
         account_storage::stored_account_info::{StoredAccountInfo, StoredAccountInfoWithoutData},
         accounts_db::AccountsFileId,
         append_vec::{AppendVec, AppendVecError},
+        split_file::{self, SplitFile, SplitFileError},
         storable_accounts::StorableAccounts,
     },
     agave_fs::{FileInfo, buffered_reader::RequiredLenBufFileRead, file_io::open_for_reading},
@@ -41,6 +42,9 @@ pub enum AccountsFileError {
 
     #[error("AppendVecError: {0}")]
     AppendVecError(#[from] AppendVecError),
+
+    #[error("SplitFileError: {0}")]
+    SplitFileError(#[from] SplitFileError),
 }
 
 #[derive(Debug)]
@@ -48,6 +52,7 @@ pub enum AccountsFileError {
 /// under different formats.
 pub enum AccountsFile {
     AppendVec(AppendVec),
+    Split(SplitFile),
 }
 
 impl AccountsFile {
@@ -65,6 +70,7 @@ impl AccountsFile {
     pub(crate) fn reopen_as_readonly(&self) -> Result<Option<Self>> {
         Ok(match self {
             Self::AppendVec(av) => av.reopen_as_readonly_file_io()?.map(Self::AppendVec),
+            Self::Split(split) => split.reopen_as_readonly()?.map(Self::Split),
         })
     }
 
@@ -73,6 +79,7 @@ impl AccountsFile {
     pub fn disable_remove_on_drop(&self) {
         match self {
             Self::AppendVec(av) => av.disable_remove_on_drop(),
+            Self::Split(split) => split.disable_remove_on_drop(),
         }
     }
 
@@ -80,20 +87,25 @@ impl AccountsFile {
     pub fn flush(&self) -> Result<()> {
         match self {
             Self::AppendVec(av) => av.flush()?,
+            Self::Split(split) => split.flush()?,
         }
         Ok(())
     }
 
-    /// Returns the number of bytes, *not accounts*, used in the AccountsFile
+    /// Returns logical bytes, using AppendVec-equivalent sizes for split storage.
+    // brooks TODO: doc
     pub fn len(&self) -> usize {
         match self {
             Self::AppendVec(av) => av.len(),
+            Self::Split(split) => split.logical_len(),
         }
     }
 
+    // brooks TODO: remove?
     pub fn is_empty(&self) -> bool {
         match self {
             Self::AppendVec(av) => av.is_empty(),
+            Self::Split(split) => split.is_empty(),
         }
     }
 
@@ -108,6 +120,7 @@ impl AccountsFile {
     ///
     /// This fn does *not* load the account's data, just the data length.  If the data is needed,
     /// use `get_stored_account_callback()` instead.  However, prefer this fn when possible.
+    // brooks TODO: return a Result<Option<Ret>>
     pub fn get_stored_account_without_data_callback<Ret>(
         &self,
         offset: Offset,
@@ -115,6 +128,9 @@ impl AccountsFile {
     ) -> Option<Ret> {
         match self {
             Self::AppendVec(av) => av.get_stored_account_without_data_callback(offset, callback),
+            Self::Split(split) => split
+                .get_account_without_data(split_file::LogicalOffset(offset), callback)
+                .ok(),
         }
     }
 
@@ -125,6 +141,7 @@ impl AccountsFile {
     ///
     /// This fn *does* load the account's data.  If the data is not needed,
     /// use `get_stored_account_without_data_callback()` instead.
+    // brooks TODO: return a Result<Option<Ret>>
     pub fn get_stored_account_callback<Ret>(
         &self,
         offset: Offset,
@@ -132,13 +149,20 @@ impl AccountsFile {
     ) -> Option<Ret> {
         match self {
             Self::AppendVec(av) => av.get_stored_account_callback(offset, callback),
+            Self::Split(split) => split
+                .get_account_with_data(split_file::LogicalOffset(offset), callback)
+                .ok(),
         }
     }
 
     /// return an `AccountSharedData` for an account at `offset`, if any.  Otherwise return None.
+    // brooks TODO: return a Result<Option<Ret>>
     pub(crate) fn get_account_shared_data(&self, offset: Offset) -> Option<AccountSharedData> {
         match self {
             Self::AppendVec(av) => av.get_account_shared_data(offset),
+            Self::Split(split) => split
+                .get_account_shared_data(split_file::LogicalOffset(offset))
+                .ok(),
         }
     }
 
@@ -146,6 +170,7 @@ impl AccountsFile {
     pub fn path(&self) -> &Path {
         match self {
             Self::AppendVec(av) => av.path(),
+            Self::Split(split) => split.meta_path(),
         }
     }
 
@@ -158,10 +183,13 @@ impl AccountsFile {
     /// Note that account data is not read/passed to the callback.
     pub fn scan_accounts_without_data(
         &self,
-        callback: impl for<'local> FnMut(Offset, StoredAccountInfoWithoutData<'local>),
+        mut callback: impl for<'local> FnMut(Offset, StoredAccountInfoWithoutData<'local>),
     ) -> Result<()> {
         match self {
             Self::AppendVec(av) => av.scan_accounts_without_data(callback)?,
+            Self::Split(split) => {
+                split.scan_accounts_without_data(|offset, account| callback(offset.0, account))?
+            }
         }
         Ok(())
     }
@@ -177,10 +205,12 @@ impl AccountsFile {
     pub(crate) fn scan_accounts<'a>(
         &'a self,
         reader: &mut impl RequiredLenBufFileRead<'a>,
-        callback: impl for<'local> FnMut(Offset, StoredAccountInfo<'local>),
+        mut callback: impl for<'local> FnMut(Offset, StoredAccountInfo<'local>),
     ) -> Result<()> {
         match self {
             Self::AppendVec(av) => av.scan_accounts(reader, callback)?,
+            Self::Split(split) => split
+                .scan_accounts_with_data(reader, |offset, account| callback(offset.0, account))?,
         }
         Ok(())
     }
@@ -189,10 +219,12 @@ impl AccountsFile {
     pub(crate) fn scan_accounts_with<'a>(
         &'a self,
         reader: &mut impl RequiredLenBufFileRead<'a>,
-        callback: impl for<'local> FnMut(Offset, StoredAccountInfo<'local>),
+        mut callback: impl for<'local> FnMut(Offset, StoredAccountInfo<'local>),
     ) -> Result<()> {
         match self {
             Self::AppendVec(av) => av.scan_accounts_with(reader, callback)?,
+            Self::Split(split) => split
+                .scan_accounts_with_data(reader, |offset, account| callback(offset.0, account))?,
         }
         Ok(())
     }
@@ -200,9 +232,7 @@ impl AccountsFile {
     /// Calculate the amount of storage required for an account with the passed
     /// in data_len
     pub(crate) fn calculate_stored_size(&self, data_len: usize) -> usize {
-        match self {
-            Self::AppendVec(_) => AppendVec::calculate_stored_size(data_len),
-        }
+        AppendVec::calculate_stored_size(data_len)
     }
 
     /// Returns the account data size for each account in `offsets`.
@@ -212,13 +242,22 @@ impl AccountsFile {
     ) -> Vec<usize> {
         match self {
             Self::AppendVec(av) => av.get_account_data_lens(offsets),
+            Self::Split(split) => {
+                let offsets = offsets.into_iter().map(split_file::LogicalOffset);
+                split
+                    .get_account_data_lens(offsets)
+                    .expect("split account offsets must be valid")
+            }
         }
     }
 
     /// iterate over all pubkeys
-    pub fn scan_pubkeys(&self, callback: impl FnMut(&Pubkey)) -> Result<()> {
+    pub fn scan_pubkeys(&self, mut callback: impl FnMut(&Pubkey)) -> Result<()> {
         match self {
             Self::AppendVec(av) => av.scan_pubkeys(callback)?,
+            Self::Split(split) => {
+                split.scan_accounts_without_data(|_offset, account| callback(account.pubkey))?
+            }
         }
         Ok(())
     }
@@ -230,12 +269,22 @@ impl AccountsFile {
     /// So, return.len() is 1 + (number of accounts written)
     /// After each account is appended, the internal `current_len` is updated
     /// and will be available to other threads.
+    // brooks TODO: return Result
     pub fn write_accounts<'a>(
         &self,
         accounts: &impl StorableAccounts<'a>,
     ) -> Option<StoredAccountsInfo> {
         match self {
             Self::AppendVec(av) => av.append_accounts(accounts),
+            Self::Split(split) => {
+                let (offsets, size) = split
+                    .write_accounts(accounts)
+                    .expect("must write split storage");
+                Some(StoredAccountsInfo {
+                    offsets: offsets.into_iter().map(|offset| offset.0).collect(),
+                    size: size as usize,
+                })
+            }
         }
     }
 
@@ -248,6 +297,7 @@ impl AccountsFile {
         } else {
             Ok(match self {
                 Self::AppendVec(av) => av.open_file_for_archive(),
+                Self::Split(split) => OpenFileForArchive::Borrowed(split.open_file_for_archive()),
             })
         }
     }
@@ -261,7 +311,10 @@ impl AccountsFile {
         &self,
         excluded_accounts: impl IntoIterator<Item = usize>,
     ) -> usize {
-        let total_size = u64_align!(self.len());
+        let total_size = match self {
+            Self::AppendVec(av) => u64_align!(av.len()),
+            Self::Split(split) => split.logical_len(),
+        };
         let excluded_size: usize = excluded_accounts
             .into_iter()
             .map(AppendVec::calculate_stored_size)
@@ -275,12 +328,17 @@ impl AccountsFile {
 pub enum AccountsFileProvider {
     #[default]
     AppendVec,
+    Split,
 }
 
 impl AccountsFileProvider {
+    // brooks TODO: return Result
     pub fn new_writable(&self, path: impl Into<PathBuf>, file_size: u64) -> AccountsFile {
         match self {
             Self::AppendVec => AccountsFile::AppendVec(AppendVec::new(path, file_size as usize)),
+            Self::Split => AccountsFile::Split(
+                SplitFile::new(path.into()).expect("must create writable split file"),
+            ),
         }
     }
 }

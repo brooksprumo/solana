@@ -6,10 +6,11 @@ mod error;
 mod meta;
 mod utils;
 
+pub(crate) use common::LogicalOffset;
 pub use error::Error as SplitFileError;
 use {
     self::{
-        common::{DataLen, DataRef, ExternalDataOffset, FileOffset, LoadedData, LogicalOffset},
+        common::{DataLen, DataRef, ExternalDataOffset, FileOffset, LoadedData},
         data::{
             DATA_ENTRY_FIXED_SIZE, DATA_HEADER_SIZE, calculate_data_entry_stored_size,
             create_data_file, parse_data_entry, read_data_entry, read_data_header,
@@ -80,6 +81,7 @@ pub fn new_scan_accounts_reader<'a>() -> impl RequiredLenBufFileRead<'a> {
 pub struct SplitFile {
     meta_path: PathBuf,
     data_path: PathBuf,
+    logical_len: AtomicU64,
 
     /// Flags if the file is dirty or not.
     /// Since fastboot requires that all storages are flushed to disk, be smart about it.
@@ -148,6 +150,7 @@ impl SplitFile {
         Ok(Self {
             meta_path,
             data_path,
+            logical_len: AtomicU64::new(0),
             is_dirty: AtomicBool::new(false),
             remove_on_drop: AtomicBool::new(true),
             inner: InnerState::Writable(WritableState {
@@ -197,18 +200,26 @@ impl SplitFile {
             SPLIT_FILE_STATS.num_empty.fetch_add(1, Ordering::Relaxed);
         }
 
-        Ok(Self {
+        let new = Self {
             meta_path,
             data_path,
+            logical_len: AtomicU64::new(0),
             is_dirty: AtomicBool::new(false),
-            remove_on_drop: AtomicBool::new(true),
+            remove_on_drop: AtomicBool::new(false),
             inner: InnerState::ReadOnly(ReadOnlyState {
                 meta_file,
                 meta_len,
                 data_file,
                 data_len,
             }),
-        })
+        };
+        let mut logical_len = 0;
+        new.scan_accounts_without_data(|_, account| {
+            logical_len += calculate_logical_stored_size(account.data_len);
+        })?;
+        new.logical_len.store(logical_len, Ordering::Relaxed);
+        new.remove_on_drop.store(true, Ordering::Relaxed);
+        Ok(new)
     }
 
     /// Instantiates a new SplitFile in ready-only mode, or `None` if it already is such.
@@ -245,6 +256,24 @@ impl SplitFile {
         Ok(Some(new))
     }
 
+    /// Returns the path to the metadata file.
+    pub(crate) fn meta_path(&self) -> &Path {
+        &self.meta_path
+    }
+
+    // brooks TODO: I think this is wrong... I think we need the data file
+    pub(crate) fn open_file_for_archive(&self) -> &File {
+        match &self.inner {
+            InnerState::ReadOnly(inner) => &inner.meta_file,
+            InnerState::Writable(inner) => &inner.meta_file,
+        }
+    }
+
+    /// Returns AppendVec-equivalent bytes, matching the size returned by write_accounts().
+    pub(crate) fn logical_len(&self) -> usize {
+        self.logical_len.load(Ordering::Relaxed) as usize
+    }
+
     /// Returns size, in bytes, of meta file.
     pub fn meta_len(&self) -> FileSize {
         match &self.inner {
@@ -261,11 +290,13 @@ impl SplitFile {
         }
     }
 
+    // brooks TODO: remove?
     /// Returns total size, in bytes, of both meta and data files.
     pub fn len(&self) -> usize {
         (self.meta_len() + self.data_len()) as usize
     }
 
+    // brooks TODO: remove?
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -375,6 +406,8 @@ impl SplitFile {
 
         inner.meta_len.store(meta_file_offset.0, Ordering::Relaxed);
         inner.data_len.store(data_file_offset.0, Ordering::Relaxed);
+        self.logical_len
+            .fetch_add(logical_stored_size, Ordering::Relaxed);
         let was_dirty = self.is_dirty.swap(true, Ordering::Relaxed);
         if !was_dirty {
             SPLIT_FILE_STATS.num_dirty.fetch_add(1, Ordering::Relaxed);

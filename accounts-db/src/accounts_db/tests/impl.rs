@@ -1,18 +1,17 @@
 use {
     super::*,
     crate::{
-        accounts_file::AccountsFileProvider,
+        accounts_file::{AccountsFile, AccountsFileProvider},
         accounts_index::{
             ACCOUNTS_INDEX_CONFIG_FOR_TESTING, AccountIndex, AccountSecondaryIndexesIncludeExclude,
             AccountsIndexConfig, IndexLimit, IndexLimitThreshold, test_utils::*,
         },
-        append_vec::{AppendVec, STORE_META_OVERHEAD},
     },
     itertools::Itertools as _,
     rand::{prelude::SliceRandom as _, rng},
     solana_account::{
         Account, AccountSharedData, DUMMY_INHERITABLE_ACCOUNT_FIELDS, InheritableAccountFields,
-        WritableAccount as _,
+        WritableAccount as _, accounts_equal,
     },
     solana_clock::Slot,
     solana_lattice_hash::lt_hash::Checksum as LtHashChecksum,
@@ -32,45 +31,6 @@ use {
 };
 
 const DEFAULT_FILE_SIZE: u64 = 4 * 1024 * 1024;
-
-const NO_LOAD_FILTER: Option<fn(u64, &Pubkey, usize) -> bool> = None;
-
-impl AccountsDb {
-    fn get_storage_for_slot(&self, slot: Slot) -> Option<Arc<AccountStorageEntry>> {
-        self.storage.get_slot_storage_entry(slot)
-    }
-
-    fn get_and_assert_single_storage(&self, slot: Slot) -> Arc<AccountStorageEntry> {
-        self.storage.get_slot_storage_entry(slot).unwrap()
-    }
-
-    fn get_account_at_slot(&self, pubkey: &Pubkey, slot: Slot) -> Option<AccountSharedData> {
-        // Check the cache for the pubkey first
-        if let Some(cached) = self.accounts_cache.load(slot, pubkey) {
-            return Some(cached.account.clone());
-        }
-
-        // Add the slot to ancestors so unrooted slots will be selected
-        let mut ancestors = Ancestors::default();
-        ancestors.insert(slot);
-
-        self.accounts_index.get_with_and_then(
-            pubkey,
-            &ancestors,
-            false,
-            |(slot_found, account_info)| {
-                // If a slot was found, ensure it was the requested slot
-                assert_eq!(slot_found, slot);
-                let storage_location = account_info.storage_location();
-                let mut accessor = self.get_account_accessor(slot, &storage_location);
-
-                accessor
-                    .check_and_get_loaded_account_shared_data(NO_LOAD_FILTER)
-                    .unwrap()
-            },
-        )
-    }
-}
 
 fn linear_ancestors(end_slot: u64) -> Ancestors {
     let mut ancestors = Ancestors::from(vec![0]);
@@ -139,6 +99,44 @@ fn create_store_for_shrink_tests(
 }
 
 #[test]
+fn test_accountsdb_split_flush_loads_inline_and_external_accounts() {
+    if DEFAULT_ACCOUNTS_DB_CONFIG.accounts_file_provider != AccountsFileProvider::Split {
+        return;
+    }
+    let db = AccountsDb::new_for_tests_with_config(Vec::new(), DEFAULT_ACCOUNTS_DB_CONFIG);
+    let slot = 0;
+    let inline_key = Pubkey::new_unique();
+    let external_key = Pubkey::new_unique();
+    let owner = Pubkey::new_unique();
+    let inline_account = AccountSharedData::new(11, 32, &owner);
+    let external_account = AccountSharedData::new(22, 8 * 1024, &owner);
+
+    db.store_for_tests((
+        slot,
+        [
+            (&inline_key, &inline_account),
+            (&external_key, &external_account),
+        ]
+        .as_slice(),
+    ));
+    db.add_root_and_flush_write_cache(slot);
+
+    let storage = db.get_storage_for_slot(slot).unwrap();
+    assert!(matches!(&storage.accounts, AccountsFile::Split(_)));
+
+    let ancestors = Ancestors::from(vec![slot]);
+    let (loaded_inline, loaded_inline_slot) =
+        db.do_load_for_tests(&ancestors, &inline_key).unwrap();
+    assert_eq!(loaded_inline_slot, slot);
+    assert!(accounts_equal(&loaded_inline, &inline_account));
+
+    let (loaded_external, loaded_external_slot) =
+        db.do_load_for_tests(&ancestors, &external_key).unwrap();
+    assert_eq!(loaded_external_slot, slot);
+    assert!(accounts_equal(&loaded_external, &external_account));
+}
+
+#[test]
 #[should_panic(expected = "Accounts may only be stored once per slot:")]
 fn test_generate_index_duplicates_within_slot() {
     let db = AccountsDb::new_for_tests_with_config(Vec::new(), DEFAULT_ACCOUNTS_DB_CONFIG);
@@ -187,7 +185,7 @@ fn test_generate_index_for_single_ref_zero_lamport_slot() {
     assert_eq!(db.accounts_index.slot_list_len(&pubkey), 1);
     assert_eq!(
         append_vec.alive_bytes(),
-        AppendVec::calculate_stored_size(0),
+        append_vec.accounts.calculate_stored_size(0),
     );
     assert_eq!(append_vec.accounts_count(), 1);
     assert_eq!(append_vec.count(), 1);
@@ -1422,6 +1420,10 @@ fn test_clean_converts_zero_lamport_single_ref_account_to_tombstone_after_shrink
 
     // ensure ids are different, to indicate shrink ran
     assert_ne!(new_storage1.id(), storage1.id());
+    assert_eq!(
+        matches!(&new_storage1.accounts, AccountsFile::Split(_)),
+        DEFAULT_ACCOUNTS_DB_CONFIG.accounts_file_provider == AccountsFileProvider::Split,
+    );
     // ensure there are exactly three accounts in the storage now, removing the obsolete one
     assert_eq!(new_storage1.count(), 3);
 
@@ -1688,7 +1690,9 @@ fn test_alive_bytes_after_shrink_with_zero_lamport_single_ref_accounts() {
     assert!(expected_alive_bytes_after_shrink < alive_bytes_before_shrink);
     assert_eq!(
         expected_alive_bytes_after_shrink,
-        AppendVec::calculate_stored_size(alive_account.data().len()),
+        storage
+            .accounts
+            .calculate_stored_size(alive_account.data().len()),
     );
 
     accounts_db.shrink_slot_forced(slot);
@@ -2732,7 +2736,7 @@ fn test_shrink_candidate_slots_with_dead_ancient_account() {
     // accounts plus the length of their metadata.
     assert_eq!(
         created_accounts.written_bytes as usize,
-        AppendVec::calculate_stored_size(1000) + AppendVec::calculate_stored_size(2000),
+        storage.accounts.calculate_stored_size(1000) + storage.accounts.calculate_stored_size(2000),
     );
     // The above check works only when the AppendVec storage is
     // used. More generally the pubkey of the smallest account
@@ -3103,7 +3107,7 @@ fn test_store_overhead() {
     accounts.add_root_and_flush_write_cache(0);
     let store = accounts.storage.get_slot_storage_entry(0).unwrap();
     let total_len = store.accounts.len();
-    assert_eq!(total_len, STORE_META_OVERHEAD);
+    assert_eq!(total_len, store.accounts.calculate_stored_size(0));
 }
 
 #[test]
@@ -5416,6 +5420,8 @@ fn test_calculate_storage_count_and_alive_bytes_obsolete_account(
     let slot0 = 0;
     let storage = accounts.create_store(slot0, 10_000);
     let offsets = storage.accounts.write_accounts(&(slot0, &account_list[..]));
+    let storage = Arc::new(storage);
+    accounts.storage.insert(Arc::clone(&storage));
 
     let offsets = offsets.unwrap().offsets;
     let data_lens = storage
@@ -6103,7 +6109,8 @@ fn test_shrink_collect_simple() {
                                 expected_tombstones
                             );
 
-                            let alive_total_one_account = AppendVec::calculate_stored_size(space);
+                            let alive_total_one_account =
+                                storage.accounts.calculate_stored_size(space);
                             assert_eq!(
                                 shrink_collect.alive_total_bytes,
                                 expected_alive_accounts.len() * alive_total_one_account
@@ -6111,14 +6118,18 @@ fn test_shrink_collect_simple() {
                             // tombstones (zero-lamport accounts) always store 0 bytes of data
                             assert_eq!(
                                 shrink_collect.tombstones_total_bytes,
-                                expected_tombstones.len() * AppendVec::calculate_stored_size(0)
+                                expected_tombstones.len()
+                                    * storage.accounts.calculate_stored_size(0)
                             );
-                            // expected_written_bytes is determined by what size append vec gets created when the write cache is flushed to an append vec.
-                            let mut expected_written_bytes =
-                                (account_count * AppendVec::calculate_stored_size(space)) as u64;
+                            // expected_written_bytes is determined by the storage format used when the
+                            // write cache is flushed.
+                            let stored_size = storage.accounts.calculate_stored_size(space);
+                            let mut expected_written_bytes = (account_count * stored_size) as u64;
                             if append_opposite_zero_lamport_account && space != 0 {
                                 // zero lamport accounts always write space = 0
-                                expected_written_bytes -= space as u64;
+                                expected_written_bytes -= (stored_size
+                                    - storage.accounts.calculate_stored_size(0))
+                                    as u64;
                             }
 
                             assert_eq!(shrink_collect.written_bytes, expected_written_bytes);

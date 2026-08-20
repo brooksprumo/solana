@@ -232,6 +232,7 @@ mod tests {
     };
 
     #[test_case(AccountsFileProvider::AppendVec)]
+    #[test_case(AccountsFileProvider::Split)]
     fn test_account_storage_reader_no_obsolete_accounts(provider: AccountsFileProvider) {
         let slot = 0;
         let temp_dir = TempDir::new().unwrap();
@@ -615,10 +616,11 @@ mod tests {
     /// * excluded accounts
     /// * exceeding the file reader's stack buffer
     #[test_matrix(
+        [AccountsFileProvider::AppendVec, AccountsFileProvider::Split],
         [false, true],
         [0, 1, 2, 3, 4, 5, 6, 7])
     ]
-    fn test_write_to(exclude_last_account: bool, data_len_last_account: usize) {
+    fn test_write_to(provider: AccountsFileProvider, exclude_last_account: bool, data_len_last_account: usize) {
         let slot = 11;
         let temp_dir = TempDir::new().unwrap();
         let storage = AccountStorageEntry::new(
@@ -626,7 +628,7 @@ mod tests {
             slot,
             11,
             1_000_000,
-            AccountsFileProvider::AppendVec,
+            provider,
         );
         let accounts: Vec<_> = [3, 256 * 1024 + 1, data_len_last_account]
             .into_iter()
