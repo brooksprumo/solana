@@ -7,6 +7,7 @@ use {
         accounts_db::{AccountShrinkThreshold, AccountsDbConfig},
         accounts_file::AccountsFileProvider,
         accounts_index::{
+            AccountIndex, AccountSecondaryIndexes, AccountSecondaryIndexesIncludeExclude,
             AccountsIndexConfig, DEFAULT_NUM_ENTRIES_OVERHEAD, DEFAULT_NUM_ENTRIES_TO_EVICT,
             IndexLimit, IndexLimitThreshold, MINIMAL_THRESHOLD_NUM_BYTES, ScanFilter,
         },
@@ -15,7 +16,7 @@ use {
     solana_clap_utils::{
         hidden_unless_forced,
         input_parsers::pubkeys_of,
-        input_validators::{is_parsable, is_pow2},
+        input_validators::{is_parsable, is_pow2, is_pubkey},
     },
     solana_cli_output::CliAccountNewConfig,
     solana_clock::Slot,
@@ -64,6 +65,31 @@ pub fn accounts_db_args<'a, 'b>() -> Box<[Arg<'a, 'b>]> {
             .takes_value(true)
             .help("Pre-allocate the accounts index, assuming this many accounts")
             .hidden(hidden_unless_forced()),
+        Arg::with_name("account_indexes")
+            .long("account-index")
+            .takes_value(true)
+            .multiple(true)
+            .possible_values(&["program-id", "spl-token-owner", "spl-token-mint"])
+            .value_name("INDEX")
+            .help("Enable an accounts index, indexed by the selected account field"),
+        Arg::with_name("account_index_exclude_key")
+            .long("account-index-exclude-key")
+            .takes_value(true)
+            .validator(is_pubkey)
+            .multiple(true)
+            .value_name("KEY")
+            .help("When account indexes are enabled, exclude this key from the index."),
+        Arg::with_name("account_index_include_key")
+            .long("account-index-include-key")
+            .takes_value(true)
+            .validator(is_pubkey)
+            .conflicts_with("account_index_exclude_key")
+            .multiple(true)
+            .value_name("KEY")
+            .help(
+                "When account indexes are enabled, only include specific keys in the index. This \
+                 overrides --account-index-exclude-key.",
+            ),
         Arg::with_name("accounts_index_limit")
             .long("accounts-index-limit")
             .value_name("VALUE")
@@ -334,6 +360,7 @@ pub fn get_accounts_db_config(
         drives: Some(accounts_index_drives),
         ..AccountsIndexConfig::default()
     };
+    let account_indexes = parse_account_secondary_indexes(arg_matches);
 
     // The `--accounts-db-access-storages-method` flag is now a no-op. Storages are
     // always accessed via file I/O. The flag is preserved for backward compatibility,
@@ -363,7 +390,7 @@ pub fn get_accounts_db_config(
 
     AccountsDbConfig {
         index: Some(accounts_index_config),
-        account_indexes: None,
+        account_indexes: Some(account_indexes),
         bank_hash_details_dir: ledger_tool_ledger_path,
         shrink_ratio: AccountShrinkThreshold::default(),
         read_cache_limit_bytes: None,
@@ -387,6 +414,43 @@ pub fn get_accounts_db_config(
         num_foreground_threads: None,
         accounts_file_provider: AccountsFileProvider::AppendVec,
     }
+}
+
+fn parse_account_secondary_indexes(arg_matches: &ArgMatches<'_>) -> AccountSecondaryIndexes {
+    let indexes: HashSet<_> = arg_matches
+        .values_of("account_indexes")
+        .unwrap_or_default()
+        .map(|value| match value {
+            "program-id" => AccountIndex::ProgramId,
+            "spl-token-mint" => AccountIndex::SplTokenMint,
+            "spl-token-owner" => AccountIndex::SplTokenOwner,
+            _ => unreachable!("invalid value given to `--account-index`: '{value}'"),
+        })
+        .collect();
+
+    let include_keys = pubkeys_of(arg_matches, "account_index_include_key")
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let exclude_keys = pubkeys_of(arg_matches, "account_index_exclude_key")
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let keys = if indexes.is_empty() || (include_keys.is_empty() && exclude_keys.is_empty()) {
+        None
+    } else if exclude_keys.is_empty() {
+        Some(AccountSecondaryIndexesIncludeExclude {
+            exclude: false,
+            keys: include_keys,
+        })
+    } else {
+        Some(AccountSecondaryIndexesIncludeExclude {
+            exclude: true,
+            keys: exclude_keys,
+        })
+    };
+
+    AccountSecondaryIndexes { keys, indexes }
 }
 
 pub(crate) fn parse_encoding_format(matches: &ArgMatches<'_>) -> UiAccountEncoding {
@@ -431,7 +495,10 @@ pub fn hardforks_of(matches: &ArgMatches<'_>, name: &str) -> Option<Vec<Slot>> {
 
 #[cfg(test)]
 mod tests {
-    use {super::*, solana_genesis_utils::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE};
+    use {
+        super::*, clap::App, solana_genesis_utils::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
+        solana_pubkey::Pubkey,
+    };
 
     #[test]
     fn test_max_genesis_archive_unpacked_size_constant() {
@@ -440,6 +507,56 @@ mod tests {
             MAX_GENESIS_ARCHIVE_UNPACKED_SIZE_STR
                 .parse::<u64>()
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_account_secondary_indexes() {
+        let include_key = Pubkey::new_unique();
+        let args = accounts_db_args();
+        let matches = App::new("test").args(&args).get_matches_from(vec![
+            "test",
+            "--account-index",
+            "program-id",
+            "--account-index",
+            "spl-token-owner",
+            "--account-index-include-key",
+            &include_key.to_string(),
+        ]);
+
+        assert_eq!(
+            parse_account_secondary_indexes(&matches),
+            AccountSecondaryIndexes {
+                indexes: HashSet::from([AccountIndex::ProgramId, AccountIndex::SplTokenOwner]),
+                keys: Some(AccountSecondaryIndexesIncludeExclude {
+                    exclude: false,
+                    keys: HashSet::from([include_key]),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn test_account_secondary_indexes_exclude_keys() {
+        let exclude_key = Pubkey::new_unique();
+        let args = accounts_db_args();
+        let matches = App::new("test").args(&args).get_matches_from(vec![
+            "test",
+            "--account-index",
+            "spl-token-mint",
+            "--account-index-exclude-key",
+            &exclude_key.to_string(),
+        ]);
+
+        assert_eq!(
+            get_accounts_db_config(Path::new("ledger"), &matches).account_indexes,
+            Some(AccountSecondaryIndexes {
+                indexes: HashSet::from([AccountIndex::SplTokenMint]),
+                keys: Some(AccountSecondaryIndexesIncludeExclude {
+                    exclude: true,
+                    keys: HashSet::from([exclude_key]),
+                }),
+            })
         );
     }
 }
