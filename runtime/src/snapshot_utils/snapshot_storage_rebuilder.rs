@@ -119,9 +119,7 @@ impl SnapshotStorageRebuilder {
                 &slot,
                 file_info,
                 old_append_vec_id as AccountsFileId,
-                self.obsolete_accounts
-                    .remove(&slot)
-                    .map(|accounts| accounts.into_tuple()),
+                self.obsolete_accounts.remove(&slot),
             )?,
         };
 

@@ -848,7 +848,7 @@ pub(crate) fn reconstruct_single_storage(
     slot: &Slot,
     append_vec_file_info: FileInfo,
     id: AccountsFileId,
-    obsolete_accounts: Option<(ObsoleteAccounts, AccountsFileId, usize)>,
+    obsolete_accounts: Option<SerdeObsoleteAccounts>,
 ) -> Result<Arc<AccountStorageEntry>, SnapshotError> {
     // The storage length is taken directly from the on-disk file size (see
     // `AccountsFile::new_for_startup`). When restoring from an archive the obsolete accounts have
@@ -860,16 +860,18 @@ pub(crate) fn reconstruct_single_storage(
     // When restoring from an archive, obsolete accounts will always be `None`.
     // When restoring from fastboot, obsolete accounts will be 'Some' if the storage contained
     // accounts marked obsolete at the time the snapshot was taken.
-    let obsolete_accounts =
-        if let Some((obsolete_accounts, obsolete_id, _obsolete_bytes)) = obsolete_accounts {
-            if obsolete_id != id {
-                return Err(SnapshotError::MismatchedAccountsFileId(id, obsolete_id));
-            }
+    //
+    // Validate before constructing an AccountsFile, which removes its file on drop.
+    let obsolete_accounts = if let Some(obsolete_accounts) = obsolete_accounts {
+        let (obsolete_accounts, obsolete_id, _obsolete_bytes) = obsolete_accounts.into_tuple();
+        if obsolete_id != id {
+            return Err(SnapshotError::MismatchedAccountsFileId(id, obsolete_id));
+        }
 
-            obsolete_accounts
-        } else {
-            ObsoleteAccounts::default()
-        };
+        obsolete_accounts
+    } else {
+        ObsoleteAccounts::default()
+    };
 
     let accounts_file = AccountsFile::new_for_startup(append_vec_file_info)?;
     Ok(Arc::new(AccountStorageEntry::new_existing(

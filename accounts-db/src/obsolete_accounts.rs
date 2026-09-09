@@ -2,7 +2,7 @@ use {crate::account_info::Offset, solana_clock::Slot};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObsoleteAccountItem {
-    /// Offset of the account in the account storage entry
+    /// Logical offset of the account in the account storage entry
     pub offset: Offset,
     /// Length of the account data
     pub data_len: usize,

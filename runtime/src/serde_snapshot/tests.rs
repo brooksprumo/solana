@@ -5,7 +5,9 @@ mod serde_snapshot_tests {
             bank::BankHashStats,
             serde_snapshot::{
                 AccountsDbFields, SerializableAccountsDb, SnapshotAccountsDbFields,
-                deserialize_wincode_from, reconstruct_accountsdb_from_fields,
+                deserialize_wincode_from,
+                obsolete_accounts::{SerdeObsoleteAccountItem, SerdeObsoleteAccounts},
+                reconstruct_accountsdb_from_fields, reconstruct_single_storage,
                 remap_append_vec_file, serialize_into,
             },
             snapshot_utils::StorageAndNextAccountsFileId,
@@ -22,8 +24,8 @@ mod serde_snapshot_tests {
             },
             accounts::Accounts,
             accounts_db::{
-                ACCOUNTS_DB_CONFIG_FOR_TESTING, AccountsDb, AccountsDbConfig, AtomicAccountsFileId,
-                get_temp_accounts_paths,
+                ACCOUNTS_DB_CONFIG_FOR_TESTING, AccountsDb, AccountsDbConfig, AccountsFileId,
+                AtomicAccountsFileId, get_temp_accounts_paths,
             },
             accounts_file::{AccountsFile, AccountsFileError},
             ancestors::Ancestors,
@@ -848,5 +850,28 @@ mod serde_snapshot_tests {
             &mut num_collisions,
         )
         .unwrap();
+    }
+
+    #[test_case(1; "unaligned")]
+    #[test_case(1 << 34; "out of range")]
+    #[should_panic(expected = "invalid logical offset from file offset")]
+    fn test_reconstruct_single_storage_bad_offset(offset: u64) {
+        let slot = 10;
+        let id: AccountsFileId = 42;
+        let obsolete_accounts = SerdeObsoleteAccounts {
+            id: id as usize,
+            bytes: 136,
+            accounts: vec![SerdeObsoleteAccountItem {
+                offset,
+                data_len: 0,
+                slot,
+            }],
+        };
+        let file_info = FileInfo {
+            file: tempfile::tempfile().unwrap(),
+            path: PathBuf::new(),
+            size: 0,
+        };
+        _ = reconstruct_single_storage(&slot, file_info, id, Some(obsolete_accounts));
     }
 }
