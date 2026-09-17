@@ -4,11 +4,11 @@ use {
     serde::Serialize,
     solana_accounts_db::{
         ObsoleteAccountItem, ObsoleteAccounts, account_storage_entry::AccountStorageEntry,
-        accounts_db::AccountsFileId, append_vec_file_offset_from_logical,
+        accounts_db::AccountsFileId,
         append_vec_logical_offset_from_file,
     },
     solana_clock::Slot,
-    std::{collections::HashMap, sync::Arc},
+    std::{collections::HashMap, io, sync::Arc},
     wincode::{SchemaRead, SchemaWrite},
 };
 
@@ -16,8 +16,8 @@ use {
 #[cfg_attr(feature = "frozen-abi", derive(StableAbi, StableAbiSample))]
 #[derive(Debug, SchemaRead, SchemaWrite, Serialize)]
 pub struct SerdeObsoleteAccountItem {
-    /// File offset of the account in the account storage entry
-    pub offset: u64,
+    /// Logical offset of the account in the account storage entry
+    pub offset: u32,
     /// Length of the account data
     pub data_len: usize,
     /// Slot when the account was marked obsolete
@@ -57,16 +57,10 @@ impl SerdeObsoleteAccounts {
         let accounts = self
             .accounts
             .into_iter()
-            .map(|item| {
-                // yes, append vec impl is hard coded here for now
-                let Some(offset) = append_vec_logical_offset_from_file(item.offset) else {
-                    panic!("invalid logical offset from file offset: {}", item.offset);
-                };
-                ObsoleteAccountItem {
-                    offset,
-                    data_len: item.data_len,
-                    slot: item.slot,
-                }
+            .map(|item| ObsoleteAccountItem {
+                offset: item.offset,
+                data_len: item.data_len,
+                slot: item.slot,
             })
             .collect();
 
@@ -83,14 +77,10 @@ impl SerdeObsoleteAccounts {
         obsolete_accounts
             .accounts
             .into_iter()
-            .map(|item| {
-                // yes, append vec impl is hard coded here for now
-                let offset = append_vec_file_offset_from_logical(item.offset);
-                SerdeObsoleteAccountItem {
-                    offset,
-                    data_len: item.data_len,
-                    slot: item.slot,
-                }
+            .map(|item| SerdeObsoleteAccountItem {
+                offset: item.offset,
+                data_len: item.data_len,
+                slot: item.slot,
             })
             .collect()
     }
@@ -132,6 +122,53 @@ impl SerdeObsoleteAccountsMap {
 
     pub(crate) fn into_hashmap(self) -> HashMap<Slot, SerdeObsoleteAccounts> {
         self.map.into_iter().collect()
+    }
+}
+
+// Fastboot v2/v3 stored physical AppendVec offsets. Keep this wire layout separate from v4.
+#[derive(SchemaRead)]
+struct LegacyObsoleteAccountItem {
+    offset: u64,
+    data_len: usize,
+    slot: Slot,
+}
+
+#[derive(SchemaRead)]
+struct LegacyObsoleteAccounts {
+    id: SerializedAccountsFileId,
+    bytes: u64,
+    accounts: Vec<LegacyObsoleteAccountItem>,
+}
+
+#[derive(SchemaRead)]
+pub(crate) struct LegacyObsoleteAccountsMap {
+    map: Vec<(Slot, LegacyObsoleteAccounts)>,
+}
+
+impl TryFrom<LegacyObsoleteAccountsMap> for SerdeObsoleteAccountsMap {
+    type Error = io::Error;
+
+    fn try_from(legacy: LegacyObsoleteAccountsMap) -> Result<Self, Self::Error> {
+        let map = legacy.map.into_iter().map(|(slot, storage)| {
+            let accounts = storage.accounts.into_iter().map(|item| {
+                let offset = append_vec_logical_offset_from_file(item.offset).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!(
+                        "invalid logical offset from file offset: {}", item.offset,
+                    ))
+                })?;
+                Ok(SerdeObsoleteAccountItem {
+                    offset,
+                    data_len: item.data_len,
+                    slot: item.slot,
+                })
+            }).collect::<io::Result<Vec<_>>>()?;
+            Ok((slot, SerdeObsoleteAccounts {
+                id: storage.id,
+                bytes: storage.bytes,
+                accounts,
+            }))
+        }).collect::<io::Result<Vec<_>>>()?;
+        Ok(Self { map })
     }
 }
 
@@ -206,17 +243,20 @@ mod test {
 
     #[test_case(1; "unaligned")]
     #[test_case(1 << 34; "out of range")]
-    #[should_panic(expected = "invalid logical offset from file offset")]
-    fn test_serde_obsolete_accounts_into_tuple_bad_offset(offset: u64) {
-        let serde_obsolete_accounts = SerdeObsoleteAccounts {
-            id: 42,
-            bytes: 136,
-            accounts: vec![SerdeObsoleteAccountItem {
-                offset,
-                data_len: 0,
-                slot: 10,
-            }],
+    fn test_legacy_obsolete_accounts_bad_offset(offset: u64) {
+        let legacy = LegacyObsoleteAccountsMap {
+            map: vec![(10, LegacyObsoleteAccounts {
+                id: 42,
+                bytes: 136,
+                accounts: vec![LegacyObsoleteAccountItem {
+                    offset,
+                    data_len: 0,
+                    slot: 10,
+                }],
+            })],
         };
-        _ = serde_obsolete_accounts.into_tuple();
+        let err = SerdeObsoleteAccountsMap::try_from(legacy).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("invalid logical offset from file offset"));
     }
 }

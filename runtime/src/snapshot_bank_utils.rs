@@ -2199,8 +2199,10 @@ mod tests {
     ///
     /// If zero lamport accounts are not handled correctly, Account1 or Account2 will come back
     /// failing the test
-    #[test]
-    fn test_fastboot_handle_zero_lamport_accounts() {
+    #[test_case(None)]
+    #[test_case(Some("3.0.0"))]
+    #[test_case(Some("3.1.0"))]
+    fn test_fastboot_handle_zero_lamport_accounts(legacy_version: Option<&str>) {
         let key1 = Keypair::new();
         let key2 = Keypair::new();
 
@@ -2258,7 +2260,24 @@ mod tests {
         .unwrap();
 
         let account_paths = &bank2.rc.accounts.accounts_db.paths;
-        let bank_snapshot = get_highest_bank_snapshot(&bank_snapshots_dir).unwrap();
+        let mut bank_snapshot = get_highest_bank_snapshot(&bank_snapshots_dir).unwrap();
+        let obsolete_path = bank_snapshot.snapshot_dir.join("obsolete_accounts");
+        let v4_bytes = std::fs::read(&obsolete_path).unwrap();
+        if let Some(version) = legacy_version {
+            // Re-encode the newly generated sidecar in the v3 wire format.
+            type Map = Vec<(u64, (usize, u64, Vec<(u32, usize, u64)>))>;
+            let map: Map = crate::serde_snapshot::deserialize_wincode_from(v4_bytes.as_slice()).unwrap();
+            assert!(map.iter().any(|(_, (_, _, accounts))| !accounts.is_empty()));
+            let legacy: Vec<_> = map.into_iter().map(|(slot, (id, bytes, accounts))| {
+                let accounts: Vec<_> = accounts.into_iter().map(|(offset, len, obsolete_slot)| {
+                    (solana_accounts_db::append_vec_file_offset_from_logical(offset), len, obsolete_slot)
+                }).collect();
+                (slot, (id, bytes, accounts))
+            }).collect();
+            crate::serde_snapshot::serialize_into(std::fs::File::create(&obsolete_path).unwrap(), &legacy).unwrap();
+            std::fs::write(bank_snapshot.snapshot_dir.join("fastboot_version"), version).unwrap();
+            bank_snapshot.fastboot_version = Some(Version::parse(version).unwrap());
+        }
 
         let deserialized_bank = bank_from_snapshot_dir(
             account_paths,
@@ -2276,6 +2295,8 @@ mod tests {
         .unwrap();
 
         // Ensure both accounts are still zero lamport
+        assert_eq!(std::fs::read(&obsolete_path).unwrap(), v4_bytes);
+        assert_eq!(std::fs::read_to_string(bank_snapshot.snapshot_dir.join("fastboot_version")).unwrap(), "4.0.0");
         assert_eq!(deserialized_bank.get_balance(&key1.pubkey()), 0);
         assert_eq!(deserialized_bank.get_balance(&key2.pubkey()), 0);
 
