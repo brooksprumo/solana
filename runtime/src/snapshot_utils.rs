@@ -98,7 +98,7 @@ const AUX_SNAPSHOT_FILE_READ_BUF_SIZE: usize = 4 * 1024 * 1024;
 // 3.1.0 - Startup hints file added. Optional tuning state, so snapshots fastboot in either
 //         direction between 3.0.0 and 3.1.0; a validator finding no hints just skips the tuning.
 // 4.0.0 - Obsolete accounts store u32 logical offsets instead of u64 AppendVec file offsets.
-//         Versions 2 and 3 are migrated before loading; older validators cannot load v4.
+//         Versions 2 and 3 are converted in memory when loading; older validators cannot load v4.
 const SNAPSHOT_FASTBOOT_VERSION: Version = Version::new(4, 0, 0);
 
 /// Information about a bank snapshot. Namely the slot of the bank, the path to the snapshot, and
@@ -349,11 +349,12 @@ pub fn mark_bank_snapshot_as_loadable(bank_snapshot_dir: impl AsRef<Path>) -> io
 fn write_fastboot_version(bank_snapshot_dir: &Path, version: &Version) -> io::Result<()> {
     let snapshot_fastboot_version_path = bank_snapshot_dir
         .join(snapshot_paths::SNAPSHOT_FASTBOOT_VERSION_FILENAME);
-    let mut temp = tempfile::NamedTempFile::new_in(bank_snapshot_dir)?;
-    temp.write_all(version.to_string().as_bytes())?;
-    temp.as_file().sync_all()?;
-    temp.persist(&snapshot_fastboot_version_path).map_err(|err| err.error)?;
-    fs::File::open(bank_snapshot_dir)?.sync_all()?;
+    fs::write(&snapshot_fastboot_version_path, version.to_string()).map_err(|err| {
+        IoError::other(format!(
+            "failed to write fastboot version file '{}': {err}",
+            snapshot_fastboot_version_path.display(),
+        ))
+    })?;
     Ok(())
 }
 
@@ -739,45 +740,11 @@ fn serialize_obsolete_accounts(
     Ok(file_stream.bytes_written())
 }
 
-/// Keeps the v3 source until the version marker is durable, allowing retries after interruption.
-fn migrate_obsolete_accounts(bank_snapshot_dir: &Path) -> Result<()> {
-    let version_path = bank_snapshot_dir.join(snapshot_paths::SNAPSHOT_FASTBOOT_VERSION_FILENAME);
-    if fs::read_to_string(&version_path)?.trim() == SNAPSHOT_FASTBOOT_VERSION.to_string() {
-        return Ok(());
-    }
-    let path = bank_snapshot_dir.join(snapshot_paths::SNAPSHOT_OBSOLETE_ACCOUNTS_FILENAME);
-    let backup = path.with_extension("v3");
-    let source = if backup.exists() { &backup } else { &path };
-    let file = fs::File::open(source)?;
-    if file.metadata()?.len() > MAX_OBSOLETE_ACCOUNTS_FILE_SIZE {
-        return Err(IoError::new(io::ErrorKind::InvalidData, "legacy obsolete accounts file is too large").into());
-    }
-    let legacy: LegacyObsoleteAccountsMap =
-        serde_snapshot::deserialize_wincode_from(ReadAdapter::new(BufReader::new(file)))?;
-    let converted = SerdeObsoleteAccountsMap::try_from(legacy)?;
-    let mut temp = tempfile::NamedTempFile::new_in(bank_snapshot_dir)?;
-    {
-        let mut writer = SizeLimitedWriter::new(
-            io::BufWriter::new(temp.as_file_mut()), MAX_OBSOLETE_ACCOUNTS_FILE_SIZE,
-        );
-        serde_snapshot::serialize_into(&mut writer, &converted)?;
-        writer.flush()?;
-    }
-    temp.as_file().sync_all()?;
-    if !backup.exists() {
-        fs::hard_link(&path, &backup)?;
-        fs::File::open(bank_snapshot_dir)?.sync_all()?;
-    }
-    temp.persist(&path).map_err(|err| err.error)?;
-    fs::File::open(bank_snapshot_dir)?.sync_all()?;
-    mark_bank_snapshot_as_loadable(bank_snapshot_dir)?;
-    fs::remove_file(backup)?;
-    Ok(())
-}
 
 fn deserialize_obsolete_accounts(
     bank_snapshot_dir: impl AsRef<Path>,
     maximum_obsolete_accounts_file_size: u64,
+    fastboot_version: &Version,
 ) -> Result<SerdeObsoleteAccountsMap> {
     let obsolete_accounts_path = bank_snapshot_dir
         .as_ref()
@@ -799,9 +766,18 @@ fn deserialize_obsolete_accounts(
         return Err(IoError::other(error_message).into());
     }
 
-    Ok(serde_snapshot::deserialize_wincode_from(
-        obsolete_accounts_reader,
-    )?)
+    match fastboot_version.major {
+        2 | 3 => {
+            let legacy: LegacyObsoleteAccountsMap =
+                serde_snapshot::deserialize_wincode_from(obsolete_accounts_reader)?;
+            Ok(SerdeObsoleteAccountsMap::try_from(legacy)?)
+        }
+        4 => Ok(serde_snapshot::deserialize_wincode_from(obsolete_accounts_reader)?),
+        _ => Err(IoError::new(
+            io::ErrorKind::InvalidData,
+            SnapshotFastbootError::IncompatibleVersion(fastboot_version.clone()),
+        ).into()),
+    }
 }
 
 pub fn write_storages_list_to_snapshot(
@@ -1577,11 +1553,8 @@ pub(crate) fn rebuild_storages_from_snapshot_dir(
     let storages_list_path =
         bank_snapshot_dir.join(snapshot_paths::SNAPSHOT_STORAGES_LIST_FILENAME);
     if !storages_list_path.exists() {
-        // Bring v2 hardlink storages to v3 before upgrading the obsolete accounts file.
+        // Bring v2 hardlink storages to v3; the obsolete accounts file is unchanged.
         migrate_legacy_hardlinks(bank_snapshot_dir, account_paths)?;
-    }
-    if snapshot_info.fastboot_version.as_ref().is_some_and(|version| matches!(version.major, 2 | 3)) {
-        migrate_obsolete_accounts(bank_snapshot_dir)?;
     }
 
     // With fastboot_version >= 2, obsolete accounts are tracked and stored in the snapshot
@@ -1590,8 +1563,8 @@ pub(crate) fn rebuild_storages_from_snapshot_dir(
     let obsolete_accounts = snapshot_info
         .fastboot_version
         .as_ref()
-        .is_some_and(|fastboot_version| fastboot_version.major >= 2)
-        .then(|| deserialize_obsolete_accounts(bank_snapshot_dir, MAX_OBSOLETE_ACCOUNTS_FILE_SIZE))
+        .filter(|fastboot_version| fastboot_version.major >= 2)
+        .map(|version| deserialize_obsolete_accounts(bank_snapshot_dir, MAX_OBSOLETE_ACCOUNTS_FILE_SIZE, version))
         .transpose()
         .map_err(|err| {
             IoError::other(format!(
@@ -2780,11 +2753,11 @@ mod tests {
         assert!(is_snapshot_fastboot_compatible(&Version::new(5, 0, 0)).is_err());
     }
 
-    #[test_case("3.0.0", false)]
-    #[test_case("3.1.0", false)]
-    #[test_case("3.1.0", true)]
-    #[test_case("2.0.0", false)]
-    fn test_migrate_obsolete_accounts(version: &str, interrupted: bool) {
+    #[test_case("2.0.0")]
+    #[test_case("3.0.0")]
+    #[test_case("3.1.0")]
+    #[test_case("4.0.0")]
+    fn test_deserialize_obsolete_accounts_by_version(version: &str) {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join(snapshot_paths::SNAPSHOT_OBSOLETE_ACCOUNTS_FILENAME);
         let version_path = dir.path().join(snapshot_paths::SNAPSHOT_FASTBOOT_VERSION_FILENAME);
@@ -2799,25 +2772,18 @@ mod tests {
         ];
         let mut bytes = Vec::new();
         serde_snapshot::serialize_into(&mut bytes, &legacy).unwrap();
-        fs::write(&path, &bytes).unwrap();
-        fs::write(&version_path, version).unwrap();
-        if interrupted {
-            fs::hard_link(&path, path.with_extension("v3")).unwrap();
-            // Simulate interruption after replacing the data but before advancing the version.
+        if version == "4.0.0" {
             let old: LegacyObsoleteAccountsMap =
                 serde_snapshot::deserialize_wincode_from(bytes.as_slice()).unwrap();
             let mut converted = Vec::new();
             serde_snapshot::serialize_into(&mut converted, &SerdeObsoleteAccountsMap::try_from(old).unwrap()).unwrap();
-            let temp = dir.path().join("replacement");
-            fs::write(&temp, converted).unwrap();
-            fs::rename(temp, &path).unwrap();
+            assert_eq!(converted.len(), bytes.len() - 3 * 4);
+            bytes = converted;
         }
-        migrate_obsolete_accounts(dir.path()).unwrap();
-        assert_eq!(fs::read_to_string(&version_path).unwrap(), "4.0.0");
-        assert!(!path.with_extension("v3").exists());
-        let migrated_bytes = fs::read(&path).unwrap();
-        assert_eq!(migrated_bytes.len(), bytes.len() - 3 * 4);
-        let mut map = deserialize_obsolete_accounts(dir.path(), MAX_OBSOLETE_ACCOUNTS_FILE_SIZE)
+        fs::write(&path, &bytes).unwrap();
+        fs::write(&version_path, version).unwrap();
+        let fastboot_version = Version::parse(version).unwrap();
+        let mut map = deserialize_obsolete_accounts(dir.path(), MAX_OBSOLETE_ACCOUNTS_FILE_SIZE, &fastboot_version)
             .unwrap().into_hashmap();
         let storage = map.remove(&10).unwrap();
         assert_eq!(storage.id, 42);
@@ -2825,15 +2791,19 @@ mod tests {
         assert_eq!(storage.accounts.iter().map(|a| (a.offset, a.data_len, a.slot)).collect::<Vec<_>>(),
             vec![(0, 0, 11), (1, 5, 12), ((1 << 31) - 1, 99, 13)]);
         assert!(map.remove(&20).unwrap().accounts.is_empty());
-        // Re-entry with an already-upgraded directory must not convert the offsets again.
-        migrate_obsolete_accounts(dir.path()).unwrap();
-        assert_eq!(fs::read(&path).unwrap(), migrated_bytes);
+        // Repeated loads must leave both the sidecar and its version unchanged.
+        let reloaded = deserialize_obsolete_accounts(dir.path(), MAX_OBSOLETE_ACCOUNTS_FILE_SIZE, &fastboot_version)
+            .unwrap().into_hashmap().remove(&10).unwrap();
+        assert_eq!(reloaded.accounts[1].offset, 1);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(fs::read_to_string(&version_path).unwrap(), version);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
     }
 
     #[test_case(1, false; "unaligned")]
     #[test_case(1 << 34, false; "out_of_range")]
     #[test_case(8, true; "truncated")]
-    fn test_migrate_obsolete_accounts_rejects_invalid(offset: u64, truncate: bool) {
+    fn test_deserialize_legacy_obsolete_accounts_rejects_invalid(offset: u64, truncate: bool) {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join(snapshot_paths::SNAPSHOT_OBSOLETE_ACCOUNTS_FILENAME);
         let version_path = dir.path().join(snapshot_paths::SNAPSHOT_FASTBOOT_VERSION_FILENAME);
@@ -2845,7 +2815,7 @@ mod tests {
         }
         fs::write(&path, &bytes).unwrap();
         fs::write(&version_path, "3.1.0").unwrap();
-        assert!(migrate_obsolete_accounts(dir.path()).is_err());
+        assert!(deserialize_obsolete_accounts(dir.path(), MAX_OBSOLETE_ACCOUNTS_FILE_SIZE, &Version::new(3, 1, 0)).is_err());
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert_eq!(fs::read_to_string(version_path).unwrap(), "3.1.0");
     }
@@ -2883,7 +2853,7 @@ mod tests {
 
         // Deserialize
         let mut deserialized_accounts =
-            deserialize_obsolete_accounts(bank_snapshot_dir, MAX_OBSOLETE_ACCOUNTS_FILE_SIZE)
+            deserialize_obsolete_accounts(bank_snapshot_dir, MAX_OBSOLETE_ACCOUNTS_FILE_SIZE, &SNAPSHOT_FASTBOOT_VERSION)
                 .unwrap()
                 .into_hashmap();
 
@@ -2963,7 +2933,7 @@ mod tests {
 
         // Set a very low maximum file size for deserialization
         // This should panic
-        deserialize_obsolete_accounts(bank_snapshot_dir, 100).unwrap();
+        deserialize_obsolete_accounts(bank_snapshot_dir, 100, &SNAPSHOT_FASTBOOT_VERSION).unwrap();
     }
 
     #[test]

@@ -2278,6 +2278,7 @@ mod tests {
             std::fs::write(bank_snapshot.snapshot_dir.join("fastboot_version"), version).unwrap();
             bank_snapshot.fastboot_version = Some(Version::parse(version).unwrap());
         }
+        let disk_bytes = std::fs::read(&obsolete_path).unwrap();
 
         let deserialized_bank = bank_from_snapshot_dir(
             account_paths,
@@ -2295,8 +2296,8 @@ mod tests {
         .unwrap();
 
         // Ensure both accounts are still zero lamport
-        assert_eq!(std::fs::read(&obsolete_path).unwrap(), v4_bytes);
-        assert_eq!(std::fs::read_to_string(bank_snapshot.snapshot_dir.join("fastboot_version")).unwrap(), "4.0.0");
+        assert_eq!(std::fs::read(&obsolete_path).unwrap(), disk_bytes);
+        assert_eq!(std::fs::read_to_string(bank_snapshot.snapshot_dir.join("fastboot_version")).unwrap(), legacy_version.unwrap_or("4.0.0"));
         assert_eq!(deserialized_bank.get_balance(&key1.pubkey()), 0);
         assert_eq!(deserialized_bank.get_balance(&key2.pubkey()), 0);
 
