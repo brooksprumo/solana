@@ -722,7 +722,7 @@ pub fn execute(
         partitioned_epoch_rewards_config: PartitionedEpochRewardsConfig::default(),
         scan_filter_for_shrinking,
         num_background_threads: Some(accounts_db_background_threads),
-        accounts_file_provider: AccountsFileProvider::AppendVec,
+        accounts_file_provider: AccountsFileProvider::Split,
     };
 
     let on_start_geyser_plugin_config_files = if matches.is_present("geyser_plugin_config") {
