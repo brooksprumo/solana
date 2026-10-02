@@ -848,6 +848,7 @@ mod tests {
             SnapshotVersion, error::VerifySlotDeltasError, paths::get_bank_snapshot_dir,
         },
         semver::Version,
+        solana_account::{Account, AccountSharedData},
         solana_accounts_db::{
             accounts_db::{ACCOUNTS_DB_CONFIG_FOR_TESTING, AccountsFileId},
             accounts_file::{AccountsFile, AccountsFileProvider},
@@ -2255,6 +2256,7 @@ mod tests {
     /// If zero lamport accounts are not handled correctly, Account1 or Account2 will come back
     /// failing the test
     #[test_case(AccountsFileProvider::AppendVec)]
+    #[test_case(AccountsFileProvider::Split)]
     fn test_fastboot_handle_zero_lamport_accounts(accounts_file_provider: AccountsFileProvider) {
         let key1 = Keypair::new();
         let key2 = Keypair::new();
@@ -2383,8 +2385,10 @@ mod tests {
         .unwrap();
     }
 
-    #[test_case(AccountsFileProvider::AppendVec)]
-    fn test_bank_from_snapshot_dir_good(accounts_file_provider: AccountsFileProvider) {
+    #[test_case(AccountsFileProvider::AppendVec, 4)]
+    #[test_case(AccountsFileProvider::AppendVec, 5)]
+    #[test_case(AccountsFileProvider::Split, 5)]
+    fn test_bank_from_snapshot_dir_good(accounts_file_provider: AccountsFileProvider, fastboot_major: u64) {
         let GenesisConfigInfo { genesis_config, .. } = create_genesis_config_with_leader(
             1_000_000 * LAMPORTS_PER_SOL,
             &Pubkey::new_unique(),
@@ -2403,6 +2407,17 @@ mod tests {
             vec![],
             None,
         );
+        let accounts: Vec<_> = [165, 8192].into_iter().map(|data_len| {
+            let address = Pubkey::new_unique();
+            let account = AccountSharedData::from(Account {
+                lamports: LAMPORTS_PER_SOL,
+                data: vec![42; data_len],
+                owner: Pubkey::new_unique(),
+                ..Account::default()
+            });
+            bank.store_account_and_update_capitalization(&address, &account);
+            (address, account)
+        }).collect();
         bank.fill_bank_with_ticks_for_tests();
         bank.set_block_id(Some(Hash::default()));
 
@@ -2417,6 +2432,11 @@ mod tests {
         )
         .unwrap();
 
+        let snapshot_dir = get_bank_snapshot_dir(&bank_snapshots_dir, bank.slot());
+        fs::write(
+            snapshot_dir.join(snapshot_paths::SNAPSHOT_FASTBOOT_VERSION_FILENAME),
+            Version::new(fastboot_major, 0, 0).to_string(),
+        ).unwrap();
         let bank_snapshot = get_highest_bank_snapshot(&bank_snapshots_dir).unwrap();
         let account_paths = &bank.rc.accounts.accounts_db.paths;
 
@@ -2435,6 +2455,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(bank_constructed, bank);
+        for (address, account) in accounts {
+            assert_eq!(bank_constructed.get_account(&address).unwrap(), account);
+        }
+        for storage in bank_constructed.accounts().accounts_db.get_storages(..).0 {
+            let original = bank.accounts().accounts_db.storage.get_slot_storage_entry(storage.slot()).unwrap();
+            assert_eq!(storage.num_stored_bytes(), original.num_stored_bytes());
+            assert_eq!(storage.count(), original.count());
+            assert!(match accounts_file_provider {
+                AccountsFileProvider::AppendVec => matches!(storage.accounts, AccountsFile::AppendVec(_)),
+                AccountsFileProvider::Split => matches!(storage.accounts, AccountsFile::Split(_)),
+            });
+        }
 
         // Verify that the next_append_vec_id tracking is correct
         let mut max_id = 0;
@@ -2456,6 +2488,7 @@ mod tests {
     /// the `(slot, id)` pair isn't in the storages list) while keeping the snapshot's own
     /// storage files in place and producing a working bank.
     #[test_case(AccountsFileProvider::AppendVec)]
+    #[test_case(AccountsFileProvider::Split)]
     fn test_bank_from_snapshot_dir_prunes_stale_storage(
         accounts_file_provider: AccountsFileProvider,
     ) {
@@ -2511,10 +2544,12 @@ mod tests {
         let stale_id = AccountsFileId::MAX;
         let stale_files: Vec<_> = account_paths
             .iter()
-            .map(|account_path| {
-                let stale = account_path.join(AccountsFile::file_name(stale_slot, stale_id));
-                fs::write(&stale, b"junk").unwrap();
-                stale
+            .flat_map(|account_path| {
+                ["", ".meta", ".data"].map(|suffix| {
+                    let stale = account_path.join(format!("{stale_slot}.{stale_id}{suffix}"));
+                    fs::write(&stale, b"junk").unwrap();
+                    stale
+                })
             })
             .collect();
 

@@ -95,7 +95,8 @@ const AUX_SNAPSHOT_FILE_READ_BUF_SIZE: usize = 4 * 1024 * 1024;
 //         direction between 3.0.0 and 3.1.0; a validator finding no hints just skips the tuning.
 // 4.0.0 - Obsolete accounts store u32 logical offsets instead of u64 AppendVec file offsets.
 //         Version 3 is converted in memory when loading; older validators cannot load v4.
-const SNAPSHOT_FASTBOOT_VERSION: Version = Version::new(4, 0, 0);
+// 5.0.0 - Storages may be split metadata/data pairs. Older validators cannot load them.
+const SNAPSHOT_FASTBOOT_VERSION: Version = Version::new(5, 0, 0);
 
 /// Information about a bank snapshot. Namely the slot of the bank, the path to the snapshot, and
 /// the kind of the snapshot.
@@ -372,6 +373,7 @@ fn is_snapshot_fastboot_compatible(
     version: &Version,
 ) -> std::result::Result<bool, SnapshotFastbootError> {
     match version.major {
+        5 => Ok(true),
         4 => Ok(true),
         3 => Ok(true),
         v if v > SNAPSHOT_FASTBOOT_VERSION.major => {
@@ -564,12 +566,12 @@ pub fn serialize_snapshot(
             if should_finalize {
                 let flush_measure = Measure::start("");
                 for storage in snapshot_storages {
+                    // Pin both storage files before flushing: split storages require that
+                    // durable files outlive the validator-exit Drop chain.
+                    storage.disable_remove_on_drop();
                     storage.flush().map_err(|err| {
                         AddBankSnapshotError::FlushStorage(err, storage.path().to_path_buf())
                     })?;
-                    // We're about to mark this snapshot fastboot-loadable. Pin the storage
-                    // file so it outlives the validator-exit Drop chain.
-                    storage.disable_remove_on_drop();
                 }
                 let flush_us = flush_measure.end_as_us();
 
@@ -1389,7 +1391,7 @@ fn spawn_streaming_snapshot_dir_files(
 
 /// Removes storage files from `account_paths` whose `(slot, id)` pair isn't listed in the
 /// storages list (i.e. they don't belong to the snapshot being loaded). Files whose names
-/// don't parse as `<slot>.<id>` storage filenames are left alone.
+/// don't parse as `<slot>.<id>[.meta|.data]` storage filenames are left alone.
 fn prune_stale_storages(account_paths: &[PathBuf], storages_list: StoragesList) -> Result<()> {
     let expected_storages = storages_list.into_slot_file_id_set();
     for account_path in account_paths {

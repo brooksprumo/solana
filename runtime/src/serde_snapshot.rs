@@ -28,7 +28,7 @@ use {
         accounts_db::{
             AccountsDb, AccountsDbConfig, AccountsFileId, AtomicAccountsFileId, IndexGenerationInfo,
         },
-        accounts_file::AccountsFile,
+        accounts_file::{AccountsFile, AccountsFileError},
         accounts_hash::AccountsLtHash,
         accounts_update_notifier_interface::AccountsUpdateNotifier,
         blockhash_queue::BlockhashQueue,
@@ -821,6 +821,20 @@ pub(crate) fn reconstruct_single_storage(
     // When restoring from an archive, obsolete accounts will always be `None`.
     // When restoring from fastboot, obsolete accounts will be 'Some' if the storage contained
     // accounts marked obsolete at the time the snapshot was taken.
+    reconstruct_storage(
+        slot,
+        id,
+        obsolete_accounts,
+        || AccountsFile::new_for_startup(append_vec_file_info),
+    )
+}
+
+pub(crate) fn reconstruct_storage(
+    slot: &Slot,
+    id: AccountsFileId,
+    obsolete_accounts: Option<(ObsoleteAccounts, AccountsFileId, usize)>,
+    open_accounts_file: impl FnOnce() -> Result<AccountsFile, AccountsFileError>,
+) -> Result<Arc<AccountStorageEntry>, SnapshotError> {
     let obsolete_accounts =
         if let Some((obsolete_accounts, obsolete_id, _obsolete_bytes)) = obsolete_accounts {
             if obsolete_id != id {
@@ -832,11 +846,10 @@ pub(crate) fn reconstruct_single_storage(
             ObsoleteAccounts::default()
         };
 
-    let accounts_file = AccountsFile::new_for_startup(append_vec_file_info)?;
     Ok(Arc::new(AccountStorageEntry::new_existing(
         *slot,
         id,
-        accounts_file,
+        open_accounts_file()?,
         obsolete_accounts,
     )))
 }
