@@ -2451,6 +2451,43 @@ mod tests {
         assert_eq!(max_id, next_id - 1);
     }
 
+    /// Finalizing a bank snapshot with split storages must succeed: `SplitFile::flush()`
+    /// refuses storages still marked remove-on-drop, so remove-on-drop must be disabled
+    /// before the flush.
+    #[test_case(AccountsFileProvider::Split)]
+    fn test_serialize_snapshot_finalizes_split_storages(
+        accounts_file_provider: AccountsFileProvider,
+    ) {
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config_with_leader(
+            1_000_000 * LAMPORTS_PER_SOL,
+            &Pubkey::new_unique(),
+            1_000_000 * LAMPORTS_PER_SOL,
+        );
+        let accounts_db_config = AccountsDbConfig {
+            accounts_file_provider,
+            ..ACCOUNTS_DB_CONFIG_FOR_TESTING
+        };
+        let bank_snapshots_dir = tempfile::TempDir::new().unwrap();
+        let bank = Bank::new_with_paths_for_tests(
+            &genesis_config,
+            Some(BankTestConfig {
+                accounts_db_config,
+            }),
+            vec![],
+            None,
+        );
+        bank.fill_bank_with_ticks_for_tests();
+        bank.set_block_id(Some(Hash::default()));
+
+        create_bank_snapshot_from_bank(
+            &bank_snapshots_dir,
+            &bank,
+            SnapshotVersion::default(),
+            true,
+        )
+        .unwrap();
+    }
+
     /// Drop a stale `<slot>.<id>` file into the account_paths run dir before calling
     /// `bank_from_snapshot_dir`, and verify that the fastboot rebuild path removes it (because
     /// the `(slot, id)` pair isn't in the storages list) while keeping the snapshot's own
