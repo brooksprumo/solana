@@ -10,7 +10,7 @@ use {
         account_storage::AccountStorageMap,
         account_storage_entry::AccountStorageEntry,
         accounts_db::{AccountsFileId, AtomicAccountsFileId},
-        accounts_file::AccountsFile,
+        accounts_file::{AccountsFile, MAXIMUM_APPEND_VEC_FILE_SIZE},
     },
     solana_clock::Slot,
     std::{
@@ -74,21 +74,38 @@ impl SnapshotStorageRebuilder {
                     &rebuilder.next_append_vec_id,
                     &mut rebuilder.num_collisions,
                 )?;
-                let accounts_file = AccountsFile::new_for_startup(remapped_file_info)?;
-                let storage_entry = AccountStorageEntry::new_existing(
+                let storage_entry = Self::reconstruct_archive_storage(
                     slot,
                     remapped_id,
-                    accounts_file,
-                    ObsoleteAccounts::default(),
-                );
+                    remapped_file_info,
+                    MAXIMUM_APPEND_VEC_FILE_SIZE,
+                )?;
 
-                rebuilder.insert_storage(slot, Arc::new(storage_entry))?;
+                rebuilder.insert_storage(slot, storage_entry)?;
                 rebuilder.processed_slot_count += 1;
             }
             rebuilder.maybe_log_progress(&mut previous_log_time);
         }
 
         Ok(rebuilder.storage)
+    }
+
+    pub(crate) fn reconstruct_archive_storage(
+        slot: Slot,
+        id: AccountsFileId,
+        file_info: FileInfo,
+        max_append_vec_size: u64,
+    ) -> Result<Arc<AccountStorageEntry>, SnapshotError> {
+        let accounts_file = if file_info.size > max_append_vec_size {
+            info!("Converting oversized archive AppendVec '{}' ({} bytes) to Split",
+                file_info.path.display(), file_info.size);
+            AccountsFile::new_split_from_append_vec(file_info, slot)?
+        } else {
+            AccountsFile::new_for_startup(file_info)?
+        };
+        Ok(Arc::new(AccountStorageEntry::new_existing(
+            slot, id, accounts_file, ObsoleteAccounts::default(),
+        )))
     }
 
     /// Rebuilds the account storages from local state.

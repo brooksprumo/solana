@@ -101,7 +101,13 @@ pub fn create_data_file(
 ) -> Result<(PathBuf, File, usize), SplitFileError> {
     let data_path = data_path_from_base(&base_path);
     let mut data_file = utils::create_new_file(&data_path)?;
-    let header_size = write_data_header(&mut data_file, uid)?;
+    let header_size = match write_data_header(&mut data_file, uid) {
+        Ok(size) => size,
+        Err(err) => {
+            let _ = std::fs::remove_file(&data_path);
+            return Err(err.into());
+        }
+    };
     Ok((data_path, data_file, header_size))
 }
 

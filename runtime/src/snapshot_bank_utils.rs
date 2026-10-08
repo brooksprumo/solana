@@ -844,14 +844,19 @@ mod tests {
             },
             status_cache::{Status, StatusCache},
         },
+        agave_fs::buffered_reader::FileBufRead as _,
         agave_snapshots::{
             SnapshotVersion, error::VerifySlotDeltasError, paths::get_bank_snapshot_dir,
         },
         semver::Version,
         solana_account::{Account, AccountSharedData},
         solana_accounts_db::{
+            account_storage_reader::{
+                AccountStorageReader, TombstonesFilter, storage_file_buf_reader,
+            },
             accounts_db::{ACCOUNTS_DB_CONFIG_FOR_TESTING, AccountsFileId},
             accounts_file::{AccountsFile, AccountsFileProvider},
+            append_vec::AppendVec,
         },
         solana_hash::Hash,
         solana_keypair::Keypair,
@@ -866,7 +871,7 @@ mod tests {
             slice,
             sync::{Arc, atomic::Ordering},
         },
-        test_case::test_case,
+        test_case::{test_case, test_matrix},
     };
 
     fn snapshot_config_for_tests(
@@ -2349,6 +2354,443 @@ mod tests {
 
         // Ensure the deserialized bank matches the original bank
         assert_eq!(*bank2, deserialized_bank);
+    }
+
+    // brooks TODO: review
+    /// Fastboot restores obsolete external data and tombstones; archives omit obsolete versions
+    /// but preserve zero-lamport deletion markers.
+    #[test_matrix(
+        [AccountsFileProvider::AppendVec, AccountsFileProvider::Split],
+        [AccountsFileProvider::AppendVec, AccountsFileProvider::Split],
+        [AccountsFileProvider::AppendVec, AccountsFileProvider::Split]
+    )]
+    fn test_fastboot_then_archive_with_obsolete_external_data(
+        source_provider: AccountsFileProvider,
+        fastboot_provider: AccountsFileProvider,
+        archive_provider: AccountsFileProvider,
+    ) {
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config_with_leader(
+            1_000_000 * LAMPORTS_PER_SOL,
+            &Pubkey::new_unique(),
+            1_000_000 * LAMPORTS_PER_SOL,
+        );
+        let source_config = AccountsDbConfig {
+            accounts_file_provider: source_provider,
+            ..ACCOUNTS_DB_CONFIG_FOR_TESTING
+        };
+        let fastboot_config = AccountsDbConfig {
+            accounts_file_provider: fastboot_provider,
+            ..ACCOUNTS_DB_CONFIG_FOR_TESTING
+        };
+        let archive_config = AccountsDbConfig {
+            accounts_file_provider: archive_provider,
+            ..ACCOUNTS_DB_CONFIG_FOR_TESTING
+        };
+        let make_account = |data_len, byte| {
+            AccountSharedData::from(Account {
+                lamports: LAMPORTS_PER_SOL,
+                data: vec![byte; data_len],
+                owner: Pubkey::new_unique(),
+                ..Account::default()
+            })
+        };
+        let address = Pubkey::new_unique();
+        let anchor_address = Pubkey::new_unique();
+        let tombstone_address = Pubkey::new_unique();
+        let obsolete_account = make_account(8192, 17);
+        let current_account = make_account(16384, 23);
+        let anchor_account = make_account(165, 31);
+        let (bank0, bank_forks) = Bank::new_with_paths_for_tests(
+            &genesis_config,
+            Some(BankTestConfig {
+                accounts_db_config: source_config,
+            }),
+            vec![],
+            None,
+        )
+        .wrap_with_bank_forks_for_tests();
+        bank0.store_account_and_update_capitalization(&address, &obsolete_account);
+        bank0.store_account_and_update_capitalization(&anchor_address, &anchor_account);
+        bank0.store_account_and_update_capitalization(&tombstone_address, &make_account(165, 37));
+        bank0.fill_bank_with_ticks_for_tests();
+        bank0.squash();
+        bank0.force_flush_accounts_cache();
+        let bank1 = Bank::new_from_parent_with_bank_forks(
+            bank_forks.as_ref(),
+            bank0.clone(),
+            *bank0.leader(),
+            1,
+        );
+        bank1.store_account_and_update_capitalization(&address, &current_account);
+        bank1.store_account_and_update_capitalization(
+            &tombstone_address,
+            &AccountSharedData::default(),
+        );
+        bank1.fill_bank_with_ticks_for_tests();
+        bank1.set_block_id(Some(Hash::default()));
+        let bank_snapshots_dir = TempDir::new().unwrap();
+        create_bank_snapshot_from_bank(
+            &bank_snapshots_dir,
+            &bank1,
+            SnapshotVersion::default(),
+            true,
+        )
+        .unwrap();
+
+        // The unchanged anchor keeps slot 0 alive after its external account becomes obsolete.
+        let source_storage = bank1
+            .accounts()
+            .accounts_db
+            .storage
+            .get_slot_storage_entry(0)
+            .unwrap();
+        assert!(match source_provider {
+            AccountsFileProvider::AppendVec =>
+                matches!(source_storage.accounts, AccountsFile::AppendVec(_)),
+            AccountsFileProvider::Split =>
+                matches!(source_storage.accounts, AccountsFile::Split(_)),
+        });
+        let obsolete = source_storage.obsolete_accounts_for_snapshots(bank1.slot());
+        let mut expected_stored_bytes = 0;
+        let mut obsolete_bytes = 0;
+        let mut num_obsolete = 0;
+        let mut obsolete_offset = None;
+        source_storage
+            .accounts
+            .scan_accounts_without_data(|offset, account| {
+                let stored_size = AppendVec::calculate_stored_size(account.data_len) as u64;
+                expected_stored_bytes += stored_size;
+                if let Some(item) = obsolete.accounts.iter().find(|item| item.offset == offset) {
+                    assert_eq!(item.data_len, account.data_len);
+                    obsolete_bytes += stored_size;
+                    num_obsolete += 1;
+                    if *account.pubkey == address {
+                        assert!(obsolete_offset.replace(offset).is_none());
+                        assert_eq!(account.data_len, 8192);
+                    }
+                }
+            })
+            .unwrap();
+        let obsolete_offset =
+            obsolete_offset.expect("the old external account must be marked obsolete");
+        assert_eq!(num_obsolete, obsolete.accounts.len());
+        assert_eq!(
+            source_storage.get_obsolete_bytes(None) as u64,
+            obsolete_bytes
+        );
+        assert_eq!(source_storage.num_stored_bytes(), expected_stored_bytes);
+        assert!(
+            !bank1
+                .accounts()
+                .accounts_db
+                .accounts_index
+                .get_and_then(&tombstone_address, |entry| (false, entry.is_some()),)
+        );
+        let source_tombstone_storage = bank1
+            .accounts()
+            .accounts_db
+            .storage
+            .get_slot_storage_entry(1)
+            .unwrap();
+        let mut tombstone_offset = None;
+        let mut tombstone_storage_bytes = 0;
+        source_tombstone_storage
+            .accounts
+            .scan_accounts_without_data(|offset, account| {
+                tombstone_storage_bytes +=
+                    AppendVec::calculate_stored_size(account.data_len) as u64;
+                if *account.pubkey == tombstone_address {
+                    assert!(tombstone_offset.replace(offset).is_none());
+                    assert_eq!(account.lamports, 0);
+                    assert_eq!(account.data_len, 0);
+                }
+            })
+            .unwrap();
+        let tombstone_offset =
+            tombstone_offset.expect("the deletion marker must be physically stored");
+        assert_eq!(
+            source_tombstone_storage.num_stored_bytes(),
+            tombstone_storage_bytes
+        );
+        assert!(
+            source_tombstone_storage
+                .obsolete_accounts_for_snapshots(1)
+                .accounts
+                .is_empty()
+        );
+        let snapshot = get_highest_bank_snapshot(&bank_snapshots_dir).unwrap();
+        let fastboot_bank = bank_from_snapshot_dir(
+            &bank1.accounts().accounts_db.paths,
+            &snapshot,
+            &genesis_config,
+            &RuntimeConfig::default(),
+            None,
+            None,
+            None,
+            false,
+            fastboot_config,
+            None,
+            Arc::default(),
+        )
+        .unwrap();
+        assert_eq!(fastboot_bank, *bank1);
+        assert_eq!(fastboot_bank.get_balance(&tombstone_address), 0);
+        assert!(fastboot_bank.get_account(&tombstone_address).is_none());
+        // Tombstone lists are not persisted: startup initially indexes the stored zero-lamport entry.
+        assert!(
+            fastboot_bank
+                .accounts()
+                .accounts_db
+                .accounts_index
+                .get_and_then(&tombstone_address, |entry| (false, entry.is_some()),)
+        );
+        let restored_tombstone_storage = fastboot_bank
+            .accounts()
+            .accounts_db
+            .storage
+            .get_slot_storage_entry(1)
+            .unwrap();
+        assert_eq!(
+            restored_tombstone_storage.num_stored_bytes(),
+            tombstone_storage_bytes
+        );
+        assert_eq!(
+            restored_tombstone_storage.num_alive_bytes() as u64,
+            tombstone_storage_bytes
+        );
+        restored_tombstone_storage
+            .accounts
+            .get_stored_account_callback(tombstone_offset, |account| {
+                assert_eq!(*account.pubkey, tombstone_address);
+                assert_eq!(account.lamports, 0);
+                assert!(account.data.is_empty());
+            })
+            .unwrap();
+        // Bank::clean_accounts excludes its own snapshot slot; exercise background cleaning
+        // through the restored root so this zero-lamport entry becomes a tombstone again.
+        fastboot_bank
+            .accounts()
+            .accounts_db
+            .clean_accounts(fastboot_bank.slot());
+        assert!(
+            !fastboot_bank
+                .accounts()
+                .accounts_db
+                .accounts_index
+                .get_and_then(&tombstone_address, |entry| (false, entry.is_some()),)
+        );
+        assert_eq!(
+            restored_tombstone_storage.num_stored_bytes(),
+            tombstone_storage_bytes
+        );
+        assert!(
+            restored_tombstone_storage
+                .obsolete_accounts_for_snapshots(1)
+                .accounts
+                .is_empty()
+        );
+        // Cleaning recreates the tombstone list. Check both archive-reader modes and byte counts.
+        for storage in [&source_tombstone_storage, &restored_tombstone_storage] {
+            let file = storage.accounts.open_file_for_archive(false).unwrap();
+            let mut file_reader =
+                storage_file_buf_reader(1024 * 1024, true, &IoSetupState::default()).unwrap();
+            for filter in [TombstonesFilter::Include, TombstonesFilter::Exclude] {
+                if let Some(file) = &file {
+                    file_reader
+                        .set_file(file.as_ref(), file.as_ref().metadata().unwrap().len())
+                        .unwrap();
+                }
+                let reader =
+                    AccountStorageReader::new(storage, Some(1), filter, &mut file_reader).unwrap();
+                let expected = tombstone_storage_bytes as usize
+                    - if filter == TombstonesFilter::Exclude {
+                        AppendVec::calculate_stored_size(0)
+                    } else {
+                        0
+                    };
+                assert_eq!(reader.len_for_archive(), expected);
+                let mut bytes = Vec::new();
+                reader.write_to(&mut bytes).unwrap();
+                assert_eq!(bytes.len(), expected);
+            }
+        }
+        assert_eq!(
+            fastboot_bank.get_account(&address).unwrap(),
+            current_account
+        );
+        assert_eq!(
+            fastboot_bank.get_account(&anchor_address).unwrap(),
+            anchor_account
+        );
+        let restored_storage = fastboot_bank
+            .accounts()
+            .accounts_db
+            .storage
+            .get_slot_storage_entry(0)
+            .unwrap();
+        assert_eq!(
+            restored_storage.obsolete_accounts_for_snapshots(1),
+            obsolete
+        );
+        assert_eq!(restored_storage.num_stored_bytes(), expected_stored_bytes);
+        assert_eq!(
+            restored_storage.num_alive_bytes() as u64,
+            expected_stored_bytes - obsolete_bytes
+        );
+        restored_storage
+            .accounts
+            .get_stored_account_callback(obsolete_offset, |account| {
+                assert_eq!(*account.pubkey, address);
+                assert_eq!(
+                    solana_accounts_db::utils::create_account_shared_data(&account),
+                    obsolete_account
+                );
+            })
+            .unwrap();
+
+        // Also write through the fastboot provider, so differing providers produce mixed storages.
+        let (fastboot_bank, fastboot_forks) = fastboot_bank.wrap_with_bank_forks_for_tests();
+        let bank2 = Bank::new_from_parent_with_bank_forks(
+            fastboot_forks.as_ref(),
+            fastboot_bank.clone(),
+            *fastboot_bank.leader(),
+            2,
+        );
+        let new_address = Pubkey::new_unique();
+        let new_account = make_account(12288, 47);
+        bank2.store_account_and_update_capitalization(&new_address, &new_account);
+        bank2.fill_bank_with_ticks_for_tests();
+        bank2.set_block_id(Some(Hash::default()));
+        let full_archives_dir = TempDir::new().unwrap();
+        let incremental_archives_dir = TempDir::new().unwrap();
+        let snapshot_config = snapshot_config_for_tests(
+            &bank_snapshots_dir,
+            &full_archives_dir,
+            &incremental_archives_dir,
+        );
+        let archive = bank_to_full_snapshot_archive(&snapshot_config, &bank2).unwrap();
+        let new_storage = bank2
+            .accounts()
+            .accounts_db
+            .storage
+            .get_slot_storage_entry(2)
+            .unwrap();
+        assert!(match fastboot_provider {
+            AccountsFileProvider::AppendVec =>
+                matches!(new_storage.accounts, AccountsFile::AppendVec(_)),
+            AccountsFileProvider::Split => matches!(new_storage.accounts, AccountsFile::Split(_)),
+        });
+        let (_accounts_dir, accounts_path) = create_tmp_accounts_dir_for_tests();
+        let archive_bank = bank_from_snapshot_archives(
+            &[accounts_path],
+            &archive,
+            None,
+            &snapshot_config,
+            &genesis_config,
+            &RuntimeConfig::default(),
+            None,
+            None,
+            None,
+            false,
+            archive_config,
+            None,
+            Arc::default(),
+        )
+        .unwrap();
+        assert_eq!(archive_bank, *bank2);
+        assert_eq!(archive_bank.get_balance(&tombstone_address), 0);
+        assert!(archive_bank.get_account(&tombstone_address).is_none());
+        let archived_tombstone_storage = archive_bank
+            .accounts()
+            .accounts_db
+            .storage
+            .get_slot_storage_entry(1)
+            .unwrap();
+        assert!(matches!(
+            archived_tombstone_storage.accounts,
+            AccountsFile::AppendVec(_)
+        ));
+        let mut num_tombstones = 0;
+        archived_tombstone_storage
+            .accounts
+            .scan_accounts_without_data(|_, account| {
+                if *account.pubkey == tombstone_address {
+                    num_tombstones += 1;
+                    assert_eq!(account.lamports, 0);
+                    assert_eq!(account.data_len, 0);
+                }
+            })
+            .unwrap();
+        assert_eq!(
+            num_tombstones, 1,
+            "the archive must preserve the deletion marker"
+        );
+        for (key, account) in [
+            (address, current_account),
+            (anchor_address, anchor_account),
+            (new_address, new_account),
+        ] {
+            assert_eq!(archive_bank.get_account(&key).unwrap(), account);
+        }
+        let archived_storage = archive_bank
+            .accounts()
+            .accounts_db
+            .storage
+            .get_slot_storage_entry(0)
+            .unwrap();
+        assert!(matches!(
+            archived_storage.accounts,
+            AccountsFile::AppendVec(_)
+        ));
+        assert!(
+            archived_storage
+                .obsolete_accounts_for_snapshots(2)
+                .accounts
+                .is_empty()
+        );
+        assert_eq!(
+            archived_storage.num_stored_bytes(),
+            expected_stored_bytes - obsolete_bytes
+        );
+        archived_storage
+            .accounts
+            .scan_accounts_without_data(|_, account| {
+                assert_ne!(
+                    *account.pubkey, tombstone_address,
+                    "the older funded version must not be archived"
+                );
+                assert_ne!(
+                    *account.pubkey, address,
+                    "obsolete data must be physically omitted from the archive"
+                );
+            })
+            .unwrap();
+
+        let (archive_bank, archive_forks) = archive_bank.wrap_with_bank_forks_for_tests();
+        let bank3 = Bank::new_from_parent_with_bank_forks(
+            archive_forks.as_ref(),
+            archive_bank.clone(),
+            *archive_bank.leader(),
+            3,
+        );
+        bank3.store_account_and_update_capitalization(
+            &Pubkey::new_unique(),
+            &make_account(8192, 59),
+        );
+        bank3.fill_bank_with_ticks_for_tests();
+        bank3.squash();
+        bank3.force_flush_accounts_cache();
+        let storage = bank3
+            .accounts()
+            .accounts_db
+            .storage
+            .get_slot_storage_entry(3)
+            .unwrap();
+        assert!(match archive_provider {
+            AccountsFileProvider::AppendVec =>
+                matches!(storage.accounts, AccountsFile::AppendVec(_)),
+            AccountsFileProvider::Split => matches!(storage.accounts, AccountsFile::Split(_)),
+        });
     }
 
     /// Test that removing the obsolete accounts file causes fastboot to fail.

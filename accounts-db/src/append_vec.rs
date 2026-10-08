@@ -680,7 +680,7 @@ impl AppendVec {
         reader: &mut impl RequiredLenBufFileRead<'a>,
         mut callback: impl for<'local> FnMut(LogicalOffset, StoredAccountInfo<'local>),
     ) -> Result<()> {
-        self.scan_accounts_stored_meta_with(reader, |stored_account_meta| {
+        Self::scan_accounts_stored_meta_with(reader, false, |stored_account_meta| {
             // SAFETY: The offset in stored_account_meta is required to be a valid/aligned offset
             // for an AppendVec entry/account, thus it is also a valid logical offset.
             let logical_offset = logical_offset_from_file(stored_account_meta.offset()).unwrap();
@@ -693,6 +693,7 @@ impl AppendVec {
                 rent_epoch: stored_account_meta.rent_epoch(),
             };
             callback(logical_offset, account);
+            Ok(())
         })
     }
 
@@ -703,33 +704,76 @@ impl AppendVec {
     #[cfg(feature = "dev-context-only-utils")]
     fn scan_accounts_stored_meta<'a>(
         &'a self,
-        callback: impl for<'local> FnMut(StoredAccountMeta<'local>),
+        mut callback: impl for<'local> FnMut(StoredAccountMeta<'local>),
     ) -> Result<()> {
         let mut reader = crate::accounts_file::new_scan_accounts_reader();
         reader.set_file(&self.file, self.len() as FileSize)?;
-        self.scan_accounts_stored_meta_with(&mut reader, callback)
+        Self::scan_accounts_stored_meta_with(&mut reader, false, |account| {
+            callback(account);
+            Ok(())
+        })
+    }
+
+    /// Scans an archive AppendVec without requiring its offsets or size to fit the index.
+    /// The source file is borrowed and is not removed if reading or the callback fails.
+    pub(crate) fn scan_accounts_from_file<E: From<AppendVecError>>(
+        file_info: &FileInfo,
+        mut callback: impl for<'local> FnMut(StoredAccountInfo<'local>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        let mut reader = crate::accounts_file::new_scan_accounts_reader();
+        reader
+            .set_file(&file_info.file, file_info.size)
+            .map_err(AppendVecError::Io)?;
+        Self::scan_accounts_stored_meta_with(&mut reader, true, |account| {
+            callback(StoredAccountInfo {
+                pubkey: account.pubkey(),
+                lamports: account.lamports(),
+                owner: account.owner(),
+                data: account.data(),
+                executable: account.executable(),
+                rent_epoch: account.rent_epoch(),
+            })
+        })
     }
 
     /// See [`scan_accounts_stored_meta`] for documentation.
     ///
     /// This fn does not call `FileBufRead::set_file()` first, before scanning.
     /// The *caller* is responsible for setting the file.
-    fn scan_accounts_stored_meta_with<'a>(
-        &'a self,
+    fn scan_accounts_stored_meta_with<'a, E: From<AppendVecError>>(
         reader: &mut impl RequiredLenBufFileRead<'a>,
-        mut callback: impl for<'local> FnMut(StoredAccountMeta<'local>),
-    ) -> Result<()> {
+        validate: bool,
+        mut callback: impl for<'local> FnMut(StoredAccountMeta<'local>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
         let mut min_buf_len = STORE_META_OVERHEAD;
         loop {
             let offset = reader.get_file_offset();
             let bytes = match reader.fill_buf_required(min_buf_len) {
                 Ok([]) => break,
                 Ok(bytes) => ValidSlice::new(bytes),
-                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(err) => return Err(AppendVecError::Io(err)),
+                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    if !validate {
+                        break;
+                    }
+                    if min_buf_len == STORE_META_OVERHEAD
+                        && reader.fill_buf().map_err(AppendVecError::Io)?.len()
+                            < APPEND_VEC_OFFSET_ALIGNMENT as usize
+                    {
+                        break;
+                    }
+                    return Err(AppendVecError::Io(err).into());
+                }
+                Err(err) => return Err(AppendVecError::Io(err).into()),
             };
 
             let (meta, next) = Self::get_type::<StoredMeta>(bytes, 0).unwrap();
+            if validate && bytes.0[next + offset_of!(AccountMeta, executable)] > 1 {
+                return Err(AppendVecError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid AppendVec executable flag",
+                ))
+                .into());
+            }
             let (account_meta, next) = Self::get_type::<AccountMeta>(bytes, next).unwrap();
             if account_meta.lamports == 0 && meta.pubkey == Pubkey::default() {
                 // we passed the last useful account
@@ -737,6 +781,13 @@ impl AppendVec {
             }
             let (_hash, next) = Self::get_type::<ObsoleteAccountHash>(bytes, next).unwrap();
             let data_len = meta.data_len as usize;
+            if validate && meta.data_len > MAX_PERMITTED_DATA_LENGTH {
+                return Err(AppendVecError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid AppendVec account data length",
+                ))
+                .into());
+            }
             let leftover = bytes.len() - next;
             if leftover >= data_len {
                 // we already read enough data to load this account
@@ -749,7 +800,7 @@ impl AppendVec {
                     offset,
                     stored_size,
                 };
-                callback(account);
+                callback(account)?;
                 reader.consume_or_skip(stored_size);
                 // restore default required buffer size
                 min_buf_len = STORE_META_OVERHEAD;
@@ -1096,6 +1147,8 @@ impl<W: io::Write> AppendVecAccountWriter<W> {
 mod tests {
     use {
         super::*,
+        crate::accounts_file,
+        agave_fs::file_io::write_buffer_to_file,
         assert_matches::assert_matches,
         rand::{prelude::*, rng},
         rand_chacha::ChaChaRng,
@@ -1109,6 +1162,42 @@ mod tests {
         tempfile::TempDir,
         test_case::test_case,
     };
+
+    #[test]
+    fn test_archive_scan_file_offsets_beyond_logical_limit() {
+        let dir = TempDir::new().unwrap();
+        let source_path = dir.path().join("source");
+        let source = AppendVec::new(&source_path, 16384);
+        let accounts = [(
+            Pubkey::new_unique(),
+            AccountSharedData::new(1, 8192, &Pubkey::new_unique()),
+        )];
+        source.append_accounts(&(0, accounts.as_slice())).unwrap();
+        let mut bytes = std::fs::read(&source_path).unwrap();
+        bytes.truncate(source.len());
+        let path = dir.path().join("oversized");
+        write_buffer_to_file(
+            &File::create(&path).unwrap(),
+            &bytes,
+            MAXIMUM_APPEND_VEC_FILE_SIZE,
+        )
+        .unwrap();
+        let file_info = FileInfo::new_from_path(&path).unwrap();
+        let mut reader = accounts_file::new_scan_accounts_reader();
+        reader.set_file(&file_info.file, file_info.size).unwrap();
+        reader.consume_or_skip(MAXIMUM_APPEND_VEC_FILE_SIZE as usize);
+        let mut count = 0;
+        AppendVec::scan_accounts_stored_meta_with(&mut reader, true, |account| -> Result<()> {
+            assert_eq!(account.offset(), MAXIMUM_APPEND_VEC_FILE_SIZE);
+            assert!(logical_offset_from_file(account.offset()).is_none());
+            assert_eq!(account.pubkey(), &accounts[0].0);
+            assert!(accounts_equal(&account, &accounts[0].1));
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 1);
+    }
 
     impl AppendVec {
         fn new_from_file(path: impl Into<PathBuf>, current_len: usize) -> Result<(Self, usize)> {

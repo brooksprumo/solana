@@ -1,3 +1,5 @@
+pub use crate::append_vec::MAXIMUM_APPEND_VEC_FILE_SIZE;
+
 use {
     crate::{
         account_info::Offset,
@@ -6,6 +8,7 @@ use {
         append_vec::{AppendVec, AppendVecError},
         split_file::{self, SplitFile, SplitFileError},
         storable_accounts::StorableAccounts,
+        utils::create_account_shared_data,
     },
     agave_fs::{
         FileInfo, FileSize,
@@ -14,7 +17,7 @@ use {
         },
         file_io::open_for_reading,
     },
-    solana_account::AccountSharedData,
+    solana_account::{AccountSharedData, ReadableAccount},
     solana_clock::Slot,
     solana_pubkey::Pubkey,
     solana_system_interface::MAX_PERMITTED_DATA_LENGTH,
@@ -78,6 +81,42 @@ impl AccountsFile {
     /// Opens split storage and its optional data file during startup.
     pub fn new_split_for_startup(meta: FileInfo, data: Option<FileInfo>) -> Result<Self> {
         Ok(Self::Split(SplitFile::open(meta, data)?))
+    }
+
+    /// Converts an archive AppendVec to Split without loading the entire storage into memory.
+    /// The source is removed only after the replacement has been written and opened read-only.
+    pub fn new_split_from_append_vec(file_info: FileInfo, slot: Slot) -> Result<Self> {
+        const BATCH_BYTES: usize = 8 * 1024 * 1024;
+        let split = SplitFile::new(&file_info.path)?;
+        let mut accounts = Vec::new();
+        let mut batch_bytes = 0;
+        AppendVec::scan_accounts_from_file(&file_info, |account| -> Result<()> {
+            batch_bytes += AppendVec::calculate_stored_size(account.data().len());
+            accounts.push((*account.pubkey(), create_account_shared_data(&account)));
+            if batch_bytes >= BATCH_BYTES {
+                split.write_accounts(&(slot, accounts.as_slice()))?;
+                accounts.clear();
+                batch_bytes = 0;
+            }
+            Ok(())
+        })?;
+        if !accounts.is_empty() {
+            split.write_accounts(&(slot, accounts.as_slice()))?;
+        }
+        let readonly = match split.reopen_as_readonly() {
+            Ok(Some(readonly)) => readonly,
+            Ok(None) => unreachable!("newly created Split is writable"),
+            Err(err) => {
+                // Reopening disables remove-on-drop before opening the replacement handles.
+                let _ = std::fs::remove_file(split.meta_path());
+                if let Some(path) = split.data_path() {
+                    let _ = std::fs::remove_file(path);
+                }
+                return Err(err.into());
+            }
+        };
+        std::fs::remove_file(&file_info.path)?;
+        Ok(Self::Split(readonly))
     }
 
     /// if storage is not readonly, reopen another instance that is read only
@@ -438,4 +477,72 @@ pub(crate) fn new_scan_accounts_reader<'a>() -> impl RequiredLenBufFileRead<'a> 
         MIN_CAPACITY,
         MAX_CAPACITY,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_split_conversion_failure_retains_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("123.456");
+        let source = AccountsFileProvider::AppendVec
+            .new_writable(&path, 10 * 1024 * 1024)
+            .unwrap();
+        let owner = Pubkey::new_unique();
+        let accounts = [
+            (
+                Pubkey::new_unique(),
+                AccountSharedData::new(1, 9 * 1024 * 1024, &owner),
+            ),
+            (
+                Pubkey::new_unique(),
+                AccountSharedData::new(2, 8192, &owner),
+            ),
+        ];
+        source.write_accounts(&(123, accounts.as_slice())).unwrap();
+        let len = source.len();
+        source.disable_remove_on_drop();
+        drop(source);
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len((len - 1) as u64)
+            .unwrap();
+        let original = std::fs::read(&path).unwrap();
+        assert!(
+            AccountsFile::new_split_from_append_vec(FileInfo::new_from_path(&path).unwrap(), 123)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(!path.with_extension("456.meta").exists());
+        assert!(!path.with_extension("456.data").exists());
+    }
+
+    #[test]
+    fn test_split_conversion_existing_data_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("123.456");
+        let source = AccountsFileProvider::AppendVec
+            .new_writable(&path, 16384)
+            .unwrap();
+        let accounts = [(
+            Pubkey::new_unique(),
+            AccountSharedData::new(1, 8192, &Pubkey::default()),
+        )];
+        source.write_accounts(&(123, accounts.as_slice())).unwrap();
+        source.disable_remove_on_drop();
+        drop(source);
+        let data_path = dir.path().join("123.456.data");
+        std::fs::write(&data_path, b"existing data").unwrap();
+        assert!(
+            AccountsFile::new_split_from_append_vec(FileInfo::new_from_path(&path).unwrap(), 123)
+                .is_err()
+        );
+        assert!(path.exists());
+        assert!(!dir.path().join("123.456.meta").exists());
+        assert_eq!(std::fs::read(data_path).unwrap(), b"existing data");
+    }
 }

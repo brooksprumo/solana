@@ -17,6 +17,7 @@ mod serde_snapshot_tests {
             },
             snapshot_bank_utils,
             snapshot_utils::{StorageAndNextAccountsFileId, create_tmp_accounts_dir_for_tests},
+            snapshot_utils::snapshot_storage_rebuilder::SnapshotStorageRebuilder,
         },
         agave_fs::{FileInfo, buffered_reader::FileBufRead as _, io_setup::IoSetupState},
         agave_snapshots::snapshot_config::SnapshotConfig,
@@ -34,8 +35,9 @@ mod serde_snapshot_tests {
                 ACCOUNTS_DB_CONFIG_FOR_TESTING, AccountsDb, AccountsDbConfig, AtomicAccountsFileId,
                 get_temp_accounts_paths,
             },
-            accounts_file::{AccountsFile, AccountsFileError},
+            accounts_file::{AccountsFile, AccountsFileError, AccountsFileProvider},
             ancestors::Ancestors,
+            append_vec::{AppendVec, MAXIMUM_APPEND_VEC_FILE_SIZE},
         },
         solana_clock::Slot,
         solana_epoch_schedule::EpochSchedule,
@@ -792,6 +794,204 @@ mod serde_snapshot_tests {
         let accounts_lt_hash_post =
             accounts.calculate_accounts_lt_hash_at_startup_from_index(&no_ancestors);
         assert_eq!(accounts_lt_hash_pre, accounts_lt_hash_post);
+    }
+
+    #[test_case(-1)]
+    #[test_case(0)]
+    #[test_case(1)]
+    fn test_reconstruct_archive_storage_conversion(threshold_delta: i64) {
+        let dir = TempDir::new().unwrap();
+        let slot = 123;
+        let id = 456;
+        let path = dir.path().join(AccountsFile::file_name(slot, id));
+        let owner = Pubkey::new_unique();
+        let updated = Pubkey::new_unique();
+        let deleted = Pubkey::new_unique();
+        let inline = Pubkey::new_unique();
+        let external = Pubkey::new_unique();
+        let accounts = [
+            (updated, AccountSharedData::new(1, 8192, &owner)),
+            (deleted, AccountSharedData::new(2, 165, &owner)),
+            (inline, AccountSharedData::new(3, 165, &owner)),
+            (external, AccountSharedData::new(4, 9 * 1024 * 1024, &owner)),
+            (updated, AccountSharedData::new(5, 16384, &owner)),
+            (deleted, AccountSharedData::default()),
+        ];
+        let size: usize = accounts[..4]
+            .iter()
+            .map(|(_, account)| AppendVec::calculate_stored_size(account.data().len()))
+            .sum();
+        let source = AccountsFileProvider::AppendVec
+            .new_writable(&path, size as u64)
+            .unwrap();
+        source.write_accounts(&(slot, &accounts[..4])).unwrap();
+        source.disable_remove_on_drop();
+        drop(source);
+        let file_info = FileInfo::new_from_path(&path).unwrap();
+        let threshold = (file_info.size as i64 + threshold_delta) as u64;
+        let storage =
+            SnapshotStorageRebuilder::reconstruct_archive_storage(slot, id, file_info, threshold).unwrap();
+        assert_eq!(
+            matches!(storage.accounts, AccountsFile::Split(_)),
+            threshold_delta < 0
+        );
+        assert_eq!(path.exists(), threshold_delta >= 0);
+        assert_eq!(storage.slot(), slot);
+        assert_eq!(storage.id(), id);
+
+        let newer_path = dir.path().join(AccountsFile::file_name(slot + 1, id + 1));
+        let newer = AccountsFileProvider::AppendVec
+            .new_writable(&newer_path, 32768)
+            .unwrap();
+        newer.write_accounts(&(slot + 1, &accounts[4..])).unwrap();
+        newer.disable_remove_on_drop();
+        drop(newer);
+        let newer = SnapshotStorageRebuilder::reconstruct_archive_storage(
+            slot + 1,
+            id + 1,
+            FileInfo::new_from_path(newer_path).unwrap(),
+            u64::MAX,
+        )
+        .unwrap();
+        let (_accounts_dir, paths) = get_temp_accounts_paths(1).unwrap();
+        let mut db = AccountsDb::new_for_tests_with_config(paths, ACCOUNTS_DB_CONFIG_FOR_TESTING);
+        let storages = AccountStorageMap::default();
+        storages.insert(slot, storage.clone());
+        storages.insert(slot + 1, newer.clone());
+        db.storage.initialize(storages);
+        let generated = db.generate_index(None, true);
+        assert_eq!(generated.calculated_capitalization, 12);
+        assert_eq!(storage.num_stored_bytes(), size as u64);
+        let db = Arc::new(db);
+        let loaded = Accounts::new(db.clone());
+        for index in [2, 3, 4] {
+            assert_eq!(
+                loaded.load_without_fixed_root(&Ancestors::default(), &accounts[index].0),
+                Some((
+                    accounts[index].1.clone(),
+                    if index == 4 { slot + 1 } else { slot }
+                )),
+            );
+        }
+        assert!(
+            loaded
+                .load_without_fixed_root(&Ancestors::default(), &deleted)
+                .is_none()
+        );
+
+        let inputs = [storage, newer];
+        let files = open_storage_files(inputs.iter().map(|storage| storage.as_ref()), false)
+            .collect::<io::Result<Vec<_>>>()
+            .unwrap();
+        let mut buf_reader =
+            storage_file_buf_reader(2 * 1024 * 1024, false, &IoSetupState::default()).unwrap();
+        let storages = AccountStorageMap::default();
+        for (storage, file) in inputs.iter().zip(files.iter()) {
+            if let Some(file) = file {
+                buf_reader
+                    .set_file(file.as_ref(), storage.accounts.len() as u64)
+                    .unwrap();
+            }
+            let reader = AccountStorageReader::new(
+                storage,
+                None,
+                TombstonesFilter::Include,
+                &mut buf_reader,
+            )
+            .unwrap();
+            let archive_path = dir.path().join(format!("archive-{}", storage.slot()));
+            reader
+                .write_to(&mut File::create(&archive_path).unwrap())
+                .unwrap();
+            let restored = SnapshotStorageRebuilder::reconstruct_archive_storage(
+                storage.slot(),
+                storage.id(),
+                FileInfo::new_from_path(archive_path).unwrap(),
+                u64::MAX,
+            )
+            .unwrap();
+            assert!(matches!(restored.accounts, AccountsFile::AppendVec(_)));
+            storages.insert(restored.slot(), restored);
+        }
+        let (_restored_dir, paths) = get_temp_accounts_paths(1).unwrap();
+        let mut restored_db =
+            AccountsDb::new_for_tests_with_config(paths, ACCOUNTS_DB_CONFIG_FOR_TESTING);
+        restored_db.storage.initialize(storages);
+        let regenerated = restored_db.generate_index(None, true);
+        assert_eq!(
+            regenerated.calculated_capitalization,
+            generated.calculated_capitalization
+        );
+        assert_eq!(
+            regenerated.calculated_accounts_lt_hash,
+            generated.calculated_accounts_lt_hash
+        );
+        let restored_accounts = Accounts::new(Arc::new(restored_db));
+        assert!(
+            restored_accounts
+                .load_without_fixed_root(&Ancestors::default(), &deleted)
+                .is_none()
+        );
+    }
+
+    #[test_case(MAXIMUM_APPEND_VEC_FILE_SIZE, false)]
+    #[test_case(MAXIMUM_APPEND_VEC_FILE_SIZE + 1, true)]
+    fn test_reconstruct_oversized_archive_storage(size: u64, converted: bool) {
+        let dir = TempDir::new().unwrap();
+        let slot = 123;
+        let id = 456;
+        let path = dir.path().join(AccountsFile::file_name(slot, id));
+        let source = AccountsFileProvider::AppendVec
+            .new_writable(&path, 16384)
+            .unwrap();
+        let accounts = [(
+            Pubkey::new_unique(),
+            AccountSharedData::new(1, 8192, &Pubkey::new_unique()),
+        )];
+        source.write_accounts(&(slot, accounts.as_slice())).unwrap();
+        source.disable_remove_on_drop();
+        drop(source);
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(size)
+            .unwrap();
+        if converted {
+            assert!(
+                AccountsFile::new_for_startup(
+                    FileInfo::new_from_path(&path).unwrap(),
+                )
+                .is_err()
+            );
+            assert!(path.exists());
+        }
+        let storages = SnapshotStorageRebuilder::rebuild_storages_from_snapshot_archive(
+            [FileInfo::new_from_path(&path).unwrap()],
+            Arc::new(AtomicAccountsFileId::new(id + 1)),
+        )
+        .unwrap();
+        let storage = storages.get(&slot).unwrap();
+        assert_eq!(storage.id(), id + 1);
+        assert_eq!(
+            matches!(storage.accounts, AccountsFile::Split(_)),
+            converted
+        );
+        let mut found = Vec::new();
+        storage
+            .accounts
+            .scan_accounts_without_data(|offset, _| found.push(offset))
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            storage
+                .accounts
+                .get_stored_account_callback(found[0], |account| {
+                    solana_accounts_db::utils::create_account_shared_data(&account)
+                })
+                .unwrap(),
+            accounts[0].1
+        );
     }
 
     // no remap needed
