@@ -216,3 +216,228 @@ pub(crate) fn get_slot_and_append_vec_id(filename: &str) -> Result<(Slot, usize)
     slot.zip(id)
         .ok_or_else(|| SnapshotError::InvalidAppendVecPath(PathBuf::from(filename)))
 }
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        crate::serde_snapshot::SerdeObsoleteAccountsMap,
+        solana_account::AccountSharedData,
+        solana_accounts_db::{
+            ObsoleteAccountItem, ObsoleteAccounts,
+            account_storage_entry::AccountStorageEntry,
+            accounts_file::{AccountsFile, AccountsFileProvider},
+        },
+        solana_pubkey::Pubkey,
+        test_case::test_case,
+    };
+
+    #[test]
+    fn test_get_slot_and_append_vec_id() {
+        let expected_slot = 12345;
+        let expected_id = 9987;
+        let (slot, id) =
+            get_slot_and_append_vec_id(&AccountsFile::file_name(expected_slot, expected_id))
+                .unwrap();
+        assert_eq!(expected_slot, slot);
+        assert_eq!(expected_id as usize, id);
+        for suffix in ["meta", "data"] {
+            assert_eq!(
+                get_slot_and_append_vec_id(&format!("{expected_slot}.{expected_id}.{suffix}")).unwrap(),
+                (expected_slot, expected_id as usize),
+            );
+        }
+        assert!(get_slot_and_append_vec_id("12345.9987.other").is_err());
+    }
+
+    #[test_case(false)]
+    #[test_case(true)]
+    fn test_rebuild_mixed_storages(data_first: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = 123;
+        let id = 456;
+        let split = AccountsFileProvider::Split.new_writable(
+            dir.path().join(AccountsFile::file_name(slot, id)), 0,
+        ).unwrap();
+        let owner = Pubkey::new_unique();
+        let accounts = vec![
+            (Pubkey::new_unique(), AccountSharedData::new(1, 165, &owner)),
+            (Pubkey::new_unique(), AccountSharedData::new(2, 8192, &owner)),
+        ];
+        let offsets = split.write_accounts(&(slot, accounts.as_slice())).unwrap().offsets;
+        split.disable_remove_on_drop();
+        split.flush().unwrap();
+        let obsolete = ObsoleteAccounts {
+            accounts: vec![ObsoleteAccountItem {
+                offset: offsets[1],
+                data_len: 8192,
+                slot: slot + 1,
+            }],
+        };
+        let append_vec = Arc::new(AccountStorageEntry::new(
+            dir.path(), slot + 1, id + 1, 16384, AccountsFileProvider::AppendVec,
+        ));
+        append_vec.accounts.write_accounts(&(slot + 1, accounts.as_slice())).unwrap();
+        append_vec.flush().unwrap();
+        let av = FileInfo::new_from_path(append_vec.path()).unwrap();
+        let split = Arc::new(AccountStorageEntry::new_existing(
+            slot, id, split, obsolete,
+        ));
+        let manifest = crate::serde_snapshot::StoragesList::new_from_storages(
+            &[split.clone(), append_vec.clone()],
+        ).into_map();
+        let obsolete_accounts = SerdeObsoleteAccountsMap::new_from_storages(
+            &[split.clone(), append_vec.clone()], slot + 1,
+        );
+        let meta = FileInfo::new_from_path(split.path()).unwrap();
+        let data = FileInfo::new_from_path(dir.path().join(format!("{slot}.{id}.data"))).unwrap();
+        split.disable_remove_on_drop();
+        append_vec.disable_remove_on_drop();
+        drop(split);
+        drop(append_vec);
+        let files = if data_first { vec![data, av, meta] } else { vec![meta, av, data] };
+        let next_id = Arc::new(AtomicAccountsFileId::new(0));
+        let storages = SnapshotStorageRebuilder::rebuild_storages_from_local_state(
+            files, next_id.clone(), obsolete_accounts.into_hashmap(), manifest,
+        ).unwrap();
+        assert_eq!(storages.len(), 2);
+        assert_eq!(next_id.load(Ordering::Relaxed), id + 2);
+        let storage = storages.get(&slot).unwrap();
+        assert!(matches!(storage.accounts, AccountsFile::Split(_)));
+        for (offset, (_, account)) in offsets.iter().zip(&accounts) {
+            let loaded = storage.accounts.get_stored_account_callback(*offset, |stored| {
+                solana_accounts_db::utils::create_account_shared_data(&stored)
+            }).unwrap();
+            assert_eq!(&loaded, account);
+        }
+        let obsolete = storage.obsolete_accounts_for_snapshots(slot + 1);
+        assert_eq!(obsolete.accounts.len(), 1);
+        assert_eq!(obsolete.accounts[0].offset, offsets[1]);
+        assert_eq!(obsolete.accounts[0].data_len, 8192);
+        assert!(matches!(storages.get(&(slot + 1)).unwrap().accounts, AccountsFile::AppendVec(_)));
+    }
+
+    #[test_case("meta")]
+    #[test_case("data")]
+    fn test_archive_rejects_split_files(suffix: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("123.456.{suffix}"));
+        std::fs::write(&path, b"not an AppendVec").unwrap();
+        let result = SnapshotStorageRebuilder::rebuild_storages_from_snapshot_archive(
+            [FileInfo::new_from_path(path).unwrap()],
+            Arc::new(AtomicAccountsFileId::new(0)),
+        );
+        assert!(matches!(result, Err(SnapshotError::RebuildStorages(message))
+            if message == "snapshot archives must contain AppendVec storages"));
+    }
+
+    #[test]
+    fn test_rebuild_split_missing_meta_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let split = AccountsFileProvider::Split.new_writable(dir.path().join("123.456"), 0).unwrap();
+        let accounts = [(Pubkey::new_unique(), AccountSharedData::new(1, 8192, &Pubkey::default()))];
+        split.write_accounts(&(123, accounts.as_slice())).unwrap();
+        split.disable_remove_on_drop();
+        split.flush().unwrap();
+        let file = FileInfo::new_from_path(dir.path().join("123.456.data")).unwrap();
+        let result = SnapshotStorageRebuilder::rebuild_storages_from_local_state(
+            [file], Arc::new(AtomicAccountsFileId::new(0)), HashMap::new(),
+            HashMap::from([((123, 456), StorageListItem::Split {
+                slot: 123, id: 456, has_data_file: true,
+            })]),
+        );
+        assert!(matches!(result, Err(SnapshotError::RebuildStorages(message))
+            if message.contains("missing matching split storage file")));
+    }
+
+    #[test]
+    fn test_rebuild_split_without_data_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("123.456");
+        let split = AccountsFileProvider::Split.new_writable(&path, 0).unwrap();
+        let accounts = [(Pubkey::new_unique(), AccountSharedData::new(1, 165, &Pubkey::default()))];
+        let offsets = split.write_accounts(&(123, accounts.as_slice())).unwrap().offsets;
+        split.disable_remove_on_drop();
+        split.flush().unwrap();
+        let file = FileInfo::new_from_path(split.path()).unwrap();
+        drop(split);
+        assert!(!dir.path().join("123.456.data").exists());
+        let next_id = Arc::new(AtomicAccountsFileId::new(0));
+        let storages = SnapshotStorageRebuilder::rebuild_storages_from_local_state(
+            [file], next_id.clone(), HashMap::new(),
+            HashMap::from([((123, 456), StorageListItem::Split {
+                slot: 123, id: 456, has_data_file: false,
+            })]),
+        ).unwrap();
+        assert_eq!(next_id.load(Ordering::Relaxed), 457);
+        let storage = storages.get(&123).unwrap();
+        let loaded = storage.accounts.get_stored_account_callback(offsets[0], |account| {
+            solana_accounts_db::utils::create_account_shared_data(&account)
+        }).unwrap();
+        assert_eq!(loaded, accounts[0].1);
+    }
+
+    #[test_case(AccountsFileProvider::AppendVec)]
+    #[test_case(AccountsFileProvider::Split)]
+    fn test_rebuild_local_state_checks_obsolete_id_before_opening(provider: AccountsFileProvider) {
+        let dir = tempfile::tempdir().unwrap();
+        let (name, item) = match provider {
+            AccountsFileProvider::AppendVec => (
+                "123.456", StorageListItem::AppendVec { slot: 123, id: 456 },
+            ),
+            AccountsFileProvider::Split => (
+                "123.456.meta", StorageListItem::Split { slot: 123, id: 456, has_data_file: false },
+            ),
+        };
+        let path = dir.path().join(name);
+        std::fs::write(&path, b"invalid storage; must validate obsolete ID before opening").unwrap();
+        let result = SnapshotStorageRebuilder::rebuild_storages_from_local_state(
+            [FileInfo::new_from_path(path).unwrap()],
+            Arc::new(AtomicAccountsFileId::new(0)),
+            HashMap::from([(123, SerdeObsoleteAccounts { id: 457, bytes: 0, accounts: vec![] })]),
+            HashMap::from([((123, 456), item)]),
+        );
+        assert!(matches!(result, Err(SnapshotError::MismatchedAccountsFileId(456, 457))));
+    }
+
+    #[test]
+    fn test_manifest_requires_data_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let split = AccountsFileProvider::Split.new_writable(dir.path().join("123.456"), 0).unwrap();
+        let meta = FileInfo::new_from_path(split.path()).unwrap();
+        let result = SnapshotStorageRebuilder::rebuild_storages_from_local_state(
+            [meta], Arc::new(AtomicAccountsFileId::new(0)), HashMap::new(),
+            HashMap::from([((123, 456), StorageListItem::Split {
+                slot: 123, id: 456, has_data_file: true,
+            })]),
+        );
+        assert!(matches!(result, Err(SnapshotError::RebuildStorages(message))
+            if message.contains("missing matching split storage file")));
+    }
+
+    #[test]
+    fn test_manifest_requires_missing_storage() {
+        let result = SnapshotStorageRebuilder::rebuild_storages_from_local_state(
+            [], Arc::new(AtomicAccountsFileId::new(0)), HashMap::new(),
+            HashMap::from([((123, 456), StorageListItem::AppendVec { slot: 123, id: 456 })]),
+        );
+        assert!(matches!(result, Err(SnapshotError::RebuildStorages(message))
+            if message.contains("missing storage files for slot 123, id 456")));
+    }
+
+    #[test]
+    fn test_manifest_does_not_infer_data_file_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let split = AccountsFileProvider::Split.new_writable(dir.path().join("123.456"), 0).unwrap();
+        std::fs::write(dir.path().join("123.456.data"), b"not a data file").unwrap();
+        let meta = FileInfo::new_from_path(split.path()).unwrap();
+        let manifest = HashMap::from([((123, 456), StorageListItem::Split {
+            slot: 123, id: 456, has_data_file: false,
+        })]);
+        let storages = SnapshotStorageRebuilder::rebuild_storages_from_local_state(
+            [meta], Arc::new(AtomicAccountsFileId::new(0)), HashMap::new(), manifest,
+        ).unwrap();
+        assert!(matches!(&storages.get(&123).unwrap().accounts, AccountsFile::Split(file)
+            if file.data_file().is_none()));
+    }
+}
