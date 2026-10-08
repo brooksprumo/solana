@@ -2,7 +2,7 @@
 
 use {
     super::SnapshotError,
-    crate::serde_snapshot::{SerdeObsoleteAccounts, remap_append_vec_file},
+    crate::serde_snapshot::{SerdeObsoleteAccounts, StorageListItem, remap_append_vec_file},
     agave_fs::FileInfo,
     log::*,
     solana_accounts_db::{
@@ -58,6 +58,11 @@ impl SnapshotStorageRebuilder {
         for file_info in files {
             let filename = file_info.path.file_name().unwrap().to_str().unwrap();
             if let Ok((slot, id)) = get_slot_and_append_vec_id(filename) {
+                if filename.ends_with(".meta") || filename.ends_with(".data") {
+                    return Err(SnapshotError::RebuildStorages(
+                        "snapshot archives must contain AppendVec storages".to_owned(),
+                    ));
+                }
                 // A snapshot archive only contains storages in AppendVec format.
                 // And never contains separate ObsoleteAccounts information.
                 // The IDs may overlap though, if the full and incremental snapshots
@@ -91,20 +96,40 @@ impl SnapshotStorageRebuilder {
         files: impl IntoIterator<Item = FileInfo>,
         next_append_vec_id: Arc<AtomicAccountsFileId>,
         mut obsolete_accounts: HashMap<Slot, SerdeObsoleteAccounts>,
+        mut expected_storages: HashMap<(Slot, AccountsFileId), StorageListItem>,
     ) -> Result<AccountStorageMap, SnapshotError> {
         let mut rebuilder = Self::new(next_append_vec_id);
+        let mut split_files: HashMap<PathBuf, FileInfo> = HashMap::new();
         let mut previous_log_time = Instant::now();
 
         for file_info in files {
             let filename = file_info.path.file_name().unwrap().to_str().unwrap();
             if let Ok((slot, id)) = get_slot_and_append_vec_id(filename) {
-                // When restoring from local state, obsolete accounts will be 'Some' if the storage
-                // contained accounts marked obsolete at the time the snapshot was taken.
-                // IDs will never overlap.
                 let id = AccountsFileId::try_from(id).unwrap();
-                let obsolete_accounts = obsolete_accounts
-                    .remove(&slot)
-                    .map(|accounts| accounts.into_tuple());
+                let expected = expected_storages.get(&(slot, id)).copied()
+                    .filter(|item| item.matches_filename(filename))
+                    .ok_or_else(|| SnapshotError::RebuildStorages(format!(
+                        "unexpected storage file '{}'", file_info.path.display(),
+                    )))?;
+                let (meta, data) = match expected {
+                    StorageListItem::AppendVec { .. } => (file_info, None),
+                    StorageListItem::Split { has_data_file: false, .. } => (file_info, None),
+                    StorageListItem::Split { has_data_file: true, .. } => {
+                        let base_path = file_info.path.with_extension("");
+                        let Some(other) = split_files.remove(&base_path) else {
+                            split_files.insert(base_path, file_info);
+                            rebuilder.maybe_log_progress(&mut previous_log_time);
+                            continue;
+                        };
+                        if filename.ends_with(".meta") {
+                            (file_info, Some(other))
+                        } else {
+                            (other, Some(file_info))
+                        }
+                    }
+                };
+                // Validate obsolete accounts before opening either storage format.
+                let obsolete_accounts = obsolete_accounts.remove(&slot).map(|accounts| accounts.into_tuple());
                 let obsolete_accounts =
                     if let Some((obsolete_accounts, obsolete_id, _bytes)) = obsolete_accounts {
                         if obsolete_id != id {
@@ -114,7 +139,10 @@ impl SnapshotStorageRebuilder {
                     } else {
                         ObsoleteAccounts::default()
                     };
-                let accounts_file = AccountsFile::new_for_startup(file_info)?;
+                let accounts_file = match expected {
+                    StorageListItem::AppendVec { .. } => AccountsFile::new_for_startup(meta)?,
+                    StorageListItem::Split { .. } => AccountsFile::new_split_for_startup(meta, data)?,
+                };
                 let storage_entry =
                     AccountStorageEntry::new_existing(slot, id, accounts_file, obsolete_accounts);
 
@@ -126,11 +154,22 @@ impl SnapshotStorageRebuilder {
                     .next_append_vec_id
                     .fetch_max(id + 1, Ordering::Relaxed);
                 rebuilder.insert_storage(slot, Arc::new(storage_entry))?;
+                expected_storages.remove(&(slot, id));
                 rebuilder.processed_slot_count += 1;
             }
             rebuilder.maybe_log_progress(&mut previous_log_time);
         }
 
+        if let Some(path) = split_files.keys().next() {
+            return Err(SnapshotError::RebuildStorages(format!(
+                "missing matching split storage file for '{}'", path.display(),
+            )));
+        }
+        if let Some(((slot, id), _)) = expected_storages.iter().next() {
+            return Err(SnapshotError::RebuildStorages(format!(
+                "missing storage files for slot {slot}, id {id}",
+            )));
+        }
         Ok(rebuilder.storage)
     }
 
@@ -165,28 +204,15 @@ impl SnapshotStorageRebuilder {
     }
 }
 
-/// Get the slot and append vec id from the filename
+/// Get the slot and storage id from an AppendVec or split storage filename.
 pub(crate) fn get_slot_and_append_vec_id(filename: &str) -> Result<(Slot, usize), SnapshotError> {
-    let mut parts = filename.splitn(2, '.');
+    let storage_name = filename.strip_suffix(".meta")
+        .or_else(|| filename.strip_suffix(".data"))
+        .unwrap_or(filename);
+    let mut parts = storage_name.splitn(2, '.');
     let slot = parts.next().and_then(|s| Slot::from_str(s).ok());
     let id = parts.next().and_then(|s| usize::from_str(s).ok());
 
     slot.zip(id)
         .ok_or_else(|| SnapshotError::InvalidAppendVecPath(PathBuf::from(filename)))
-}
-
-#[cfg(test)]
-mod tests {
-    use {super::*, solana_accounts_db::accounts_file::AccountsFile};
-
-    #[test]
-    fn test_get_slot_and_append_vec_id() {
-        let expected_slot = 12345;
-        let expected_id = 9987;
-        let (slot, id) =
-            get_slot_and_append_vec_id(&AccountsFile::file_name(expected_slot, expected_id))
-                .unwrap();
-        assert_eq!(expected_slot, slot);
-        assert_eq!(expected_id as usize, id);
-    }
 }

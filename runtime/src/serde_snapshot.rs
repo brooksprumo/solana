@@ -72,17 +72,17 @@ mod tests;
 mod types;
 
 pub use startup_hints::StartupHints;
+#[cfg(test)]
+pub(crate) use storages_list::LegacyStorageListItem;
 #[cfg(feature = "dev-context-only-utils")]
 pub use status_cache::serialize_status_cache_into;
-#[cfg(test)]
-pub(crate) use storages_list::StorageListItem;
 pub(crate) use {
     obsolete_accounts::{
         LegacyObsoleteAccountsMap, SerdeObsoleteAccounts, SerdeObsoleteAccountsMap,
     },
     status_cache::{deserialize_status_cache, serialize_status_cache},
     storage::{SerializableAccountStorageEntry, SerializedAccountsFileId},
-    storages_list::StoragesList,
+    storages_list::{LegacyStoragesList, StorageListItem, StoragesList},
 };
 
 const MAX_STREAM_SIZE: usize = 32 * 1024 * 1024 * 1024;

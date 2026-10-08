@@ -74,6 +74,12 @@ impl AccountsFile {
         Ok(Self::AppendVec(av))
     }
 
+    // brooks TODO: FIXME: remove?
+    /// Opens split storage and its optional data file during startup.
+    pub fn new_split_for_startup(meta: FileInfo, data: Option<FileInfo>) -> Result<Self> {
+        Ok(Self::Split(SplitFile::open(meta, data)?))
+    }
+
     /// if storage is not readonly, reopen another instance that is read only
     pub(crate) fn reopen_as_readonly(&self) -> Result<Option<Self>> {
         Ok(match self {
