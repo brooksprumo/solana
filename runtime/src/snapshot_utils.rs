@@ -6,7 +6,7 @@ use {
         serde_snapshot::{
             self, AccountsDbFields, ExtraFieldsToSerialize, LegacyObsoleteAccountsMap,
             SerdeObsoleteAccountsMap, SnapshotAccountsDbFields, SnapshotBankFields,
-            SnapshotStreams, StartupHints, StoragesList,
+            SnapshotStreams, StartupHints, StoragesList, LegacyStoragesList, StorageListItem,
         },
         snapshot_package::BankSnapshotPackage,
         snapshot_utils::snapshot_storage_rebuilder::{
@@ -93,7 +93,9 @@ const AUX_SNAPSHOT_FILE_READ_BUF_SIZE: usize = 4 * 1024 * 1024;
 //         direction between 3.0.0 and 3.1.0; a validator finding no hints just skips the tuning.
 // 4.0.0 - Obsolete accounts store u32 logical offsets instead of u64 AppendVec file offsets.
 //         Version 3 is converted in memory when loading; older validators cannot load v4.
-const SNAPSHOT_FASTBOOT_VERSION: Version = Version::new(4, 0, 0);
+// 5.0.0 - Storages list identifies AppendVec or Split and whether a data file is required.
+//         Older validators cannot load split storages.
+const SNAPSHOT_FASTBOOT_VERSION: Version = Version::new(5, 0, 0);
 
 /// Information about a bank snapshot. Namely the slot of the bank, the path to the snapshot, and
 /// the kind of the snapshot.
@@ -359,6 +361,7 @@ fn is_snapshot_fastboot_compatible(
     version: &Version,
 ) -> std::result::Result<bool, SnapshotFastbootError> {
     match version.major {
+        5 => Ok(true),
         4 => Ok(true),
         3 => Ok(true),
         v if v > SNAPSHOT_FASTBOOT_VERSION.major => {
@@ -791,6 +794,8 @@ fn serialize_storages_list_to_snapshot(
 fn deserialize_storages_list(
     storages_list_path: &Path,
     maximum_storages_list_file_size: u64,
+    fastboot_version: &Version,
+    account_paths: &[PathBuf],
 ) -> Result<StoragesList> {
     let storages_list_reader = ReadAdapter::new(large_file_buf_reader(
         storages_list_path,
@@ -809,9 +814,13 @@ fn deserialize_storages_list(
         return Err(IoError::other(error_message).into());
     }
 
-    Ok(serde_snapshot::deserialize_wincode_from(
-        storages_list_reader,
-    )?)
+    if fastboot_version.major >= 5 {
+        Ok(serde_snapshot::deserialize_wincode_from(storages_list_reader)?)
+    } else {
+        let legacy: LegacyStoragesList =
+            serde_snapshot::deserialize_wincode_from(storages_list_reader)?;
+        Ok(legacy.into_current(account_paths)?)
+    }
 }
 
 pub fn write_startup_hints_to_snapshot(
@@ -1374,11 +1383,13 @@ fn spawn_streaming_snapshot_dir_files(
     (file_receiver, handle)
 }
 
-/// Removes storage files from `account_paths` whose `(slot, id)` pair isn't listed in the
-/// storages list (i.e. they don't belong to the snapshot being loaded). Files whose names
-/// don't parse as `<slot>.<id>` storage filenames are left alone.
-fn prune_stale_storages(account_paths: &[PathBuf], storages_list: StoragesList) -> Result<()> {
-    let expected_storages = storages_list.into_slot_file_id_set();
+/// Removes storage files from `account_paths` not required by the storages list, including
+/// unexpected formats or data files for otherwise listed `(slot, id)` pairs. Files whose names
+/// don't parse as `<slot>.<id>[.meta|.data]` storage filenames are left alone.
+fn prune_stale_storages(
+    account_paths: &[PathBuf],
+    expected_storages: &HashMap<(Slot, AccountsFileId), StorageListItem>,
+) -> Result<()> {
     for account_path in account_paths {
         let read_dir = fs::read_dir(account_path).map_err(|err| {
             IoError::other(format!(
@@ -1395,7 +1406,8 @@ fn prune_stale_storages(account_paths: &[PathBuf], storages_list: StoragesList) 
                 // Not a storage file name — leave it alone.
                 continue;
             };
-            if !expected_storages.contains(&(slot, id as AccountsFileId)) {
+            if !expected_storages.get(&(slot, id as AccountsFileId))
+                .is_some_and(|item| item.matches_filename(name)) {
                 info!(
                     "Removing stale storage file '{}' not in storages list",
                     path.display(),
@@ -1447,8 +1459,12 @@ pub(crate) fn rebuild_storages_from_snapshot_dir(
     let storages_list_path =
         bank_snapshot_dir.join(snapshot_paths::SNAPSHOT_STORAGES_LIST_FILENAME);
     let storages_list =
-        deserialize_storages_list(&storages_list_path, MAX_STORAGES_LIST_FILE_SIZE)?;
-    prune_stale_storages(account_paths, storages_list)?;
+        deserialize_storages_list(
+            &storages_list_path, MAX_STORAGES_LIST_FILE_SIZE,
+            snapshot_info.fastboot_version.as_ref().expect("fastboot requires a version"),
+            account_paths,
+        )?.into_map();
+    prune_stale_storages(account_paths, &storages_list)?;
 
     let snapshot_file_path = snapshot_info.snapshot_path();
     let snapshot_version_path = bank_snapshot_dir.join(snapshot_paths::SNAPSHOT_VERSION_FILENAME);
@@ -1471,6 +1487,7 @@ pub(crate) fn rebuild_storages_from_snapshot_dir(
                 obsolete_accounts
                     .map(|accounts| accounts.into_hashmap())
                     .unwrap_or_default(),
+                storages_list,
             )?;
             Ok((storage, bank_fields, accounts_db_fields))
         },
@@ -2810,12 +2827,12 @@ mod tests {
         }
 
         let storages_list = StoragesList::from_items(vec![
-            StorageListItem { slot: 100, id: 1 },
-            StorageListItem { slot: 200, id: 2 },
+            StorageListItem::AppendVec { slot: 100, id: 1 },
+            StorageListItem::AppendVec { slot: 200, id: 2 },
         ]);
         prune_stale_storages(
             std::slice::from_ref(&account_path.path().to_path_buf()),
-            storages_list,
+            &storages_list.into_map(),
         )
         .unwrap();
 
