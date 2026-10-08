@@ -146,7 +146,13 @@ pub fn create_meta_file(
 ) -> Result<(PathBuf, File, usize), SplitFileError> {
     let meta_path = meta_path_from_base(&base_path);
     let mut meta_file = utils::create_new_file(&meta_path)?;
-    let header_size = write_meta_header(&mut meta_file, uid)?;
+    let header_size = match write_meta_header(&mut meta_file, uid) {
+        Ok(size) => size,
+        Err(err) => {
+            let _ = std::fs::remove_file(&meta_path);
+            return Err(err.into());
+        }
+    };
     Ok((meta_path, meta_file, header_size))
 }
 
