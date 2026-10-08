@@ -143,17 +143,24 @@ mod tests {
     };
 
     #[test]
+    fn test_storage_list_item_size() {
+        assert_eq!(std::mem::size_of::<StorageListItem>(), 16);
+    }
+
+    #[test]
     fn test_roundtrip_storages_list() {
         let list = StoragesList {
             list: vec![
                 StorageListItem::AppendVec { slot: 7, id: 42 },
-                StorageListItem::AppendVec {
+                StorageListItem::Split {
                     slot: 11,
                     id: 13,
+                    has_data_file: false,
                 },
-                StorageListItem::AppendVec {
+                StorageListItem::Split {
                     slot: Slot::MAX,
                     id: AccountsFileId::MAX,
+                    has_data_file: true,
                 },
             ],
         };
@@ -164,5 +171,34 @@ mod tests {
 
         let decoded: StoragesList = deserialize_wincode_from(Cursor::new(&buf)).unwrap();
         assert_eq!(decoded.list, expected);
+    }
+
+    #[test]
+    fn test_legacy_storages_list_encoding() {
+        // The original encoding is a Vec of a u64 slot followed by a u32 ID.
+        let mut bytes = Vec::new();
+        serialize_into(Cursor::new(&mut bytes), &vec![(7_u64, 42_u32), (11, 13)]).unwrap();
+        let legacy: LegacyStoragesList = deserialize_wincode_from(Cursor::new(&bytes)).unwrap();
+        assert_eq!(legacy.list.len(), 2);
+        assert_eq!((legacy.list[0].slot, legacy.list[0].id), (7, 42));
+        assert_eq!((legacy.list[1].slot, legacy.list[1].id), (11, 13));
+        let mut roundtrip = Vec::new();
+        serialize_into(Cursor::new(&mut roundtrip), &legacy).unwrap();
+        assert_eq!(roundtrip, bytes);
+    }
+
+    #[test]
+    fn test_legacy_storages_list_missing_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = LegacyStoragesList {
+            list: vec![LegacyStorageListItem { slot: 7, id: 42 }],
+        };
+        assert_eq!(
+            legacy
+                .into_current(&[dir.path().to_path_buf()])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
     }
 }

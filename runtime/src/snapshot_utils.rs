@@ -1819,8 +1819,10 @@ mod tests {
             },
         },
         assert_matches::assert_matches,
+        solana_account::AccountSharedData,
         solana_accounts_db::accounts_file::{AccountsFile, AccountsFileProvider},
         solana_hash::Hash,
+        solana_pubkey::Pubkey,
         std::{convert::TryFrom, mem::size_of},
         tempfile::NamedTempFile,
         test_case::test_case,
@@ -2817,18 +2819,25 @@ mod tests {
         let account_path = tempfile::TempDir::new().unwrap();
         // Files that belong to the snapshot.
         let keep_a = account_path.path().join(AccountsFile::file_name(100, 1));
-        let keep_b = account_path.path().join(AccountsFile::file_name(200, 2));
+        let keep_b = account_path.path().join("200.2.meta");
+        let keep_meta = account_path.path().join("201.3.meta");
+        let keep_data = account_path.path().join("201.3.data");
+        let unexpected_data = account_path.path().join("200.2.data");
+        let unexpected_append_vec = account_path.path().join("200.2");
+        let unexpected_meta = account_path.path().join("100.1.meta");
         // A stale storage file that should be removed.
         let stale = account_path.path().join(AccountsFile::file_name(300, 3));
         // A non-storage filename — should be left alone.
         let untouched = account_path.path().join("something_else.txt");
-        for path in [&keep_a, &keep_b, &stale, &untouched] {
+        for path in [&keep_a, &keep_b, &keep_meta, &keep_data, &unexpected_data,
+            &unexpected_append_vec, &unexpected_meta, &stale, &untouched] {
             fs::write(path, b"x").unwrap();
         }
 
         let storages_list = StoragesList::from_items(vec![
             StorageListItem::AppendVec { slot: 100, id: 1 },
-            StorageListItem::AppendVec { slot: 200, id: 2 },
+            StorageListItem::Split { slot: 200, id: 2, has_data_file: false },
+            StorageListItem::Split { slot: 201, id: 3, has_data_file: true },
         ]);
         prune_stale_storages(
             std::slice::from_ref(&account_path.path().to_path_buf()),
@@ -2838,7 +2847,53 @@ mod tests {
 
         assert!(keep_a.exists(), "expected storage file was deleted");
         assert!(keep_b.exists(), "expected storage file was deleted");
+        assert!(keep_meta.exists());
+        assert!(keep_data.exists());
+        assert!(!unexpected_data.exists());
+        assert!(!unexpected_append_vec.exists());
+        assert!(!unexpected_meta.exists());
         assert!(!stale.exists(), "stale storage file was not removed");
         assert!(untouched.exists(), "non-storage file was wrongly removed");
+    }
+
+    #[test_case(4, AccountsFileProvider::AppendVec, false)]
+    #[test_case(4, AccountsFileProvider::Split, false)]
+    #[test_case(4, AccountsFileProvider::Split, true)]
+    #[test_case(5, AccountsFileProvider::AppendVec, false)]
+    #[test_case(5, AccountsFileProvider::Split, false)]
+    #[test_case(5, AccountsFileProvider::Split, true)]
+    fn test_deserialize_storages_list_by_version(
+        major: u64, provider: AccountsFileProvider, external_data: bool,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(AccountStorageEntry::new(dir.path(), 123, 456, 16384, provider));
+        let accounts = [(Pubkey::new_unique(), AccountSharedData::new(
+            1, if external_data { 8192 } else { 165 }, &Pubkey::default(),
+        ))];
+        storage.accounts.write_accounts(&(123, accounts.as_slice())).unwrap();
+        let path = dir.path().join(snapshot_paths::SNAPSHOT_STORAGES_LIST_FILENAME);
+        if major == 4 {
+            let legacy = LegacyStoragesList {
+                list: vec![crate::serde_snapshot::LegacyStorageListItem { slot: 123, id: 456 }],
+            };
+            serialize_into(fs::File::create(&path).unwrap(), &legacy).unwrap();
+        } else {
+            serialize_storages_list_to_snapshot(
+                dir.path(), StoragesList::new_from_storages(std::slice::from_ref(&storage)), &IoSetupState::default(),
+            ).unwrap();
+        }
+        let before = fs::read(&path).unwrap();
+        let restored = deserialize_storages_list(
+            &path, MAX_STORAGES_LIST_FILE_SIZE, &Version::new(major, 0, 0),
+            &[dir.path().to_path_buf()],
+        ).unwrap().into_map();
+        let expected = match provider {
+            AccountsFileProvider::AppendVec => StorageListItem::AppendVec { slot: 123, id: 456 },
+            AccountsFileProvider::Split => StorageListItem::Split {
+                slot: 123, id: 456, has_data_file: external_data,
+            },
+        };
+        assert_eq!(restored, HashMap::from([((123, 456), expected)]));
+        assert_eq!(fs::read(&path).unwrap(), before);
     }
 }
