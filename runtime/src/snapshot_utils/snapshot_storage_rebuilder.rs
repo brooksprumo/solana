@@ -69,7 +69,7 @@ impl SnapshotStorageRebuilder {
                     &rebuilder.next_append_vec_id,
                     &mut rebuilder.num_collisions,
                 )?;
-                let accounts_file = AccountsFile::new_for_startup(remapped_file_info)?;
+                let accounts_file = AccountsFile::open_append_vec(remapped_file_info)?;
                 let storage_entry = AccountStorageEntry::new_existing(
                     slot,
                     remapped_id,
@@ -114,7 +114,7 @@ impl SnapshotStorageRebuilder {
                     } else {
                         ObsoleteAccounts::default()
                     };
-                let accounts_file = AccountsFile::new_for_startup(file_info)?;
+                let accounts_file = AccountsFile::open_append_vec(file_info)?;
                 let storage_entry =
                     AccountStorageEntry::new_existing(slot, id, accounts_file, obsolete_accounts);
 

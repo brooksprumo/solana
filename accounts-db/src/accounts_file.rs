@@ -64,12 +64,8 @@ pub enum AccountsFile {
 }
 
 impl AccountsFile {
-    /// Creates a new AccountsFile for the underlying storage at `file_info`
-    ///
-    /// This version of `new()` may only be called when reconstructing storages as part of startup.
-    /// The storage length is taken to be the full file size; this is trusted and relies on later
-    /// index generation or accounts verification to ensure it is valid.
-    pub fn new_for_startup(file_info: FileInfo) -> Result<Self> {
+    /// Creates a new AccountsFile by opening an existing AppendVec from `file_info`.
+    pub fn open_append_vec(file_info: FileInfo) -> Result<Self> {
         let av = AppendVec::new_for_startup(file_info)?;
         Ok(Self::AppendVec(av))
     }
