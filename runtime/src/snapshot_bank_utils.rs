@@ -851,7 +851,7 @@ mod tests {
         semver::Version,
         solana_accounts_db::{
             accounts_db::{ACCOUNTS_DB_CONFIG_FOR_TESTING, AccountsFileId},
-            accounts_file::{AccountsFile, AccountsFileProvider},
+            accounts_file::AccountsFileProvider,
         },
         solana_keypair::Keypair,
         solana_native_token::LAMPORTS_PER_SOL,
@@ -2255,6 +2255,7 @@ mod tests {
     /// If zero lamport accounts are not handled correctly, Account1 or Account2 will come back
     /// failing the test
     #[test_case(AccountsFileProvider::AppendVec)]
+    #[test_case(AccountsFileProvider::Split)]
     fn test_fastboot_handle_zero_lamport_accounts(accounts_file_provider: AccountsFileProvider) {
         let key1 = Keypair::new();
         let key2 = Keypair::new();
@@ -2384,6 +2385,7 @@ mod tests {
     }
 
     #[test_case(AccountsFileProvider::AppendVec)]
+    #[test_case(AccountsFileProvider::Split)]
     fn test_bank_from_snapshot_dir_good(accounts_file_provider: AccountsFileProvider) {
         let GenesisConfigInfo { genesis_config, .. } = create_genesis_config_with_leader(
             1_000_000 * LAMPORTS_PER_SOL,
@@ -2456,6 +2458,7 @@ mod tests {
     /// the `(slot, id)` pair isn't in the storages list) while keeping the snapshot's own
     /// storage files in place and producing a working bank.
     #[test_case(AccountsFileProvider::AppendVec)]
+    #[test_case(AccountsFileProvider::Split)]
     fn test_bank_from_snapshot_dir_prunes_stale_storage(
         accounts_file_provider: AccountsFileProvider,
     ) {
@@ -2511,10 +2514,12 @@ mod tests {
         let stale_id = AccountsFileId::MAX;
         let stale_files: Vec<_> = account_paths
             .iter()
-            .map(|account_path| {
-                let stale = account_path.join(AccountsFile::file_name(stale_slot, stale_id));
-                fs::write(&stale, b"junk").unwrap();
-                stale
+            .flat_map(|account_path| {
+                ["", ".meta", ".data"].map(|suffix| {
+                    let stale = account_path.join(format!("{stale_slot}.{stale_id}{suffix}"));
+                    fs::write(&stale, b"junk").unwrap();
+                    stale
+                })
             })
             .collect();
 
