@@ -93,7 +93,8 @@ const AUX_SNAPSHOT_FILE_READ_BUF_SIZE: usize = 4 * 1024 * 1024;
 //         direction between 3.0.0 and 3.1.0; a validator finding no hints just skips the tuning.
 // 4.0.0 - Obsolete accounts store u32 logical offsets instead of u64 AppendVec file offsets.
 //         Version 3 is converted in memory when loading; older validators cannot load v4.
-const SNAPSHOT_FASTBOOT_VERSION: Version = Version::new(4, 0, 0);
+// 5.0.0 - Added in agave v4.5. The storages list file format changed to support SplitFile.
+const SNAPSHOT_FASTBOOT_VERSION: Version = Version::new(5, 0, 0);
 
 /// Information about a bank snapshot. Namely the slot of the bank, the path to the snapshot, and
 /// the kind of the snapshot.
@@ -359,6 +360,7 @@ fn is_snapshot_fastboot_compatible(
     version: &Version,
 ) -> std::result::Result<bool, SnapshotFastbootError> {
     match version.major {
+        5 => Ok(true),
         4 => Ok(true),
         3 => Ok(true),
         v if v > SNAPSHOT_FASTBOOT_VERSION.major => {
