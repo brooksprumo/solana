@@ -59,6 +59,33 @@ impl StoragesList {
     }
 }
 
+impl From<LegacyStoragesList> for StoragesList {
+    fn from(legacy: LegacyStoragesList) -> StoragesList {
+        let items = legacy
+            .items
+            .into_iter()
+            .map(|legacy_item| StorageListItem::AppendVec {
+                slot: legacy_item.slot,
+                id: legacy_item.id,
+            })
+            .collect();
+        StoragesList { items }
+    }
+}
+
+/// Legacy storage list item format, used before fastboot v5.0.0
+#[repr(C)]
+#[derive(Debug, SchemaRead, SchemaWrite)]
+pub struct LegacyStorageListItem {
+    pub slot: Slot,
+    pub id: AccountsFileId,
+}
+
+#[derive(Debug, SchemaRead, SchemaWrite)]
+pub struct LegacyStoragesList {
+    pub items: Vec<LegacyStorageListItem>,
+}
+
 #[cfg(test)]
 mod tests {
     use {
@@ -92,5 +119,34 @@ mod tests {
         let decoded: StoragesList = deserialize_wincode_from(Cursor::new(&buf)).unwrap();
         assert_eq!(decoded.items, list.items);
     }
+
+    #[test]
+    fn test_from_legacy_storages_list() {
+        let legacy_list = LegacyStoragesList {
+            items: vec![
+                LegacyStorageListItem { slot: 7, id: 42 },
+                LegacyStorageListItem { slot: 11, id: 13 },
+                LegacyStorageListItem {
+                    slot: Slot::MAX,
+                    id: AccountsFileId::MAX,
+                },
+            ],
+        };
+
+        let mut buf = Vec::new();
+        serialize_into(Cursor::new(&mut buf), &legacy_list).unwrap();
+
+        let expected_current: Vec<_> = legacy_list
+            .items
+            .iter()
+            .map(|item| StorageListItem::AppendVec {
+                slot: item.slot,
+                id: item.id,
+            })
+            .collect();
+
+        let decoded: LegacyStoragesList = deserialize_wincode_from(Cursor::new(&buf)).unwrap();
+        let actual_current = StoragesList::from(decoded);
+        assert_eq!(actual_current.items, expected_current);
     }
 }
