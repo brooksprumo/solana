@@ -70,6 +70,11 @@ impl AccountsFile {
         Ok(Self::AppendVec(av))
     }
 
+    /// Creates a new AccountsFile by opening an existing SplitFile from `meta` and `data`.
+    pub fn open_split(meta: FileInfo, data: Option<FileInfo>) -> Result<Self> {
+        Ok(Self::Split(SplitFile::open(meta, data)?))
+    }
+
     /// if storage is not readonly, reopen another instance that is read only
     pub(crate) fn reopen_as_readonly(&self) -> Result<Option<Self>> {
         Ok(match self {
