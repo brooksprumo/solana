@@ -840,7 +840,7 @@ mod tests {
                 get_highest_loadable_bank_snapshot, purge_all_bank_snapshots, purge_bank_snapshot,
                 purge_bank_snapshots_older_than_slot, purge_incomplete_bank_snapshots,
                 purge_old_bank_snapshots, purge_old_bank_snapshots_at_startup,
-                snapshot_storage_rebuilder::get_slot_and_append_vec_id,
+                snapshot_storage_rebuilder::parse_storage_filename,
             },
             status_cache::{Status, StatusCache},
         },
@@ -2444,12 +2444,11 @@ mod tests {
             fs::read_dir(path).unwrap().for_each(|entry| {
                 let path = entry.unwrap().path();
                 let filename = path.file_name().unwrap();
-                let (_slot, append_vec_id) =
-                    get_slot_and_append_vec_id(filename.to_str().unwrap()).unwrap();
-                max_id = std::cmp::max(max_id, append_vec_id);
+                let parsed_filename = parse_storage_filename(filename.to_str().unwrap()).unwrap();
+                max_id = std::cmp::max(max_id, parsed_filename.id);
             });
         }
-        let next_id = bank.accounts().accounts_db.next_id.load(Ordering::Relaxed) as usize;
+        let next_id = bank.accounts().accounts_db.next_id.load(Ordering::Relaxed);
         assert_eq!(max_id, next_id - 1);
     }
 
