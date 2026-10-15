@@ -167,10 +167,12 @@ impl SnapshotStorageRebuilder {
                         };
                         // If we're here, then we have both files and can open the SplitFile.
                         // Figure out which file is the meta and which is the data.
-                        if filename.ends_with(".meta") {
-                            (file_info, Some(other))
-                        } else {
-                            (other, Some(file_info))
+                        let ParsedStorageFormat::Split(split_format) = &format else {
+                            unreachable!();
+                        };
+                        match split_format {
+                            ParsedSplit::Meta => (file_info, Some(other)),
+                            ParsedSplit::Data => (other, Some(file_info)),
                         }
                     }
                 };
