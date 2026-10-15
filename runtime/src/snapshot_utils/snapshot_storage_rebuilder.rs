@@ -109,9 +109,6 @@ impl SnapshotStorageRebuilder {
             if let Some(ParsedStorageFilename { slot, id, format }) =
                 parse_storage_filename(filename)
             {
-                // When restoring from local state, obsolete accounts will be 'Some' if the storage
-                // contained accounts marked obsolete at the time the snapshot was taken.
-                // IDs will never overlap.
                 let expected_storage = expected_storages.get(&(slot, id)).ok_or_else(|| {
                     SnapshotError::RebuildStorages(format!(
                         "unexpected storage file '{}'",
