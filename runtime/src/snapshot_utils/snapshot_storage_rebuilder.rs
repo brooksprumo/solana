@@ -212,18 +212,16 @@ impl SnapshotStorageRebuilder {
             }
         }
 
-        if !expected_storages.is_empty() {
-            // we didn't see all the files that we were told to expect...
-            return Err(SnapshotError::RebuildStorages(format!(
-                "these expected storages were missing files and not rebuilt: {:?}",
-                expected_storages.keys(),
-            )));
-        }
-        if !split_files_with_data.is_empty() {
+        if !expected_storages.is_empty() || !split_files_with_data.is_empty() {
+            // we didn't see all the files that we were told to expect, or
             // we didn't see both meta and data files for these SplitFiles...
             return Err(SnapshotError::RebuildStorages(format!(
-                "these split storages were missing one of their files: {:?}",
-                split_files_with_data.keys(),
+                "num expected storages that were missing files and not rebuilt: {} (e.g. {:?}), \
+                 num split storages that were missing one of their files: {} (e.g. {:?})",
+                expected_storages.len(),
+                expected_storages.iter().next(),
+                split_files_with_data.len(),
+                split_files_with_data.iter().next(),
             )));
         }
 
@@ -499,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "these expected storages were missing files")]
+    #[should_panic(expected = "expected storages that were missing files and not rebuilt")]
     fn test_rebuild_storages_from_local_state_bad_no_files() {
         SnapshotStorageRebuilder::rebuild_storages_from_local_state(
             [],
@@ -514,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "these expected storages were missing files")]
+    #[should_panic(expected = "expected storages that were missing files and not rebuilt")]
     fn test_rebuild_storages_from_local_state_bad_missing_split_data() {
         let temp_dir = tempfile::tempdir().unwrap();
         let path = temp_dir.path().join("123.456.meta");
@@ -537,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "these expected storages were missing files")]
+    #[should_panic(expected = "expected storages that were missing files and not rebuilt")]
     fn test_rebuild_storages_from_local_state_bad_missing_split_meta() {
         let temp_dir = tempfile::tempdir().unwrap();
         let path = temp_dir.path().join("123.456.data");
