@@ -6,12 +6,11 @@ use {
         serde_snapshot::{
             self, AccountsDbFields, ExtraFieldsToSerialize, LegacyObsoleteAccountsMap,
             LegacyStoragesList, SerdeObsoleteAccountsMap, SnapshotAccountsDbFields,
-            SnapshotBankFields, SnapshotStreams, StartupHints, StorageListItem, StoragesList,
+            SnapshotBankFields, SnapshotStreams, StartupHints, StoragesList,
         },
         snapshot_package::BankSnapshotPackage,
         snapshot_utils::snapshot_storage_rebuilder::{
-            ParsedSplit, ParsedStorageFilename, ParsedStorageFormat, SnapshotStorageRebuilder,
-            parse_storage_filename, storages_list_to_map,
+            SnapshotStorageRebuilder, parse_storage_filename, storages_list_to_map,
         },
     },
     agave_fs::{
@@ -41,7 +40,7 @@ use {
     solana_accounts_db::{
         account_storage::AccountStorageMap,
         account_storage_entry::AccountStorageEntry,
-        accounts_db::{AccountsFileId, AtomicAccountsFileId},
+        accounts_db::AtomicAccountsFileId,
         utils::{ACCOUNTS_SNAPSHOT_DIR, move_and_async_delete_path},
     },
     solana_clock::Slot,
@@ -1383,59 +1382,6 @@ fn spawn_streaming_snapshot_dir_files(
     (file_receiver, handle)
 }
 
-/// Removes storage files from `account_paths` that are not in `expected_storages`.
-///
-/// Files whose names do not parse as a storage are left alone.
-fn prune_stale_storages(
-    account_paths: &[PathBuf],
-    expected_storages: &HashMap<(Slot, AccountsFileId), StorageListItem>,
-) -> Result<()> {
-    for account_path in account_paths {
-        let read_dir = fs::read_dir(account_path).map_err(|err| {
-            IoError::other(format!(
-                "failed to read account path '{}': {err}",
-                account_path.display(),
-            ))
-        })?;
-        for entry in read_dir {
-            let path = entry?.path();
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-
-            let Some(ParsedStorageFilename { slot, id, format }) = parse_storage_filename(name)
-            else {
-                // Not a storage file name — leave it alone.
-                continue;
-            };
-
-            let matched =
-                expected_storages
-                    .get(&(slot, id))
-                    .is_some_and(|expected_storage| match (format, expected_storage) {
-                        (ParsedStorageFormat::AppendVec, StorageListItem::AppendVec { .. }) => true,
-                        (
-                            ParsedStorageFormat::Split(split_format),
-                            StorageListItem::Split { has_data_file, .. },
-                        ) => match split_format {
-                            ParsedSplit::Meta => true,
-                            ParsedSplit::Data => *has_data_file,
-                        },
-                        _ => false,
-                    });
-
-            if !matched {
-                info!(
-                    "Removing stale storage file '{}' not in storages list",
-                    path.display(),
-                );
-                fs::remove_file(&path)?;
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Performs the common tasks when deserializing a snapshot
 ///
 /// Handles reading the snapshot file and version file,
@@ -1484,7 +1430,6 @@ pub(crate) fn rebuild_storages_from_snapshot_dir(
             .expect("fastboot requires a version"),
     )?;
     let storages_map = storages_list_to_map(&storages_list);
-    prune_stale_storages(account_paths, &storages_map)?;
 
     let snapshot_file_path = snapshot_info.snapshot_path();
     let snapshot_version_path = bank_snapshot_dir.join(snapshot_paths::SNAPSHOT_VERSION_FILENAME);
@@ -1827,7 +1772,7 @@ pub fn create_tmp_accounts_dir_for_tests() -> (TempDir, PathBuf) {
 mod tests {
     use {
         super::*,
-        crate::serde_snapshot::{StorageListItem, deserialize_wincode_from, serialize_into},
+        crate::serde_snapshot::{deserialize_wincode_from, serialize_into},
         agave_snapshots::{
             paths::{
                 full_snapshot_archives_iter, get_highest_full_snapshot_archive_slot,
@@ -1841,7 +1786,7 @@ mod tests {
         assert_matches::assert_matches,
         solana_accounts_db::accounts_file::AccountsFileProvider,
         solana_hash::Hash,
-        std::{convert::TryFrom, mem::size_of, slice},
+        std::{convert::TryFrom, mem::size_of},
         tempfile::NamedTempFile,
         test_case::test_case,
     };
@@ -2830,65 +2775,5 @@ mod tests {
 
         // scenario 9: all good
         assert!(is_bank_snapshot_complete(bank_snapshot_dir));
-    }
-
-    #[test]
-    fn test_prune_stale_storages() {
-        let account_path = tempfile::TempDir::new().unwrap();
-        // Files that belong to the snapshot.
-        let append_vec_1_keep = account_path.path().join("101.1");
-        let append_vec_2_prune = account_path.path().join("102.2");
-        let split_3_meta_keep = account_path.path().join("203.3.meta");
-        let split_3_data_keep = account_path.path().join("203.3.data");
-        let split_4_meta_only_keep = account_path.path().join("204.4.meta");
-        let split_4_data_prune = account_path.path().join("204.4.data");
-        let split_5_meta_prune = account_path.path().join("205.5.meta");
-        let split_5_data_prune = account_path.path().join("205.5.data");
-        let non_storage_keep = account_path.path().join("something_else.txt");
-        for path in [
-            &append_vec_1_keep,
-            &append_vec_2_prune,
-            &split_3_meta_keep,
-            &split_3_data_keep,
-            &split_4_meta_only_keep,
-            &split_4_data_prune,
-            &split_5_meta_prune,
-            &split_5_data_prune,
-            &non_storage_keep,
-        ] {
-            fs::write(path, b"x").unwrap();
-        }
-
-        let storages_list = StoragesList {
-            items: vec![
-                StorageListItem::AppendVec { slot: 101, id: 1 },
-                StorageListItem::Split {
-                    slot: 203,
-                    id: 3,
-                    has_data_file: true,
-                },
-                StorageListItem::Split {
-                    slot: 204,
-                    id: 4,
-                    has_data_file: false,
-                },
-            ],
-        };
-        let storages_map = storages_list_to_map(&storages_list);
-        prune_stale_storages(
-            slice::from_ref(&account_path.path().to_path_buf()),
-            &storages_map,
-        )
-        .unwrap();
-
-        assert!(append_vec_1_keep.exists());
-        assert!(!append_vec_2_prune.exists());
-        assert!(split_3_meta_keep.exists());
-        assert!(split_3_data_keep.exists());
-        assert!(split_4_meta_only_keep.exists());
-        assert!(!split_4_data_prune.exists());
-        assert!(!split_5_meta_prune.exists());
-        assert!(!split_5_data_prune.exists());
-        assert!(non_storage_keep.exists());
     }
 }

@@ -18,6 +18,7 @@ use {
     solana_clock::Slot,
     std::{
         collections::HashMap,
+        fs,
         sync::{Arc, atomic::Ordering},
         time::{Duration, Instant},
     },
@@ -93,6 +94,9 @@ impl SnapshotStorageRebuilder {
     }
 
     /// Rebuilds the account storages from local state.
+    ///
+    /// Note, also removes storages in `files` that are not in `expected_storages`.
+    /// (Files whose names do not parse as a storage are left alone.)
     pub(crate) fn rebuild_storages_from_local_state(
         files: impl IntoIterator<Item = FileInfo>,
         next_append_vec_id: Arc<AtomicAccountsFileId>,
@@ -106,110 +110,112 @@ impl SnapshotStorageRebuilder {
         for file_info in files {
             rebuilder.maybe_log_progress(&mut previous_log_time);
             let filename = file_info.path.file_name().unwrap().to_str().unwrap();
-            if let Some(ParsedStorageFilename { slot, id, format }) =
-                parse_storage_filename(filename)
-            {
-                let expected_storage = expected_storages.get(&(slot, id)).ok_or_else(|| {
-                    SnapshotError::RebuildStorages(format!(
-                        "unexpected storage file '{}'",
-                        file_info.path.display(),
-                    ))
-                })?;
+            let Some(ParsedStorageFilename { slot, id, format }) = parse_storage_filename(filename)
+            else {
+                // Not a storage file name — leave it alone.
+                continue;
+            };
 
-                // verify the storage file format matches what we're expecting
-                match (expected_storage, &format) {
-                    (StorageListItem::AppendVec { .. }, ParsedStorageFormat::AppendVec) => {
-                        // all good
-                    }
-                    (StorageListItem::Split { .. }, ParsedStorageFormat::Split(..)) => {
-                        // all good
-                    }
-                    _ => {
-                        // format mismatch between expected and actual
-                        return Err(SnapshotError::RebuildStorages(format!(
-                            "storage file format mismatch! slot: {slot}, id: {id}, actual: \
-                             {format:?}, expected: {expected_storage:?}"
-                        )));
+            let Some(expected_storage) = expected_storages.remove(&(slot, id)) else {
+                info!(
+                    "Removing stale storage file '{}' not in storages list",
+                    file_info.path.display(),
+                );
+                fs::remove_file(&file_info.path)?;
+                continue;
+            };
+
+            // verify the storage file format matches what we're expecting
+            match (&expected_storage, &format) {
+                (StorageListItem::AppendVec { .. }, ParsedStorageFormat::AppendVec) => {
+                    // all good
+                }
+                (StorageListItem::Split { .. }, ParsedStorageFormat::Split(..)) => {
+                    // all good
+                }
+                _ => {
+                    // format mismatch between expected and actual
+                    return Err(SnapshotError::RebuildStorages(format!(
+                        "storage file format mismatch! slot: {slot}, id: {id}, actual: \
+                         {format:?}, expected: {expected_storage:?}"
+                    )));
+                }
+            }
+
+            // Look up this `file_info` in the list of expected storages.
+            // If we have all the files to open the storage, proceed with opening.
+            // Otherwise, continue to the next item in `files`.
+            // E.g. this happens for a SplitFile with both meta and data files, but
+            // we've only seen one of the two files so far.
+            let file_infos = match expected_storage {
+                StorageListItem::AppendVec { .. } => {
+                    // AppendVec only has one file, proceed with opening.
+                    (file_info, None)
+                }
+                StorageListItem::Split {
+                    has_data_file: false,
+                    ..
+                } => {
+                    // SplitFile without data only has one file, proceed with opening.
+                    (file_info, None)
+                }
+                StorageListItem::Split {
+                    has_data_file: true,
+                    ..
+                } => {
+                    // SplitFile with data has two files, so must ensure
+                    // we've seen both files before opening.
+                    let Some(other) = split_files_with_data.remove(&(slot, id)) else {
+                        // This is the first file seen for this SplitFile (with data).
+                        // Remember it for next time and then continue to the next file.
+                        split_files_with_data.insert((slot, id), file_info);
+                        expected_storages.insert((slot, id), expected_storage);
+                        continue;
+                    };
+                    // If we're here, then we have both files and can open the SplitFile.
+                    // Figure out which file is the meta and which is the data.
+                    let ParsedStorageFormat::Split(split_format) = &format else {
+                        unreachable!();
+                    };
+                    match split_format {
+                        ParsedSplit::Meta => (file_info, Some(other)),
+                        ParsedSplit::Data => (other, Some(file_info)),
                     }
                 }
+            };
 
-                // Look up this `file_info` in the list of expected storages.
-                // If we have all the files to open the storage, proceed with opening.
-                // Otherwise, continue to the next item in `files`.
-                // E.g. this happens for a SplitFile with both meta and data files, but
-                // we've only seen one of the two files so far.
-                let file_infos = match expected_storage {
-                    StorageListItem::AppendVec { .. } => {
-                        // AppendVec only has one file, proceed with opening.
-                        (file_info, None)
+            // If we got here then `file_infos` can be used to open an AccountStorageEntry.
+            // Grab ObsoleteAccounts (if any) for this storage entry now.
+            let obsolete_accounts = obsolete_accounts
+                .remove(&slot)
+                .map(|accounts| accounts.into_tuple());
+            let obsolete_accounts =
+                if let Some((obsolete_accounts, obsolete_id, _bytes)) = obsolete_accounts {
+                    if obsolete_id != id {
+                        return Err(SnapshotError::MismatchedAccountsFileId(id, obsolete_id));
                     }
-                    StorageListItem::Split {
-                        has_data_file: false,
-                        ..
-                    } => {
-                        // SplitFile without data only has one file, proceed with opening.
-                        (file_info, None)
-                    }
-                    StorageListItem::Split {
-                        has_data_file: true,
-                        ..
-                    } => {
-                        // SplitFile with data has two files, so must ensure
-                        // we've seen both files before opening.
-                        let Some(other) = split_files_with_data.remove(&(slot, id)) else {
-                            // This is the first file seen for this SplitFile (with data).
-                            // Remember it for next time and then continue to the next file.
-                            split_files_with_data.insert((slot, id), file_info);
-                            continue;
-                        };
-                        // If we're here, then we have both files and can open the SplitFile.
-                        // Figure out which file is the meta and which is the data.
-                        let ParsedStorageFormat::Split(split_format) = &format else {
-                            unreachable!();
-                        };
-                        match split_format {
-                            ParsedSplit::Meta => (file_info, Some(other)),
-                            ParsedSplit::Data => (other, Some(file_info)),
-                        }
-                    }
+                    obsolete_accounts
+                } else {
+                    ObsoleteAccounts::default()
                 };
+            let accounts_file = match expected_storage {
+                StorageListItem::AppendVec { .. } => AccountsFile::open_append_vec(file_infos.0)?,
+                StorageListItem::Split { .. } => {
+                    AccountsFile::open_split(file_infos.0, file_infos.1)?
+                }
+            };
+            let storage_entry =
+                AccountStorageEntry::new_existing(slot, id, accounts_file, obsolete_accounts);
 
-                // If we got here then `file_infos` can be used to open an AccountStorageEntry.
-                // Grab ObsoleteAccounts (if any) for this storage entry now.
-                let obsolete_accounts = obsolete_accounts
-                    .remove(&slot)
-                    .map(|accounts| accounts.into_tuple());
-                let obsolete_accounts =
-                    if let Some((obsolete_accounts, obsolete_id, _bytes)) = obsolete_accounts {
-                        if obsolete_id != id {
-                            return Err(SnapshotError::MismatchedAccountsFileId(id, obsolete_id));
-                        }
-                        obsolete_accounts
-                    } else {
-                        ObsoleteAccounts::default()
-                    };
-                let accounts_file = match expected_storage {
-                    StorageListItem::AppendVec { .. } => {
-                        AccountsFile::open_append_vec(file_infos.0)?
-                    }
-                    StorageListItem::Split { .. } => {
-                        AccountsFile::open_split(file_infos.0, file_infos.1)?
-                    }
-                };
-                let storage_entry =
-                    AccountStorageEntry::new_existing(slot, id, accounts_file, obsolete_accounts);
-
-                // Keep track of the highest append_vec_id in the system, so the future append_vecs
-                // can be assigned to unique IDs.  This is only needed when loading from local
-                // state.  When loading from a snapshot archive, the max of the appendvec IDs is
-                // updated in remap_append_vec_file(), which is not in the from_local_state route.
-                rebuilder
-                    .next_append_vec_id
-                    .fetch_max(id + 1, Ordering::Relaxed);
-                rebuilder.insert_storage(slot, Arc::new(storage_entry))?;
-                rebuilder.processed_slot_count += 1;
-                expected_storages.remove(&(slot, id));
-            }
+            // Keep track of the highest append_vec_id in the system, so the future append_vecs
+            // can be assigned to unique IDs.  This is only needed when loading from local
+            // state.  When loading from a snapshot archive, the max of the appendvec IDs is
+            // updated in remap_append_vec_file(), which is not in the from_local_state route.
+            rebuilder
+                .next_append_vec_id
+                .fetch_max(id + 1, Ordering::Relaxed);
+            rebuilder.insert_storage(slot, Arc::new(storage_entry))?;
+            rebuilder.processed_slot_count += 1;
         }
 
         if !expected_storages.is_empty() || !split_files_with_data.is_empty() {
@@ -338,7 +344,7 @@ mod tests {
             accounts_file::{AccountsFile, AccountsFileProvider},
         },
         solana_pubkey::Pubkey,
-        std::{fs, slice},
+        std::slice,
     };
 
     #[test]
@@ -470,11 +476,27 @@ mod tests {
             ))
             .unwrap();
 
+        // create a non-storage file that should be skipped
+        let non_storage_path = temp_dir.path().join("non_storage");
+        fs::write(&non_storage_path, b"junk").unwrap();
+
+        // create unexpected storages that should be pruned
+        let prune_av_path = temp_dir.path().join("567.890");
+        fs::write(&prune_av_path, b"junk").unwrap();
+        let prune_split_meta_path = temp_dir.path().join("888.888.meta");
+        fs::write(&prune_split_meta_path, b"junk").unwrap();
+        let prune_split_data_path = temp_dir.path().join("999.999.data");
+        fs::write(&prune_split_data_path, b"junk").unwrap();
+
         let files = [
             path1.with_added_extension("meta"),
             path2.with_added_extension("data"),
             path2.with_added_extension("meta"),
             path3,
+            non_storage_path.clone(),
+            prune_av_path.clone(),
+            prune_split_meta_path.clone(),
+            prune_split_data_path.clone(),
         ]
         .into_iter()
         .map(|path| FileInfo::new_from_path(path).unwrap());
@@ -494,6 +516,10 @@ mod tests {
         assert_eq!(storages.get(&slot1).unwrap().id(), id1);
         assert_eq!(storages.get(&slot2).unwrap().id(), id2);
         assert_eq!(storages.get(&slot3).unwrap().id(), id3);
+        assert!(fs::exists(non_storage_path).unwrap());
+        assert!(!fs::exists(prune_av_path).unwrap());
+        assert!(!fs::exists(prune_split_meta_path).unwrap());
+        assert!(!fs::exists(prune_split_data_path).unwrap());
     }
 
     #[test]
