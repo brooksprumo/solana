@@ -680,7 +680,7 @@ impl AppendVec {
         reader: &mut impl RequiredLenBufFileRead<'a>,
         mut callback: impl for<'local> FnMut(LogicalOffset, StoredAccountInfo<'local>),
     ) -> Result<()> {
-        self.scan_accounts_stored_meta_with(reader, |stored_account_meta| {
+        Self::scan_accounts_stored_meta_with(reader, |stored_account_meta| {
             // SAFETY: The offset in stored_account_meta is required to be a valid/aligned offset
             // for an AppendVec entry/account, thus it is also a valid logical offset.
             let logical_offset = logical_offset_from_file(stored_account_meta.offset()).unwrap();
@@ -696,6 +696,27 @@ impl AppendVec {
         })
     }
 
+    /// Iterate over all accounts on `reader` and call `callback` with each.
+    ///
+    /// `callback` parameters:
+    /// * StoredAccountInfo: the account itself, with account data
+    pub(crate) fn scan_reader<'a>(
+        reader: &mut impl RequiredLenBufFileRead<'a>,
+        mut callback: impl for<'local> FnMut(StoredAccountInfo<'local>),
+    ) -> Result<()> {
+        Self::scan_accounts_stored_meta_with(reader, |stored_account_meta| {
+            let account = StoredAccountInfo {
+                pubkey: stored_account_meta.pubkey(),
+                lamports: stored_account_meta.lamports(),
+                owner: stored_account_meta.owner(),
+                data: stored_account_meta.data(),
+                executable: stored_account_meta.executable(),
+                rent_epoch: stored_account_meta.rent_epoch(),
+            };
+            callback(account);
+        })
+    }
+
     /// Iterate over all accounts and call `callback` with each account.
     ///
     /// Prefer scan_accounts() when possible, as it does not contain file format
@@ -707,7 +728,7 @@ impl AppendVec {
     ) -> Result<()> {
         let mut reader = crate::accounts_file::new_scan_accounts_reader();
         reader.set_file(&self.file, self.len() as FileSize)?;
-        self.scan_accounts_stored_meta_with(&mut reader, callback)
+        Self::scan_accounts_stored_meta_with(&mut reader, callback)
     }
 
     /// See [`scan_accounts_stored_meta`] for documentation.
@@ -715,7 +736,6 @@ impl AppendVec {
     /// This fn does not call `FileBufRead::set_file()` first, before scanning.
     /// The *caller* is responsible for setting the file.
     fn scan_accounts_stored_meta_with<'a>(
-        &'a self,
         reader: &mut impl RequiredLenBufFileRead<'a>,
         mut callback: impl for<'local> FnMut(StoredAccountMeta<'local>),
     ) -> Result<()> {

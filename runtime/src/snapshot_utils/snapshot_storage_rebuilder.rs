@@ -18,6 +18,7 @@ use {
     solana_clock::Slot,
     std::{
         collections::HashMap,
+        fs,
         sync::{Arc, atomic::Ordering},
         time::{Duration, Instant},
     },
@@ -52,6 +53,7 @@ impl SnapshotStorageRebuilder {
     pub(crate) fn rebuild_storages_from_snapshot_archive(
         files: impl IntoIterator<Item = FileInfo>,
         next_append_vec_id: Arc<AtomicAccountsFileId>,
+        max_append_vec_size: u64,
     ) -> Result<AccountStorageMap, SnapshotError> {
         let mut rebuilder = Self::new(next_append_vec_id);
         let mut previous_log_time = Instant::now();
@@ -75,7 +77,26 @@ impl SnapshotStorageRebuilder {
                     &rebuilder.next_append_vec_id,
                     &mut rebuilder.num_collisions,
                 )?;
-                let accounts_file = AccountsFile::open_append_vec(remapped_file_info)?;
+
+                let accounts_file = if remapped_file_info.size <= max_append_vec_size {
+                    AccountsFile::open_append_vec(remapped_file_info)?
+                } else {
+                    info!(
+                        "Converting AppendVec to Split: '{}'...",
+                        remapped_file_info.path.display(),
+                    );
+                    let append_vec_path = remapped_file_info.path.clone();
+                    let accounts_file =
+                        AccountsFile::new_split_from_append_vec(remapped_file_info)?;
+                    fs::remove_file(&append_vec_path).map_err(|err| {
+                        SnapshotError::RebuildStorages(format!(
+                            "failed to remove AppendVec '{}' after converting to Split: {err}",
+                            append_vec_path.display(),
+                        ))
+                    })?;
+                    accounts_file
+                };
+
                 let storage_entry = AccountStorageEntry::new_existing(
                     slot,
                     remapped_id,
@@ -336,6 +357,7 @@ mod tests {
         solana_accounts_db::{
             account_storage_entry::AccountStorageEntry,
             accounts_file::{AccountsFile, AccountsFileProvider},
+            append_vec::AppendVec,
         },
         solana_pubkey::Pubkey,
         std::{fs, slice},
@@ -555,5 +577,43 @@ mod tests {
             )]),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn test_rebuild_storages_from_snapshot_archive_converts_large_append_vec() {
+        const MAX_SIZE: u64 = 50_000;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let slot = 12;
+        let id = 34;
+        let append_vec_file_name = AccountsFile::file_name(slot, id);
+        let append_vec_path = temp_dir.path().join(&append_vec_file_name);
+
+        // Create an append vec and write some accounts.
+        // Note that the AppendVec ctor sets the file size, and we don't
+        // need to write a lot of large accounts to exceed the limit.
+        let append_vec = AppendVec::new(&append_vec_path, MAX_SIZE as usize + 1);
+        let o = Pubkey::default();
+        let accounts = [
+            (Pubkey::new_unique(), AccountSharedData::new(2, 2, &o)),
+            (Pubkey::new_unique(), AccountSharedData::new(0, 0, &o)),
+            (Pubkey::new_unique(), AccountSharedData::new(9, 9999, &o)),
+        ];
+        append_vec
+            .append_accounts(&(slot, accounts.as_slice()))
+            .unwrap();
+
+        let append_vec_file_info = FileInfo::new_from_path(&append_vec_path).unwrap();
+        let new_id = id + 1;
+        let storages = SnapshotStorageRebuilder::rebuild_storages_from_snapshot_archive(
+            [append_vec_file_info],
+            Arc::new(AtomicAccountsFileId::new(new_id)),
+            MAX_SIZE,
+        )
+        .unwrap();
+
+        let storage = storages.get(&slot).unwrap();
+        assert_eq!(storage.slot(), slot);
+        assert_eq!(storage.id(), new_id);
+        assert!(matches!(storage.accounts, AccountsFile::Split(_)));
     }
 }

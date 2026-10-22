@@ -4,8 +4,9 @@ use {
         account_storage::stored_account_info::{StoredAccountInfo, StoredAccountInfoWithoutData},
         accounts_db::AccountsFileId,
         append_vec::{AppendVec, AppendVecError},
+        is_zero_lamport::IsZeroLamport as _,
         split_file::{self, SplitFile, SplitFileError},
-        storable_accounts::StorableAccounts,
+        storable_accounts::{AccountForStorage, StorableAccounts},
     },
     agave_fs::{
         FileInfo, FileSize,
@@ -73,6 +74,69 @@ impl AccountsFile {
     /// Creates a new AccountsFile by opening an existing SplitFile from `meta` and `data`.
     pub fn open_split(meta: FileInfo, data: Option<FileInfo>) -> Result<Self> {
         Ok(Self::Split(SplitFile::open(meta, data)?))
+    }
+
+    /// Creates a new SplitFile from `append_vec_file_info`.
+    ///
+    /// Reads accounts from the append vec and writes them into a new split file.
+    /// Returns an AccountsFile instance that is already read-only.
+    pub fn new_split_from_append_vec(append_vec_file_info: FileInfo) -> Result<Self> {
+        // Wrap StoredAccountInfo (the account type given to the callback when
+        // scanning the AppendVec) in a struct and then implement StorableAccounts
+        // on it, so that we can write into the SplitFile without needing to
+        // allocate an intermediate AccountSharedData (or equiv).
+        struct StorableStoredAccountInfo<'a>(StoredAccountInfo<'a>);
+        impl<'a> StorableAccounts<'a> for StorableStoredAccountInfo<'a> {
+            fn account<R>(
+                &self,
+                _index: usize,
+                mut callback: impl for<'local> FnMut(AccountForStorage<'local>) -> R,
+            ) -> R {
+                let account_for_storage = AccountForStorage::StoredAccountInfo(&self.0);
+                callback(account_for_storage)
+            }
+            fn account_for_geyser<R>(
+                &self,
+                _index: usize,
+                _callback: impl for<'local> FnMut(&'local Pubkey, &'local AccountSharedData) -> R,
+            ) -> R {
+                unimplemented!()
+            }
+            fn is_zero_lamport(&self, _index: usize) -> bool {
+                self.0.is_zero_lamport()
+            }
+            fn data_len(&self, _index: usize) -> usize {
+                self.0.data.len()
+            }
+            fn pubkey(&self, _index: usize) -> &Pubkey {
+                self.0.pubkey
+            }
+            fn slot(&self, _index: usize) -> Slot {
+                unimplemented!()
+            }
+            fn target_slot(&self) -> Slot {
+                unimplemented!()
+            }
+            fn len(&self) -> usize {
+                1
+            }
+        }
+
+        let split = SplitFile::new(&append_vec_file_info.path)?;
+        let mut reader = new_scan_accounts_reader();
+        reader.set_file(&append_vec_file_info.file, append_vec_file_info.size)?;
+        let mut first_error = None;
+        AppendVec::scan_reader(&mut reader, |account| {
+            let result = split.write_accounts(&StorableStoredAccountInfo(account));
+            first_error = first_error.take().or(result.err());
+        })?;
+        if let Some(first_error) = first_error {
+            return Err(first_error.into());
+        }
+
+        // SAFETY: `split` is *not* read-only, so must return Some.
+        let split = split.reopen_as_readonly()?.unwrap();
+        Ok(Self::Split(split))
     }
 
     /// if storage is not readonly, reopen another instance that is read only
@@ -434,4 +498,45 @@ pub(crate) fn new_scan_accounts_reader<'a>() -> impl RequiredLenBufFileRead<'a> 
         MIN_CAPACITY,
         MAX_CAPACITY,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use {super::*, solana_account::accounts_equal, tempfile::TempDir};
+
+    #[test]
+    fn test_new_split_from_append_vec() {
+        let temp_dir = TempDir::new().unwrap();
+        let append_vec_path = temp_dir.path().join("12.34");
+        let append_vec = AppendVec::new(&append_vec_path, 50_000);
+
+        let owner = Pubkey::default();
+        let accounts = [
+            (Pubkey::new_unique(), AccountSharedData::new(1, 0, &owner)),
+            (Pubkey::new_unique(), AccountSharedData::new(0, 0, &owner)),
+            (
+                Pubkey::new_unique(),
+                AccountSharedData::new(33, 10_000, &owner),
+            ),
+        ];
+        let dummy_slot = 12; // value isn't used
+        append_vec
+            .append_accounts(&(dummy_slot, accounts.as_slice()))
+            .unwrap();
+
+        let append_vec_file_info = FileInfo::new_from_path(&append_vec_path).unwrap();
+        let split = AccountsFile::new_split_from_append_vec(append_vec_file_info).unwrap();
+
+        let mut reader = new_scan_accounts_reader();
+        split.set_file_on_reader(&mut reader).unwrap();
+        let mut i = 0;
+        split
+            .scan_accounts_with(&mut reader, |_offset, stored_account| {
+                let (expected_pubkey, expected_account) = &accounts[i];
+                assert_eq!(stored_account.pubkey(), expected_pubkey);
+                assert!(accounts_equal(&stored_account, expected_account));
+                i += 1;
+            })
+            .unwrap();
+    }
 }
