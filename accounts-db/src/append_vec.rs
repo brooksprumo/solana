@@ -684,15 +684,7 @@ impl AppendVec {
             // SAFETY: The offset in stored_account_meta is required to be a valid/aligned offset
             // for an AppendVec entry/account, thus it is also a valid logical offset.
             let logical_offset = logical_offset_from_file(stored_account_meta.offset()).unwrap();
-            let account = StoredAccountInfo {
-                pubkey: stored_account_meta.pubkey(),
-                lamports: stored_account_meta.lamports(),
-                owner: stored_account_meta.owner(),
-                data: stored_account_meta.data(),
-                executable: stored_account_meta.executable(),
-                rent_epoch: stored_account_meta.rent_epoch(),
-            };
-            callback(logical_offset, account);
+            callback(logical_offset, stored_account_from(stored_account_meta));
         })
     }
 
@@ -705,15 +697,7 @@ impl AppendVec {
         mut callback: impl for<'local> FnMut(StoredAccountInfo<'local>),
     ) -> Result<()> {
         Self::scan_accounts_stored_meta_with(reader, |stored_account_meta| {
-            let account = StoredAccountInfo {
-                pubkey: stored_account_meta.pubkey(),
-                lamports: stored_account_meta.lamports(),
-                owner: stored_account_meta.owner(),
-                data: stored_account_meta.data(),
-                executable: stored_account_meta.executable(),
-                rent_epoch: stored_account_meta.rent_epoch(),
-            };
-            callback(account);
+            callback(stored_account_from(stored_account_meta));
         })
     }
 
@@ -1109,6 +1093,18 @@ impl<W: io::Write> AppendVecAccountWriter<W> {
         self.output.write_all(
             &[0; APPEND_VEC_OFFSET_ALIGNMENT as usize][..stored_size - unaligned_stored_size],
         )
+    }
+}
+
+/// Helper fn to return a StoredAccountInfo from a StoredAccountMeta.
+fn stored_account_from<'a>(stored_account_meta: StoredAccountMeta<'a>) -> StoredAccountInfo<'a> {
+    StoredAccountInfo {
+        pubkey: stored_account_meta.pubkey(),
+        lamports: stored_account_meta.lamports(),
+        owner: &stored_account_meta.account_meta.owner,
+        data: stored_account_meta.data(),
+        executable: stored_account_meta.executable(),
+        rent_epoch: stored_account_meta.rent_epoch(),
     }
 }
 
