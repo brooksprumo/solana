@@ -4,9 +4,8 @@ use {
         account_storage::stored_account_info::{StoredAccountInfo, StoredAccountInfoWithoutData},
         accounts_db::AccountsFileId,
         append_vec::{AppendVec, AppendVecError},
-        is_zero_lamport::IsZeroLamport as _,
         split_file::{self, SplitFile, SplitFileError},
-        storable_accounts::{AccountForStorage, StorableAccounts},
+        storable_accounts::StorableAccounts,
     },
     agave_fs::{
         FileInfo, FileSize,
@@ -25,6 +24,7 @@ use {
         iter::ExactSizeIterator,
         mem,
         path::{Path, PathBuf},
+        slice,
     },
     thiserror::Error,
 };
@@ -81,53 +81,12 @@ impl AccountsFile {
     /// Reads accounts from the append vec and writes them into a new split file.
     /// Returns an AccountsFile instance that is already read-only.
     pub fn new_split_from_append_vec(append_vec_file_info: FileInfo) -> Result<Self> {
-        // Wrap StoredAccountInfo (the account type given to the callback when
-        // scanning the AppendVec) in a struct and then implement StorableAccounts
-        // on it, so that we can write into the SplitFile without needing to
-        // allocate an intermediate AccountSharedData (or equiv).
-        struct StorableStoredAccountInfo<'a>(StoredAccountInfo<'a>);
-        impl<'a> StorableAccounts<'a> for StorableStoredAccountInfo<'a> {
-            fn account<R>(
-                &self,
-                _index: usize,
-                mut callback: impl for<'local> FnMut(AccountForStorage<'local>) -> R,
-            ) -> R {
-                let account_for_storage = AccountForStorage::StoredAccountInfo(&self.0);
-                callback(account_for_storage)
-            }
-            fn account_for_geyser<R>(
-                &self,
-                _index: usize,
-                _callback: impl for<'local> FnMut(&'local Pubkey, &'local AccountSharedData) -> R,
-            ) -> R {
-                unimplemented!()
-            }
-            fn is_zero_lamport(&self, _index: usize) -> bool {
-                self.0.is_zero_lamport()
-            }
-            fn data_len(&self, _index: usize) -> usize {
-                self.0.data.len()
-            }
-            fn pubkey(&self, _index: usize) -> &Pubkey {
-                self.0.pubkey
-            }
-            fn slot(&self, _index: usize) -> Slot {
-                unimplemented!()
-            }
-            fn target_slot(&self) -> Slot {
-                unimplemented!()
-            }
-            fn len(&self) -> usize {
-                1
-            }
-        }
-
         let split = SplitFile::new(&append_vec_file_info.path)?;
         let mut reader = new_scan_accounts_reader();
         reader.set_file(&append_vec_file_info.file, append_vec_file_info.size)?;
         let mut first_error = None;
         AppendVec::scan_reader(&mut reader, |account| {
-            let result = split.write_accounts(&StorableStoredAccountInfo(account));
+            let result = split.write_accounts(&(0, slice::from_ref(&&account), 0));
             first_error = first_error.take().or(result.err());
         })?;
         if let Some(first_error) = first_error {
