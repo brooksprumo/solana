@@ -80,14 +80,6 @@ const MAX_SNAPSHOT_VERSION_FILE_SIZE: u64 = 8; // byte
 /// Buffer size for reading auxiliary per-snapshot files (obsolete accounts, storages list).
 /// Sized to allow several concurrent reads at the default io-uring reader read size (1MiB).
 const AUX_SNAPSHOT_FILE_READ_BUF_SIZE: usize = 4 * 1024 * 1024;
-/// Max size of an append vec before we covert to a split file at startup.
-/// Not using the const from solana_accounts_db::append_vec, since it is DCOU.
-/// Hence the test-only compile-time assertion.
-const MAX_APPEND_VEC_FILE_SIZE: u64 = 16 * 1024 * 1024 * 1024;
-#[cfg(test)]
-const _: () = assert!(
-    MAX_APPEND_VEC_FILE_SIZE == solana_accounts_db::append_vec::MAXIMUM_APPEND_VEC_FILE_SIZE
-);
 
 // Snapshot Fastboot Version History
 // Legacy - No fastboot version file, storages flushed file presence determines if snapshot is loadable
@@ -1326,7 +1318,6 @@ fn unarchive_snapshot(
                     SnapshotStorageRebuilder::rebuild_storages_from_snapshot_archive(
                         append_vec_files.into_iter().chain(file_receiver),
                         next_append_vec_id,
-                        MAX_APPEND_VEC_FILE_SIZE,
                     )?,
                     measure_name
                 );
