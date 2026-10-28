@@ -359,7 +359,6 @@ impl SplitFile {
             split: self,
             inner,
             meta_writer: BufWriter::with_capacity(WRITE_BUFFER_CAPACITY, meta_file),
-            data_writer: None,
             meta_file_offset,
             data_file_offset,
             _write_guard: write_guard,
@@ -678,7 +677,6 @@ pub struct SplitFileWriter<'a> {
     split: &'a SplitFile,
     inner: &'a WritableState,
     meta_writer: BufWriter<&'a File>,
-    data_writer: Option<BufWriter<&'a File>>,
     meta_file_offset: FileOffset,
     data_file_offset: FileOffset,
     // keep this last in the struct to ensure the buffers are dropped before releasing the lock
@@ -730,17 +728,9 @@ impl SplitFileWriter<'_> {
                             self.inner.data_len.store(data_len64, Ordering::Relaxed);
                             self.data_file_offset = FileOffset(data_len64);
                         }
-                        if self.data_writer.is_none() {
-                            // Data writer also doesn't exist yet, so create it now.
-                            // SAFETY: data_file was created above and must be Some.
-                            let mut data_file = self.inner.data_file.get().unwrap();
-                            data_file.seek(SeekFrom::Start(self.data_file_offset.0))?;
-                            self.data_writer =
-                                Some(BufWriter::with_capacity(WRITE_BUFFER_CAPACITY, data_file));
-                        }
                         let write_info = write_data_entry(
-                            // SAFETY: data_writer was just initialized
-                            self.data_writer.as_mut().unwrap(),
+                            // SAFETY: data_file was checked or created above and must be Some.
+                            self.inner.data_file.get().unwrap(),
                             self.data_file_offset,
                             account.pubkey(),
                             account.data(),
@@ -771,11 +761,8 @@ impl SplitFileWriter<'_> {
         Ok((logical_offsets, logical_stored_size))
     }
 
-    /// Flushes BufWriters and updates meta/data lens.
+    /// Flushes the meta BufWriter and updates meta/data lens.
     pub fn finish(mut self) -> Result<(), SplitFileError> {
-        if let Some(data_writer) = &mut self.data_writer {
-            data_writer.flush()?;
-        }
         self.meta_writer.flush()?;
         self.inner
             .data_len
@@ -1648,10 +1635,8 @@ mod tests {
         let data_offset =
             data::DATA_HEADER_SIZE.next_multiple_of(data::DATA_ENTRY_OFFSET_ALIGNMENT) as u64;
         let wrong_address = Pubkey::new_unique();
-        let mut data_file = data_file;
-        data_file.seek(SeekFrom::Start(data_offset)).unwrap();
         write_data_entry(
-            &mut data_file,
+            data_file,
             FileOffset(data_offset),
             &wrong_address,
             vec![0; data_len].as_slice(),
@@ -1719,10 +1704,8 @@ mod tests {
         let data_offset =
             data::DATA_HEADER_SIZE.next_multiple_of(data::DATA_ENTRY_OFFSET_ALIGNMENT) as u64;
         let wrong_data_len = expected_data_len - 1;
-        let mut data_file = data_file;
-        data_file.seek(SeekFrom::Start(data_offset)).unwrap();
         write_data_entry(
-            &mut data_file,
+            data_file,
             FileOffset(data_offset),
             &address,
             vec![0; wrong_data_len].as_slice(),
