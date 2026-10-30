@@ -44,6 +44,7 @@ stable-abi = [
 [dependencies]
 agave-fs = { workspace = true }
 ahash = { workspace = true }
+hashbrown = { workspace = true, features = ["rayon"] }
 blake3 = { workspace = true }
 bv = { workspace = true, features = ["serde"] }
 dashmap = { workspace = true, features = ["rayon", "raw-api"] }
@@ -51,6 +52,7 @@ itertools = { workspace = true }
 log = { workspace = true }
 modular-bitfield = { workspace = true }
 num_cpus = { workspace = true }
+parking_lot = { workspace = true }
 qualifier_attr = { workspace = true, optional = true }
 rand = { workspace = true }
 rayon = { workspace = true }
@@ -77,6 +79,7 @@ solana-pubkey = { workspace = true, features = ["rand"] }
 solana-rent = { workspace = true, optional = true }
 solana-reward-info = { workspace = true, features = ["serde"] }
 solana-signer = { workspace = true, optional = true }
+solana-sdk-ids = { workspace = true }
 solana-slot-hashes = { workspace = true }
 solana-stake-interface = { workspace = true, optional = true, features = ["serde", "wincode"] }
 solana-svm-transaction = { workspace = true }
@@ -102,7 +105,6 @@ rand_chacha = { workspace = true }
 solana-account = { workspace = true, features = ["wincode"] }
 solana-accounts-db = { path = ".", features = ["agave-unstable-api", "dev-context-only-utils"] }
 solana-instruction = { workspace = true }
-solana-sdk-ids = { workspace = true }
 solana-sha256-hasher = { workspace = true }
 solana-signature = { workspace = true, features = ["rand"] }
 solana-slot-history = { workspace = true }

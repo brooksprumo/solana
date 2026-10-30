@@ -1,4 +1,5 @@
 #![cfg(test)]
+use rayon::iter::IntoParallelRefIterator;
 use {
     super::{
         test_utils::{goto_end_of_slot, update_vote_account_timestamp},
@@ -28,7 +29,7 @@ use {
         snapshot_utils::create_tmp_accounts_dir_for_tests,
         stake_history::StakeHistory,
         stake_utils,
-        stakes::{InvalidCacheEntryReason, SerdeStakesToStakeFormat, Stakes, StakesCache},
+        stakes::{InvalidCacheEntryReason, SerdeStakesToStakeFormat, Stakes},
         sysvar_account::{create_account, from_account},
     },
     agave_feature_set::{self as feature_set, FeatureSet},
@@ -657,8 +658,8 @@ impl Bank {
         thread_pool: &ThreadPool,
         reward_calc_tracer: Option<impl RewardCalcTracer>,
     ) -> StakeDelegationsMap {
-        let stakes = self.stakes_cache.stakes();
-        let stake_delegations = stakes.stake_delegations_vec();
+        let stakes = self.reward_stakes();
+        let stake_delegations = stakes.stake_delegations();
         // Obtain all unique voter pubkeys from stake delegations.
         fn merge(mut acc: HashSet<Pubkey>, other: HashSet<Pubkey>) -> HashSet<Pubkey> {
             if acc.len() < other.len() {
@@ -3351,9 +3352,9 @@ fn test_bank_vote_accounts() {
 
     let vote_accounts = bank.vote_accounts();
 
-    assert_eq!(vote_accounts.len(), 2);
-
-    assert!(vote_accounts.get(&vote_keypair.pubkey()).is_some());
+    // New accounts are directly loadable before admission to an epoch's validator set.
+    assert_eq!(vote_accounts.len(), 1);
+    assert!(bank.get_vote_account(&vote_keypair.pubkey()).is_some());
 
     assert!(bank.withdraw(&vote_keypair.pubkey(), 10).is_ok());
 
@@ -3387,7 +3388,7 @@ fn test_bank_cloned_stake_delegations() {
     bank.squash();
     let bank = Bank::new_from_parent(bank, SlotLeader::new_unique(), 1);
 
-    let stake_delegations = bank.stakes_cache.stakes().stake_delegations().clone();
+    let stake_delegations = bank.reward_stakes().stake_delegations().clone();
     assert_eq!(stake_delegations.len(), 1); // bootstrap validator has
     // to have a stake delegation
 
@@ -3438,7 +3439,7 @@ fn test_bank_cloned_stake_delegations() {
 
     bank.process_transaction(&transaction).unwrap();
 
-    let stake_delegations = bank.stakes_cache.stakes().stake_delegations().clone();
+    let stake_delegations = bank.reward_stakes().stake_delegations().clone();
     assert_eq!(stake_delegations.len(), 2);
     assert!(stake_delegations.get(&stake_keypair.pubkey()).is_some());
 }
@@ -3793,10 +3794,10 @@ fn test_add_instruction_processor_for_existing_unrelated_accounts() {
 
         // Non-builtin loader accounts can not be used for instruction processing
         {
-            let stakes = bank.stakes_cache.stakes();
+            let stakes = bank.reward_stakes();
             assert!(stakes.vote_accounts().as_ref().is_empty());
         }
-        assert!(bank.stakes_cache.stakes().stake_delegations().is_empty());
+        assert!(bank.reward_stakes().stake_delegations().is_empty());
         if pass == 0 {
             add_root_and_flush_write_cache(&bank);
             assert_eq!(
@@ -3813,10 +3814,10 @@ fn test_add_instruction_processor_for_existing_unrelated_accounts() {
         bank.store_account(&vote_id, &vote_account);
         bank.store_account(&stake_id, &stake_account);
         {
-            let stakes = bank.stakes_cache.stakes();
+            let stakes = bank.reward_stakes();
             assert!(!stakes.vote_accounts().as_ref().is_empty());
         }
-        assert!(!bank.stakes_cache.stakes().stake_delegations().is_empty());
+        assert!(!bank.reward_stakes().stake_delegations().is_empty());
         if pass == 1 {
             add_root_and_flush_write_cache(&bank);
             assert_eq!(
@@ -3837,10 +3838,10 @@ fn test_add_instruction_processor_for_existing_unrelated_accounts() {
             ProgramCacheEntry::new_builtin(MockBuiltin::register),
         );
         {
-            let stakes = bank.stakes_cache.stakes();
+            let stakes = bank.reward_stakes();
             assert!(stakes.vote_accounts().as_ref().is_empty());
         }
-        assert!(bank.stakes_cache.stakes().stake_delegations().is_empty());
+        assert!(bank.reward_stakes().stake_delegations().is_empty());
         if pass == 2 {
             add_root_and_flush_write_cache(&bank);
             assert_eq!(
@@ -3866,10 +3867,10 @@ fn test_add_instruction_processor_for_existing_unrelated_accounts() {
         let new_hash = bank.calculate_accounts_lt_hash_for_tests();
         assert_eq!(old_hash, new_hash);
         {
-            let stakes = bank.stakes_cache.stakes();
+            let stakes = bank.reward_stakes();
             assert!(stakes.vote_accounts().as_ref().is_empty());
         }
-        assert!(bank.stakes_cache.stakes().stake_delegations().is_empty());
+        assert!(bank.reward_stakes().stake_delegations().is_empty());
         assert_eq!(
             bank.calculate_capitalization_for_tests(),
             bank.capitalization()
@@ -5612,7 +5613,7 @@ fn test_bank_hash_deterministic_with_stakes_cache() {
     genesis_config.creation_time = 0;
     genesis_config.epoch_schedule = EpochSchedule::new(SLOTS_PER_EPOCH);
 
-    let mut bank0 = Bank::new_for_tests(&genesis_config);
+    let bank0 = Bank::new_for_tests(&genesis_config);
     let rent = bank0.rent_collector.rent.clone();
 
     for (validator_index, validator_keypairs) in validator_keypairs.iter().enumerate() {
@@ -5655,19 +5656,8 @@ fn test_bank_hash_deterministic_with_stakes_cache() {
         bank0.store_account_and_update_capitalization(&pubkey, &account);
     }
 
-    // Simulate starting from a snapshot so subsequent stores populate every overlay: overrides,
-    // additions, and removals.
-    let restored_stakes = {
-        let stakes = bank0.stakes_cache.stakes();
-        Stakes::load_from_accounts(
-            0,
-            stakes.history().clone(),
-            bank0.new_warmup_cooldown_rate_epoch(),
-            pubkeys_by_owner(&stakes),
-            |pubkey| bank0.get_account(pubkey),
-        )
-    };
-    bank0.stakes_cache = StakesCache::new(restored_stakes);
+    // Subsequent stores exercise overrides, additions, and removals in the
+    // write-cache view used by stake calculations.
 
     for (validator_index, validator_keypairs) in validator_keypairs.iter().enumerate() {
         let vote_pubkey = validator_keypairs.vote_keypair.pubkey();
@@ -5688,8 +5678,7 @@ fn test_bank_hash_deterministic_with_stakes_cache() {
                         &removed_stake_account,
                     );
                     let delegated_stake_after_removal = bank0
-                        .stakes_cache
-                        .stakes()
+                        .reward_stakes()
                         .vote_accounts()
                         .get_delegated_stake(&vote_pubkey);
 
@@ -5700,8 +5689,7 @@ fn test_bank_hash_deterministic_with_stakes_cache() {
                     );
                     assert_eq!(
                         bank0
-                            .stakes_cache
-                            .stakes()
+                            .reward_stakes()
                             .vote_accounts()
                             .get_delegated_stake(&vote_pubkey),
                         delegated_stake_after_removal,
@@ -5760,7 +5748,7 @@ fn test_bank_hash_deterministic_with_stakes_cache() {
     // Round-trip a full snapshot. In particular, this checks the exact-size iterator contract used
     // by wincode when stake removals are pending, then reconstructs both AccountsDb and the bank.
     let expected_stake_delegations = {
-        let stakes = bank0.stakes_cache.stakes();
+        let stakes = bank0.reward_stakes();
         stakes.stake_delegations().len()
     };
     while !bank0.is_complete() {
@@ -5800,7 +5788,7 @@ fn test_bank_hash_deterministic_with_stakes_cache() {
     )
     .unwrap();
     assert_eq!(
-        bank0.stakes_cache.stakes().stake_delegations().len(),
+        bank0.reward_stakes().stake_delegations().len(),
         expected_stake_delegations,
         "snapshot restore must preserve the number of stake delegations",
     );
@@ -5860,6 +5848,54 @@ fn test_bank_hash_deterministic_with_stakes_cache() {
         bank2.hash().to_string(),
         "6jBDVYNuCq9LEG1ChbgZY1Q6JW26Q1Crwth7K8XQwwWT",
     );
+}
+
+#[test]
+fn test_vote_account_loads_follow_flush_and_visible_writes() {
+    let GenesisConfigInfo { genesis_config, voting_keypair, .. } =
+        create_genesis_config_with_leader(100_000, &Pubkey::new_unique(), 3);
+    let bank0 = Arc::new(Bank::new_for_tests(&genesis_config));
+    let vote_key = voting_keypair.pubkey();
+    let original = bank0.get_vote_account(&vote_key).unwrap();
+    let epoch_stake = bank0.get_current_epoch_vote_accounts().get(&vote_key).unwrap().0;
+    assert_eq!(bank0.vote_accounts().get(&vote_key).unwrap().0, epoch_stake);
+    add_root_and_flush_write_cache(&bank0);
+    let bank1 = Arc::new(Bank::new_from_parent(bank0, SlotLeader::new_unique(), 1));
+    let mut changed = original.account().clone();
+    changed.set_lamports(changed.lamports() + 10);
+    bank1.store_account(&vote_key, &changed);
+    assert_eq!(bank1.vote_accounts().get(&vote_key).unwrap().1.account(), &changed);
+    assert_eq!(bank1.vote_accounts().get(&vote_key).unwrap().0, epoch_stake);
+    add_root_and_flush_write_cache(&bank1);
+    assert_eq!(bank1.vote_accounts().get(&vote_key).unwrap().1.account(), &changed);
+
+    let bank2 = Bank::new_from_parent(bank1, SlotLeader::new_unique(), 2);
+    bank2.store_account(&vote_key, &AccountSharedData::default());
+    assert!(bank2.vote_accounts().get(&vote_key).is_none());
+    assert!(!bank2.vote_accounts().iter().any(|(key, _)| *key == vote_key));
+    add_root_and_flush_write_cache(&bank2);
+    assert!(bank2.vote_accounts().get(&vote_key).is_none());
+}
+
+#[test]
+fn test_vote_account_scans_are_independent_of_epoch_membership() {
+    let GenesisConfigInfo { genesis_config, .. } =
+        create_genesis_config_with_leader(100_000, &Pubkey::new_unique(), 3);
+    let bank = Bank::new_for_tests(&genesis_config);
+    let before = bank.vote_accounts().len();
+    add_root_and_flush_write_cache(&bank);
+    let ((vote_key, vote_account), (stake_key, stake_account)) =
+        crate::stakes::tests::create_staked_node_accounts(10, &Rent::default());
+    bank.store_account(&vote_key, &vote_account);
+    bank.store_account(&stake_key, &stake_account);
+    assert_eq!(bank.vote_accounts().len(), before);
+    assert!(!bank.vote_accounts().contains_key(&vote_key));
+    assert_eq!(bank.get_vote_account(&vote_key).unwrap().account(), &vote_account);
+    assert!(bank.vote_accounts_for_rpc().unwrap().contains_key(&vote_key));
+    bank.store_account(&stake_key, &AccountSharedData::default());
+    bank.store_account(&vote_key, &AccountSharedData::default());
+    assert!(bank.get_vote_account(&vote_key).is_none());
+    assert!(!bank.vote_accounts_for_rpc().unwrap().contains_key(&vote_key));
 }
 
 #[ignore]
@@ -8604,11 +8640,9 @@ fn test_get_inflation_num_slots_already_activated() {
 #[test]
 fn test_stake_vote_account_validity() {
     let thread_pool = ThreadPoolBuilder::new().num_threads(1).build().unwrap();
-    // TODO: stakes cache should be hardened for the case when the account
-    // owner is changed from vote/stake program to something else. see:
-    // https://github.com/solana-labs/solana/pull/24200#discussion_r849935444
+    // Accounts that leave the vote/stake programs are excluded from rewards.
     check_stake_vote_account_validity(
-        false, // check owner change
+        true, // check owner change
         |bank: &Bank| bank._load_vote_and_stake_accounts(&thread_pool, null_tracer()),
     );
 }
@@ -12368,7 +12402,7 @@ fn test_new_from_snapshot_uses_rent_from_sysvar() {
     // Reconstruct bank from corrupted fields.
     // Use `None` to ensure new_from_snapshot computes the leader, which
     // exercises the slot 0 `highest_staked_node()` path.
-    let pubkeys_by_owner = pubkeys_by_owner(&bank.stakes_cache.stakes());
+    let pubkeys_by_owner = pubkeys_by_owner(&bank.reward_stakes());
     let new_bank = Bank::new_from_snapshot(
         BankRc {
             accounts: Arc::clone(&bank.rc.accounts),
@@ -12418,7 +12452,7 @@ fn test_new_from_snapshot_hashes_per_tick_changed() {
         .map(|(epoch, stakes)| (epoch, stakes.into()))
         .collect();
 
-    let pubkeys_by_owner = pubkeys_by_owner(&bank.stakes_cache.stakes());
+    let pubkeys_by_owner = pubkeys_by_owner(&bank.reward_stakes());
     let new_bank = Bank::new_from_snapshot(
         BankRc {
             accounts: Arc::clone(&bank.rc.accounts),

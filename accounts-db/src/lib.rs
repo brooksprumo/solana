@@ -35,6 +35,7 @@ pub mod read_only_accounts_cache;
 mod read_only_accounts_cache;
 mod split_file;
 pub mod stake_rewards;
+pub mod stakes_cache;
 pub mod storable_accounts;
 pub mod utils;
 pub mod waitable_condvar;

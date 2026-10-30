@@ -42,7 +42,7 @@ use {
 };
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct VoteAccount(Arc<VoteAccountInner>);
+pub struct VoteAccount(VoteAccountInner);
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -52,13 +52,25 @@ pub enum Error {
     InvalidOwner(/*owner:*/ Pubkey),
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct VoteAccountInner {
     account: AccountSharedData,
     vote_state_view: VoteStateView,
 }
 
 pub type VoteAccountsHashMap = HashMap<Pubkey, (/*stake:*/ u64, VoteAccount)>;
+
+/// Vote-account readers can load current account state without building a map.
+pub trait VoteAccountsReader {
+    fn iter(&self) -> impl Iterator<Item = (&Pubkey, (u64, VoteAccount))> + Clone;
+}
+
+impl VoteAccountsReader for VoteAccountsHashMap {
+    fn iter(&self) -> impl Iterator<Item = (&Pubkey, (u64, VoteAccount))> + Clone {
+        HashMap::iter(self).map(|(key, (stake, account))| (key, (*stake, account.clone())))
+    }
+}
+
 #[cfg_attr(feature = "stable-abi", derive(StableAbi, StableAbiSample))]
 #[derive(Debug, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 #[cfg_attr(
@@ -514,11 +526,11 @@ impl TryFrom<AccountSharedData> for VoteAccount {
             return Err(Error::InvalidOwner(*account.owner()));
         }
 
-        Ok(Self(Arc::new(VoteAccountInner {
+        Ok(Self(VoteAccountInner {
             vote_state_view: VoteStateView::try_new(account.data_clone())
                 .map_err(|_| Error::InstructionError(InstructionError::InvalidAccountData))?,
             account,
-        })))
+        }))
     }
 }
 

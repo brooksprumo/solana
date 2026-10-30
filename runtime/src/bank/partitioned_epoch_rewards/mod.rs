@@ -1,3 +1,5 @@
+#[cfg(test)]
+use {crate::stake_history::StakeHistory, solana_stake_interface::state::Delegation};
 mod calculation;
 mod distribution;
 mod epoch_rewards_hasher;
@@ -7,7 +9,6 @@ use {
     super::Bank,
     crate::{
         inflation_rewards::points::PointValue, reward_info::RewardInfo,
-        stake_account::StakeAccount, stake_history::StakeHistory,
     },
     solana_account::{AccountSharedData, ReadableAccount},
     solana_accounts_db::{
@@ -16,7 +17,7 @@ use {
     },
     solana_clock::Slot,
     solana_pubkey::{Pubkey, PubkeyHasherBuilder},
-    solana_stake_interface::state::{Delegation, Stake},
+    solana_stake_interface::state::Stake,
     solana_vote::vote_account::VoteAccounts,
     std::{collections::HashMap, mem::MaybeUninit, sync::Arc},
 };
@@ -332,9 +333,10 @@ pub(super) struct CachedVoteAccounts<'a> {
 }
 
 /// hold reward calc info to avoid recalculation across functions
+#[cfg(test)]
 pub(super) struct EpochRewardCalculateParamInfo<'a> {
     pub(super) stake_history: StakeHistory,
-    pub(super) stake_delegations: Vec<(&'a Pubkey, &'a StakeAccount<Delegation>)>,
+    pub(super) stake_delegations: &'a solana_accounts_db::stakes_cache::StakesMap<crate::stake_account::StakeAccount<solana_stake_interface::state::Delegation>>,
     pub(super) cached_vote_accounts: CachedVoteAccounts<'a>,
 }
 
@@ -352,6 +354,8 @@ pub(super) struct PartitionedRewardsCalculation {
     /// Surfaced for the `epoch_rewards` datapoint without re-running the
     /// filter at distribution time.
     num_filtered_vote_accounts: usize,
+    /// Count captured while the stake table is already available for calculation.
+    num_stake_accounts: usize,
 }
 
 pub(crate) type StakeRewards = Vec<StakeReward>;
@@ -1701,7 +1705,7 @@ mod tests {
 
         let stake_amount = 10_000;
         {
-            let stakes = bank.stakes_cache.stakes();
+            let stakes = bank.reward_stakes();
             assert!(stakes.vote_accounts().as_ref().is_empty());
             assert!(stakes.stake_delegations().is_empty());
         }
@@ -1758,7 +1762,7 @@ mod tests {
         bank.store_account(&stake_address, &stake_account);
 
         {
-            let stakes = bank.stakes_cache.stakes();
+            let stakes = bank.reward_stakes();
             assert_eq!(stakes.vote_accounts().len(), 3);
             assert_eq!(stakes.stake_delegations().len(), 3);
         }
@@ -1777,9 +1781,7 @@ mod tests {
         let NewEpochBundle {
             stake_history: _,
             unfiltered_distribution_vote_accounts,
-            delegated_stakes: _,
             reward_epoch_delegated_stakes,
-            inert_stake_delegations: _,
             filtered_distribution_vote_accounts,
             rewards_calculation: _,
             calculate_activated_stake_time_us: _,

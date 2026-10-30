@@ -242,6 +242,7 @@ agave-xdp = { path = "xdp", version = "=4.5.0-alpha.4", features = ["agave-unsta
 agave-xdp-ebpf = { path = "xdp-ebpf", version = "=4.5.0-alpha.4", features = ["agave-unstable-api"] }
 ahash = "0.8.12"
 allocator-api2 = "0.2.16"
+hashbrown = "0.15.1"
 anyhow = "1.0.104"
 arbitrary = "1.5.0"
 arc-swap = "1.9.3"
@@ -305,7 +306,6 @@ histogram = "0.6.9"
 http = "1.5.0"
 humantime = "2.4.0"
 hyper-util = "0.1.21"
-imbl = "7.0.2"
 indexmap = "2.14.2"
 indicatif = "0.18.6"
 io-uring = { version = "0.7.15", features = ["io_safety"] }

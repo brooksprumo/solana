@@ -82,10 +82,10 @@ struct VoteState {
 
 impl VoteState {
     fn try_new(
-        vote_accounts: &HashMap<Pubkey, (u64, VoteAccount)>,
+        bank: &Bank,
         vote_pubkey: Pubkey,
     ) -> Option<Self> {
-        let Some((_, account)) = vote_accounts.get(&vote_pubkey) else {
+        let Some(account) = bank.get_vote_account(&vote_pubkey) else {
             info!("did not find vote account for vote_pubkey={vote_pubkey}");
             return None;
         };
@@ -371,13 +371,13 @@ fn allocate_updated_accounts(
 fn update_accounts(
     reward_state: &Option<RewardState>,
     final_cert_state: &Option<FinalCertState>,
-    vote_accounts: &HashMap<Pubkey, (u64, VoteAccount)>,
+    bank: &Bank,
     mut updated_accounts: HashMap<Pubkey, VoteState>,
     validators: impl Iterator<Item = Pubkey>,
 ) -> Result<Vec<(Pubkey, AccountSharedData)>, CalcVoteRewardUpdateVoteStatesError> {
     let mut leader_reward = 0;
     for validator in validators {
-        let Some(mut vote_state) = VoteState::try_new(vote_accounts, validator) else {
+        let Some(mut vote_state) = VoteState::try_new(bank, validator) else {
             continue;
         };
         let account_updated = match (reward_state, final_cert_state) {
@@ -406,7 +406,7 @@ fn update_accounts(
             }
             Entry::Vacant(e) => {
                 if let Some(mut vote_state) =
-                    VoteState::try_new(vote_accounts, state.leader_vote_pubkey)
+                    VoteState::try_new(bank, state.leader_vote_pubkey)
                 {
                     state.update_leader(&mut vote_state, leader_reward);
                     e.insert(vote_state);
@@ -447,28 +447,26 @@ pub(super) fn calc_vote_rewards_update_vote_states(
     let final_cert_state = final_cert_input.map(|(signers, final_slot)| {
         FinalCertState::new(bank, signers, final_slot, block_producer_time_nanos)
     });
-    let vote_accounts = bank.vote_accounts();
-
     let updated_accounts = match (&reward_state, &final_cert_state) {
         (None, None) => return Ok(0),
         (Some(state), None) => update_accounts(
             &reward_state,
             &final_cert_state,
-            &vote_accounts,
+            bank,
             updated_accounts,
             state.reward_validators.iter().cloned(),
         )?,
         (None, Some(state)) => update_accounts(
             &reward_state,
             &final_cert_state,
-            &vote_accounts,
+            bank,
             updated_accounts,
             state.signers.iter().cloned(),
         )?,
         (Some(r_state), Some(f_state)) => update_accounts(
             &reward_state,
             &final_cert_state,
-            &vote_accounts,
+            bank,
             updated_accounts,
             r_state.reward_validators.union(f_state.signers).cloned(),
         )?,

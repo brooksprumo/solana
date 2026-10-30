@@ -198,13 +198,12 @@ mod tests {
         }
 
         fn add_tower_rewards(&self, bank: Arc<Bank>) -> Arc<Bank> {
-            let vote_accounts = bank.vote_accounts();
             let updated_accounts = self
                 .validators
                 .iter()
                 .map(|validator| {
                     let vote_pubkey = validator.vote_keypair.pubkey();
-                    let mut vote_state = VoteState::try_new(&vote_accounts, vote_pubkey).unwrap();
+                    let mut vote_state = VoteState::try_new(&bank, vote_pubkey).unwrap();
                     vote_state
                         .handler
                         .increment_credits(bank.epoch(), self.pay_type.tower());
@@ -217,13 +216,12 @@ mod tests {
         }
 
         fn add_ag_rewards(&self, bank: Arc<Bank>) -> Arc<Bank> {
-            let vote_accounts = bank.vote_accounts();
             let updated_accounts = self
                 .validators
                 .iter()
                 .map(|validator| {
                     let vote_pubkey = validator.vote_keypair.pubkey();
-                    let mut vote_state = VoteState::try_new(&vote_accounts, vote_pubkey).unwrap();
+                    let mut vote_state = VoteState::try_new(&bank, vote_pubkey).unwrap();
                     if let Some(ag_credits) = self.pay_type.ag() {
                         increment_credits(
                             vote_state.handler.epoch_credits_mut(),

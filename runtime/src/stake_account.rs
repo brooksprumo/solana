@@ -100,6 +100,16 @@ impl<T> StakeAccount<T> {
 }
 
 impl StakeAccount<Delegation> {
+    /// Decode a delegated account without allocating an error for skipped accounts.
+    pub(crate) fn from_account_if_delegated(account: AccountSharedData) -> Option<Self> {
+        if account.owner() != &stake_program::id() {
+            return None;
+        }
+        let stake_state: StakeStateV2 = account.state().ok()?;
+        stake_state.delegation_ref()?;
+        Some(Self { account, stake_state, _phantom: PhantomData })
+    }
+
     #[inline]
     #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
     pub(crate) fn delegation(&self) -> &Delegation {

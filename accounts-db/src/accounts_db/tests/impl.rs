@@ -1,3 +1,4 @@
+use crate::stakes_cache::StakesMap;
 use {
     super::*,
     crate::{
@@ -29,7 +30,169 @@ use {
     test_case::test_case,
 };
 
+fn stakes_cache_snapshot(db: &AccountsDb, ancestors: &Ancestors) -> StakesCache {
+    let stake_accounts = db.fold_reward_accounts(ancestors, &solana_sdk_ids::stake::id(),
+        StakesMap::default, |mut accounts, key, account| { accounts.insert(*key, account); accounts },
+        |mut a, b| { a.extend(b); a });
+    StakesCache::new(stake_accounts, vote_accounts_snapshot(db, ancestors))
+}
+
+fn vote_accounts_snapshot(db: &AccountsDb, ancestors: &Ancestors) -> StakesMap<AccountSharedData> {
+    db.fold_reward_accounts(ancestors, &solana_sdk_ids::vote::id(),
+        StakesMap::default, |mut accounts, key, account| { accounts.insert(*key, account); accounts },
+        |mut a, b| { a.extend(b); a })
+}
+
 const DEFAULT_FILE_SIZE: u64 = 4 * 1024 * 1024;
+
+#[test]
+fn test_load_uses_stakes_cache_after_write_and_read_cache_misses() {
+    let db = AccountsDb::new_for_tests_with_config(Vec::new(), DEFAULT_ACCOUNTS_DB_CONFIG);
+    let stake = Pubkey::new_unique();
+    let vote = Pubkey::new_unique();
+    let stake_account = AccountSharedData::new(10, 3, &solana_sdk_ids::stake::id());
+    let vote_account = AccountSharedData::new(20, 5, &solana_sdk_ids::vote::id());
+    let old_stake = AccountSharedData::new(9, 3, &solana_sdk_ids::stake::id());
+    db.store_for_tests((3, &[(&stake, &old_stake)][..]));
+    db.add_root_for_tests(3);
+    db.flush_accounts_cache_slot_for_tests(3);
+    db.store_for_tests((5, &[(&stake, &stake_account), (&vote, &vote_account)][..]));
+    db.add_root_for_tests(5);
+    db.flush_accounts_cache_slot_for_tests(5);
+    let ancestors = Ancestors::from(vec![5]);
+    let loads_from_storage = db.load_account_stats.num_loaded_from_index_storage.load(Ordering::Relaxed);
+    for (key, account) in [(&stake, &stake_account), (&vote, &vote_account)] {
+        assert!(db.accounts_cache.load_latest(key, &ancestors).is_none());
+        assert!(db.read_only_accounts_cache.load(key, |_| true).is_none());
+        let (loaded, slot) = db.load(&ancestors, key, PopulateReadCache::False, NO_LOAD_FILTER).unwrap();
+        assert_eq!(&loaded, account);
+        assert_eq!(slot, 5);
+        assert!(Arc::ptr_eq(&loaded.data_clone(), &account.data_clone()));
+        assert!(db.load(&ancestors, key, PopulateReadCache::False,
+            Some(|_, _: &Pubkey, _| false)).is_none());
+    }
+    assert_eq!(db.load_account_stats.num_loaded_from_index_storage.load(Ordering::Relaxed), loads_from_storage);
+
+    assert_eq!(db.load(&Ancestors::from(vec![3]), &stake, PopulateReadCache::False, NO_LOAD_FILTER), Some((old_stake, 3)));
+    assert_eq!(db.load_account_stats.num_loaded_from_index_storage.load(Ordering::Relaxed), loads_from_storage + 1);
+    db.read_only_accounts_cache.store(stake, 5, stake_account.clone());
+    let read_cache_hits = db.load_account_stats.num_loaded_from_read_cache.load(Ordering::Relaxed);
+    assert_eq!(db.load(&ancestors, &stake, PopulateReadCache::False, NO_LOAD_FILTER), Some((stake_account.clone(), 5)));
+    assert_eq!(db.load_account_stats.num_loaded_from_read_cache.load(Ordering::Relaxed), read_cache_hits + 1);
+
+    let changed = AccountSharedData::new(30, 0, &Pubkey::new_unique());
+    db.store_for_tests((6, &[(&stake, &changed), (&vote, &AccountSharedData::default())][..]));
+    db.store_for_tests((7, &[(&stake, &stake_account)][..]));
+    assert_eq!(db.load(&Ancestors::from(vec![5, 6]), &stake, PopulateReadCache::False, NO_LOAD_FILTER), Some((changed, 6)));
+    assert!(db.load(&Ancestors::from(vec![5, 6]), &vote, PopulateReadCache::False, NO_LOAD_FILTER).is_none());
+    assert_eq!(db.load(&Ancestors::from(vec![5, 7]), &stake, PopulateReadCache::False, NO_LOAD_FILTER), Some((stake_account, 7)));
+}
+
+#[test]
+fn test_stakes_cache_rooted_flush_and_fork_overlay() {
+    let db = AccountsDb::new_for_tests_with_config(Vec::new(), DEFAULT_ACCOUNTS_DB_CONFIG);
+    let stake = Pubkey::new_unique();
+    let vote = Pubkey::new_unique();
+    // Deliberately undecodable: the cache retains every live program-owned account.
+    let stake_account = AccountSharedData::new(10, 3, &solana_sdk_ids::stake::id());
+    let vote_account = AccountSharedData::new(20, 5, &solana_sdk_ids::vote::id());
+    db.store_for_tests((0, &[(&stake, &stake_account), (&vote, &vote_account)][..]));
+    assert!(db.stakes_cache.read().stake_accounts.is_empty());
+    db.add_root_for_tests(0);
+    assert!(db.stakes_cache.read().stake_accounts.is_empty());
+    let view = stakes_cache_snapshot(&db, &Ancestors::from(vec![0]));
+    assert_eq!(view.stake_accounts.get(&stake).map(|(_, account)| account), Some(&stake_account));
+    assert_eq!(view.vote_accounts.get(&vote).map(|(_, account)| account), Some(&vote_account));
+    assert_eq!(vote_accounts_snapshot(&db, &Ancestors::from(vec![0])), view.vote_accounts.into_iter().map(|(key, (_, account))| (key, account)).collect());
+    assert_eq!(db.load(&Ancestors::from(vec![0]), &stake, PopulateReadCache::False, NO_LOAD_FILTER).map(|(account, _)| account), Some(stake_account.clone()));
+    db.flush_accounts_cache_slot_for_tests(0);
+    assert_eq!(db.stakes_cache.read().stake_accounts.get(&stake).map(|(_, account)| account), Some(&stake_account));
+
+    let moved = AccountSharedData::new(30, 0, &solana_sdk_ids::vote::id());
+    let closed = AccountSharedData::default();
+    db.store_for_tests((1, &[(&stake, &moved), (&vote, &closed)][..]));
+    let sibling = AccountSharedData::new(99, 0, &solana_sdk_ids::stake::id());
+    db.store_for_tests((2, &[(&stake, &sibling)][..]));
+    let view = stakes_cache_snapshot(&db, &Ancestors::from(vec![0, 1]));
+    assert!(view.stake_accounts.is_empty());
+    assert_eq!(view.vote_accounts.get(&stake).map(|(_, account)| account), Some(&moved));
+    assert!(!view.vote_accounts.contains_key(&vote));
+    assert_eq!(vote_accounts_snapshot(&db, &Ancestors::from(vec![0, 1])), view.vote_accounts.into_iter().map(|(key, (_, account))| (key, account)).collect());
+    assert_eq!(db.load(&Ancestors::from(vec![0, 1]), &stake, PopulateReadCache::False, NO_LOAD_FILTER).map(|(account, _)| account), Some(moved.clone()));
+    assert_eq!(db.load(&Ancestors::from(vec![0, 2]), &stake, PopulateReadCache::False, NO_LOAD_FILTER).map(|(account, _)| account), Some(sibling));
+    // Reading an unrooted fork does not change the persistent cache.
+    assert_eq!(db.stakes_cache.read().stake_accounts.get(&stake).map(|(_, account)| account), Some(&stake_account));
+    db.add_root_for_tests(1);
+    db.flush_accounts_cache_slot_for_tests(1);
+    let rooted = db.stakes_cache.read();
+    assert!(rooted.stake_accounts.is_empty());
+    assert_eq!(rooted.vote_accounts.get(&stake).map(|(_, account)| account), Some(&moved));
+    assert!(!rooted.vote_accounts.contains_key(&vote));
+}
+
+#[test]
+fn test_stakes_cache_cleaned_flush_uses_latest_versions() {
+    let db = AccountsDb::new_for_tests_with_config(Vec::new(), DEFAULT_ACCOUNTS_DB_CONFIG);
+    let key = Pubkey::new_unique();
+    let account = AccountSharedData::new(10, 0, &solana_sdk_ids::stake::id());
+    db.store_for_tests((0, &[(&key, &account)][..]));
+    db.add_root_and_flush_write_cache(0);
+    // The intermediate version is omitted from storage by flush cleaning.
+    db.store_for_tests((1, &[(&key, &account)][..]));
+    db.add_root_for_tests(1);
+    db.store_for_tests((2, &[(&key, &AccountSharedData::default())][..]));
+    db.add_root_for_tests(2);
+    db.flush_accounts_cache(true, Some(2));
+    assert!(db.stakes_cache.read().stake_accounts.is_empty());
+    assert!(stakes_cache_snapshot(&db, &Ancestors::from(vec![2])).stake_accounts.is_empty());
+}
+
+#[test]
+fn test_stakes_cache_startup_resolves_latest_account_without_rpc_indexes() {
+    let db = AccountsDb::new_for_tests_with_config(Vec::new(), DEFAULT_ACCOUNTS_DB_CONFIG);
+    let keys: Vec<_> = (0..5).map(|_| Pubkey::new_unique()).collect();
+    let stake = AccountSharedData::new(10, 1, &solana_sdk_ids::stake::id());
+    let vote = AccountSharedData::new(20, 2, &solana_sdk_ids::vote::id());
+    let other = AccountSharedData::new(30, 0, &Pubkey::default());
+    let closed = AccountSharedData::default();
+    for (slot, accounts) in [
+        (0, vec![(&keys[0], &stake), (&keys[1], &stake), (&keys[2], &vote), (&keys[3], &stake), (&keys[4], &vote)]),
+        (1, vec![(&keys[0], &vote), (&keys[1], &closed), (&keys[2], &other)]),
+    ] {
+        let store = db.create_store(slot, 4096);
+        store.write_accounts(&(slot, &accounts[..])).unwrap();
+        db.storage.insert(Arc::new(store));
+    }
+    let info = db.generate_index(None, false, &[]);
+    assert!(info.pubkeys_by_owner.is_empty());
+    let cache = db.stakes_cache.read();
+    assert_eq!(cache.stake_accounts.len(), 1);
+    assert_eq!(cache.stake_accounts.get(&keys[3]).map(|(_, account)| account), Some(&stake));
+    assert_eq!(cache.vote_accounts.len(), 2);
+    assert_eq!(cache.vote_accounts.get(&keys[0]).map(|(_, account)| account), Some(&vote));
+    assert_eq!(cache.vote_accounts.get(&keys[4]).map(|(_, account)| account), Some(&vote));
+}
+
+#[test]
+fn test_stakes_cache_flush_handoff_keeps_rewards_view_complete() {
+    let db = AccountsDb::new_for_tests_with_config(Vec::new(), DEFAULT_ACCOUNTS_DB_CONFIG);
+    let keys: Vec<_> = (0..100).map(|_| Pubkey::new_unique()).collect();
+    let account = AccountSharedData::new(10, 0, &solana_sdk_ids::stake::id());
+    let accounts: Vec<_> = keys.iter().map(|key| (key, &account)).collect();
+    db.store_for_tests((0, &accounts[..]));
+    db.add_root_for_tests(0);
+    thread::scope(|scope| {
+        let flush = scope.spawn(|| db.flush_accounts_cache_slot_for_tests(0));
+        for _ in 0..50 {
+            let view = stakes_cache_snapshot(&db, &Ancestors::from(vec![0]));
+            assert_eq!(view.stake_accounts.len(), keys.len());
+            for key in &keys {
+                assert_eq!(db.load(&Ancestors::from(vec![0]), key, PopulateReadCache::False, NO_LOAD_FILTER).map(|(account, _)| account), Some(account.clone()));
+            }
+        }
+        flush.join().unwrap();
+    });
+}
 
 fn linear_ancestors(end_slot: u64) -> Ancestors {
     let mut ancestors = Ancestors::from(vec![0]);

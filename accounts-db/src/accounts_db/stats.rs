@@ -11,7 +11,6 @@ use {
 #[derive(Debug, Default)]
 pub struct AccountsStats {
     pub last_store_report: AtomicInterval,
-    pub stakes_cache_check_and_store_us: AtomicU64,
     pub create_store_count: AtomicU64,
     pub dropped_stores: AtomicU64,
     pub handle_dead_keys_us: AtomicU64,
@@ -764,6 +763,7 @@ pub struct WriteAccountsToCacheStats {
 pub struct LoadAccountsStats {
     pub num_loaded_from_write_cache: AtomicU64,
     pub num_loaded_from_read_cache: AtomicU64,
+    pub num_loaded_from_stakes_cache: AtomicU64,
     pub num_loaded_from_index_storage: AtomicU64,
 }
 
@@ -779,6 +779,11 @@ impl LoadAccountsStats {
             (
                 "num_loaded_from_read_cache",
                 self.num_loaded_from_read_cache.swap(0, Ordering::Relaxed),
+                i64
+            ),
+            (
+                "num_loaded_from_stakes_cache",
+                self.num_loaded_from_stakes_cache.swap(0, Ordering::Relaxed),
                 i64
             ),
             (

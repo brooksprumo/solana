@@ -354,10 +354,8 @@ pub fn execute_block_proto(context: &ProtoBlockContext) -> ProtoBlockEffects {
         Vec::new()
     } else {
         let stakes = bank.stakes();
-        let mut entries = stakes.stake_delegations_vec();
-        entries.sort_unstable_by_key(|(pubkey, _)| **pubkey);
-        entries
-            .into_iter()
+        let mut delegations: Vec<_> = stakes.stake_delegations()
+            .iter()
             .map(|(pubkey, stake_account)| {
                 let delegation = stake_account.delegation();
                 protos::StakeDelegation {
@@ -371,7 +369,9 @@ pub fn execute_block_proto(context: &ProtoBlockContext) -> ProtoBlockEffects {
                     data_len: stake_account.data_len() as u64,
                 }
             })
-            .collect()
+            .collect();
+        delegations.sort_unstable_by(|a, b| a.stake_account.cmp(&b.stake_account));
+        delegations
     };
 
     // Then include in the output

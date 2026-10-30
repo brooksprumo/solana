@@ -74,7 +74,6 @@ crossbeam-channel = { workspace = true }
 crossbeam-queue = { workspace = true }
 crossbeam-utils = { workspace = true }
 dashmap = { workspace = true, features = ["rayon", "raw-api"] }
-imbl = { workspace = true, features = ["rayon"] }
 itertools = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }

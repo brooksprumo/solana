@@ -74,7 +74,7 @@ use {
             MaxAllowableDrift, calculate_stake_weighted_timestamp,
         },
         stakes::{
-            DelegatedStakes, EpochBoundaryStakes, SerdeStakesToStakeFormat, Stakes, StakesCache,
+            EpochBoundaryStakes, SerdeStakesToStakeFormat, Stakes,
         },
         status_cache::{SlotDelta, StatusCache},
         sysvar_account::{RENT_UNADJUSTED_INITIAL_BALANCE, create_account, from_account},
@@ -143,7 +143,7 @@ use {
     solana_inflation::Inflation,
     solana_keypair::Keypair,
     solana_lattice_hash::lt_hash::LtHash,
-    solana_measure::{measure::Measure, measure_time, measure_us},
+    solana_measure::{measure::Measure, measure_us},
     solana_message::{
         AccountKeys, SanitizedMessage, inner_instruction::InnerInstructions, v0::LoadedAddresses,
     },
@@ -210,7 +210,7 @@ use {
         vote_account::{VoteAccount, VoteAccounts, VoteAccountsHashMap},
         vote_parser,
     },
-    solana_vote_interface::state::VoteStateV4,
+    solana_vote_interface::state::{VoteStateV4, VoteStateVersions},
     std::{
         collections::{HashMap, HashSet},
         fmt,
@@ -234,7 +234,7 @@ use {
 use {
     dashmap::DashSet,
     qualifier_attr::{field_qualifiers, qualifiers},
-    rayon::iter::{IntoParallelRefIterator, ParallelIterator},
+    rayon::iter::ParallelIterator,
     solana_accounts_db::accounts_db::{
         ACCOUNTS_DB_CONFIG_FOR_BENCHMARKS, ACCOUNTS_DB_CONFIG_FOR_TESTING,
     },
@@ -252,6 +252,10 @@ mod check_transactions;
 pub mod entry_bytes_budget;
 mod fee_distribution;
 mod metrics;
+mod vote_accounts;
+mod stake_accounts;
+pub use stake_accounts::{BankStakeAccounts, StakeAccountsReader};
+pub use vote_accounts::BankVoteAccounts;
 pub(crate) mod partitioned_epoch_rewards;
 mod recent_blockhashes_account;
 mod sysvar_cache;
@@ -682,7 +686,6 @@ impl PartialEq for Bank {
             rent_collector,
             epoch_schedule,
             inflation,
-            stakes_cache,
             epoch_stakes,
             is_delta,
             accounts_lt_hash,
@@ -748,7 +751,6 @@ impl PartialEq for Bank {
             && rent_collector == &other.rent_collector
             && epoch_schedule == &other.epoch_schedule
             && *inflation.read().unwrap() == *other.inflation.read().unwrap()
-            && *stakes_cache.stakes() == *other.stakes_cache.stakes()
             && epoch_stakes == &other.epoch_stakes
             && is_delta.load(Relaxed) == other.is_delta.load(Relaxed)
             && *accounts_lt_hash.lock().unwrap() == *other.accounts_lt_hash.lock().unwrap()
@@ -928,9 +930,6 @@ pub struct Bank {
 
     /// inflation specs
     inflation: Arc<RwLock<Inflation>>,
-
-    /// cache of vote_account and stake_account state for this fork
-    stakes_cache: StakesCache,
 
     /// staked nodes on epoch boundaries, saved off when a bank.slot() is at
     ///   a leader schedule calculation boundary
@@ -1195,14 +1194,10 @@ struct NewEpochBundle {
     stake_history: CowStakeHistory,
     /// Vote accounts computed from the stakes cache for the current
     /// (distribution) epoch *before* applying any VAT filtering.
+    #[cfg(test)]
     unfiltered_distribution_vote_accounts: VoteAccounts,
-    /// Current effective stake delegated to each vote account pubkey.
-    delegated_stakes: DelegatedStakes,
     /// Stake amounts for the end of the rewarded epoch
     reward_epoch_delegated_stakes: RewardEpochDelegatedStakes,
-    /// Delegations eligible for eviction when `remove_inactive_stakes`
-    /// is active.
-    inert_stake_delegations: Vec<Pubkey>,
     /// Vote accounts computed from the stakes cache for the current
     /// (distribution) epoch *after* applying VAT filtering.
     filtered_distribution_vote_accounts: VoteAccounts,
@@ -1257,7 +1252,6 @@ impl Bank {
             rent_collector: RentCollector::default(),
             epoch_schedule: EpochSchedule::default(),
             inflation: Arc::<RwLock<Inflation>>::default(),
-            stakes_cache: StakesCache::default(),
             epoch_stakes: HashMap::<Epoch, VersionedEpochStakes>::default(),
             is_delta: AtomicBool::default(),
             rewards: RwLock::<Vec<(Pubkey, RewardInfo)>>::default(),
@@ -1448,9 +1442,6 @@ impl Bank {
         let (blockhash_queue, blockhash_queue_time_us) =
             measure_us!(RwLock::new(parent.blockhash_queue.read().unwrap().clone()));
 
-        let (stakes_cache, stakes_cache_time_us) =
-            measure_us!(StakesCache::new(parent.stakes_cache.stakes().clone()));
-
         let (epoch_stakes, epoch_stakes_time_us) = measure_us!(parent.epoch_stakes.clone());
 
         let (transaction_processor, builtin_program_ids_time_us) = measure_us!(
@@ -1509,8 +1500,6 @@ impl Bank {
             transaction_entries_count: AtomicU64::new(0),
             transactions_per_entry_max: AtomicU64::new(0),
             entry_bytes_consumed: EntryBytesBudget::new(parent.entry_bytes_budget().slot_limit()),
-            // we will .clone_with_epoch() this soon after stake data update; so just .clone() for now
-            stakes_cache,
             epoch_stakes,
             parent_hash: parent.hash(),
             parent_slot: parent.slot(),
@@ -1588,7 +1577,6 @@ impl Bank {
                 status_cache_time_us,
                 fee_components_time_us,
                 blockhash_queue_time_us,
-                stakes_cache_time_us,
                 epoch_stakes_time_us,
                 builtin_program_ids_time_us,
                 executor_cache_time_us: 0,
@@ -1757,14 +1745,6 @@ impl Bank {
             .new_warmup_cooldown_rate_epoch(&self.epoch_schedule)
     }
 
-    /// Whether we are in the epoch rewards period. We must check parent slot to
-    /// correctly return `true` during the pre-execution period in the first block
-    /// of the epoch before `epoch_reward_status` is updated.
-    fn in_epoch_rewards_period(&self) -> bool {
-        matches!(self.epoch_reward_status, EpochRewardStatus::Active(_))
-            || self.epoch_schedule.get_epoch(self.parent_slot) < self.epoch()
-    }
-
     /// Get cached vote account state from the past few epochs so that some vote
     /// state configuration changes are delayed before being used in reward
     /// calculation.
@@ -1804,23 +1784,19 @@ impl Bank {
         // Add new entry to stakes.stake_history, set appropriate epoch and
         // update vote accounts with warmed up stakes before saving a
         // snapshot of stakes in epoch stakes
-        let stakes = self.stakes_cache.stakes();
-        let stake_delegations = stakes.stake_delegations_vec();
+        let stake_history = self.load_reward_stake_history();
+        let stake_delegations = self.stake_accounts_for_rewards();
         let (
             EpochBoundaryStakes {
                 stake_history,
                 vote_accounts: unfiltered_distribution_vote_accounts,
-                delegated_stakes,
                 mut reward_epoch_delegated_stakes,
-                inert_stake_delegations,
             },
             calculate_activated_stake_time_us,
-        ) = measure_us!(stakes.calculate_activated_stake(
-            self.epoch(),
-            thread_pool,
-            self.new_warmup_cooldown_rate_epoch(),
-            &stake_delegations,
-            self.feature_set.snapshot().remove_inactive_stakes,
+        ) = measure_us!(Stakes::<StakeAccount<Delegation>>::calculate_epoch_boundary(
+            rewarded_epoch, stake_history, self.epoch(), thread_pool,
+            self.new_warmup_cooldown_rate_epoch(), &stake_delegations,
+            |delegated_stakes| self.load_reward_vote_accounts(delegated_stakes),
         ));
         debug_assert_eq!(reward_epoch_delegated_stakes.epoch, rewarded_epoch);
 
@@ -1840,7 +1816,7 @@ impl Bank {
         let (rewards_calculation, update_rewards_with_thread_pool_time_us) =
             measure_us!(self.calculate_rewards(
                 &stake_history,
-                stake_delegations,
+                &stake_delegations,
                 cached_vote_accounts,
                 rewarded_epoch,
                 &reward_epoch_delegated_stakes,
@@ -1850,10 +1826,9 @@ impl Bank {
             ));
         NewEpochBundle {
             stake_history,
+            #[cfg(test)]
             unfiltered_distribution_vote_accounts,
-            delegated_stakes,
             reward_epoch_delegated_stakes,
-            inert_stake_delegations,
             filtered_distribution_vote_accounts,
             rewards_calculation,
             calculate_activated_stake_time_us,
@@ -1881,14 +1856,12 @@ impl Bank {
         let mut rewards_metrics = RewardsMetrics::default();
         let NewEpochBundle {
             stake_history,
-            unfiltered_distribution_vote_accounts,
-            delegated_stakes,
             reward_epoch_delegated_stakes,
-            inert_stake_delegations,
             filtered_distribution_vote_accounts,
             rewards_calculation,
             calculate_activated_stake_time_us,
             update_rewards_with_thread_pool_time_us,
+            ..
         } = self.compute_new_epoch_caches_and_rewards(
             thread_pool,
             parent_epoch,
@@ -1896,13 +1869,9 @@ impl Bank {
             &mut rewards_metrics,
         );
 
-        self.stakes_cache.activate_epoch(
-            epoch,
-            stake_history,
-            unfiltered_distribution_vote_accounts,
-            delegated_stakes,
-            &inert_stake_delegations,
-        );
+        self.update_sysvar_account(&stake_history::id(), |account| {
+            create_account::<StakeHistory>(&stake_history, self.inherit_lamports(account))
+        });
 
         // Save a snapshot of stakes for use in consensus and stake weighted networking
         let leader_schedule_epoch = self.epoch_schedule.get_leader_schedule_epoch(slot);
@@ -2115,7 +2084,7 @@ impl Bank {
         leader_for_tests: Option<SlotLeader>,
         debug_keys: Option<Arc<HashSet<Pubkey>>>,
         accounts_data_size_initial: u64,
-        pubkeys_by_owner: ahash::HashMap<Pubkey, Vec<Pubkey>>,
+        _pubkeys_by_owner: ahash::HashMap<Pubkey, Vec<Pubkey>>,
         epoch_stakes: HashMap<Epoch, VersionedEpochStakes>,
     ) -> Self {
         let now = Instant::now();
@@ -2126,39 +2095,6 @@ impl Bank {
         // Initialize the rewards thread pool while creating the first bank so
         // the first epoch boundary crossing does not pay the cost.
         let rewards_calculation_thread_pool = rewards_calculation_thread_pool();
-        // Build the stakes cache from accounts-db, not from the copy in the
-        // snapshot. Stake and vote accounts were found while building the
-        // index. Stake history comes from its sysvar, which the cache writes
-        // at every epoch boundary. The feature set does not exist yet, so
-        // the one feature the stake math needs is read from its account.
-        //
-        // Note that we are disabling the read cache while we populate the stakes cache.
-        // The stakes accounts will not be expected to be loaded again.
-        // If we populate the read cache with these loads, then we'll just soon have to evict these.
-        let load_account = |pubkey: &Pubkey| {
-            let (account, _slot) = bank_rc
-                .accounts
-                .load_do_not_populate_read_cache(&ancestors, pubkey)?;
-            Some(account)
-        };
-        let stake_history = Self::load_sysvar_for_snapshot_load(
-            &bank_rc.accounts,
-            &ancestors,
-            &stake_history::id(),
-        );
-        let new_rate_activation_epoch =
-            load_account(&feature_set::reduce_stake_warmup_cooldown::id())
-                .and_then(|account| feature::state::from_account(&account))
-                .and_then(|feature| feature.activated_at)
-                .map(|activation_slot| fields.epoch_schedule.get_epoch(activation_slot));
-        let (stakes, stakes_time) = measure_time!(Stakes::load_from_accounts(
-            epoch,
-            stake_history,
-            new_rate_activation_epoch,
-            pubkeys_by_owner,
-            load_account,
-        ));
-        info!("Loading Stakes took: {stakes_time}");
         assert!(
             fields.versioned_epoch_stakes.is_empty(),
             "should be already converted and passed in epoch_stakes parameter"
@@ -2173,8 +2109,9 @@ impl Bank {
             if slot == 0 {
                 // Genesis snapshot has no leader for the genesis block.
                 // Instead the leader is set to the maximum delegated vote account.
-                stakes
-                    .highest_staked_node()
+                epoch_stakes.iter().min_by_key(|(epoch, _)| *epoch).expect("genesis epoch stakes")
+                    .1.stakes().vote_accounts().find_max_by_delegated_stake()
+                    .map(|(vote_address, account)| SlotLeader { id: *account.node_pubkey(), vote_address: *vote_address })
                     .expect("genesis snapshot should contain at least one staked vote account")
             } else {
                 Self::slot_leader_from_epoch_stakes(
@@ -2247,7 +2184,6 @@ impl Bank {
             ),
             epoch_schedule: fields.epoch_schedule,
             inflation: Arc::new(RwLock::new(fields.inflation)),
-            stakes_cache: StakesCache::new(stakes),
             epoch_stakes,
             is_delta: AtomicBool::new(fields.is_delta),
             rewards: RwLock::new(vec![]),
@@ -2367,7 +2303,7 @@ impl Bank {
             fee_rate_governor: self.fee_rate_governor.clone(),
             epoch_schedule: self.epoch_schedule.clone(),
             inflation: *self.inflation.read().unwrap(),
-            stakes: self.stakes_cache.stakes().clone(),
+            stakes: Stakes::default(),
             is_delta: self.is_delta.load(Relaxed),
             accounts_data_len: self.load_accounts_data_size(),
             versioned_epoch_stakes: self.epoch_stakes.clone(),
@@ -2720,7 +2656,7 @@ impl Bank {
             // At the epoch boundary, `compute_new_epoch_caches_and_rewards`
             // has already produced the VAT-filtered vote-account snapshot;
             // reuse it here instead of re-cloning and re-filtering the
-            // `stakes_cache`. Other callers (same-epoch refresh, warps)
+            // accounts view. Other callers (same-epoch refresh, warps)
             // fall back to `get_top_epoch_stakes`.
             let stakes = match prefiltered_distribution_vote_accounts {
                 Some(prefiltered) => Stakes::new(prefiltered, self.epoch()),
@@ -2739,10 +2675,7 @@ impl Bank {
             // It is expensive to log the details of epoch stakes. Only log them at "trace"
             // level for debugging purpose.
             if log::log_enabled!(log::Level::Trace) {
-                let vote_stakes: HashMap<_, _> = self
-                    .stakes_cache
-                    .stakes()
-                    .vote_accounts()
+                let vote_stakes: HashMap<_, _> = self.current_reward_vote_accounts()
                     .delegated_stakes()
                     .map(|(pubkey, stake)| (*pubkey, stake))
                     .collect();
@@ -2839,13 +2772,13 @@ impl Bank {
         if epoch == Some(self.epoch()) {
             return;
         }
-        // if I'm the first Bank in an epoch, ensure stake_history is updated
-        self.update_sysvar_account(&stake_history::id(), |account| {
-            create_account::<StakeHistory>(
-                self.stakes_cache.stakes().history(),
-                self.inherit_lamports(account),
-            )
-        });
+        // Epoch transitions store the newly calculated history in process_new_epoch.
+        // Genesis creates the sysvar once, before there is any history to record.
+        if self.get_account(&stake_history::id()).is_none() {
+            self.update_sysvar_account(&stake_history::id(), |account| {
+                create_account(&StakeHistory::default(), self.inherit_lamports(account))
+            });
+        }
     }
 
     /// Rebuilds slot-param state from the current feature set.
@@ -2957,9 +2890,7 @@ impl Bank {
         &self,
         vote_account_pubkey: &Pubkey,
     ) -> std::result::Result<(), VATHealthError> {
-        let vote_accounts = self.vote_accounts();
-
-        let Some((_, vote_account)) = vote_accounts.get(vote_account_pubkey) else {
+        let Some(vote_account) = self.get_vote_account(vote_account_pubkey) else {
             return Err(VATHealthError::VoteAccountNotFound);
         };
 
@@ -3199,8 +3130,10 @@ impl Bank {
     ) -> Option<UnixTimestamp> {
         let mut get_timestamp_estimate_time = Measure::start("get_timestamp_estimate");
         let slots_per_epoch = self.epoch_schedule().slots_per_epoch;
-        let vote_accounts = self.vote_accounts();
-        let recent_timestamps = vote_accounts.iter().filter_map(|(pubkey, (_, account))| {
+        let epoch = self.epoch_schedule().get_epoch(self.slot());
+        let stakes = self.epoch_vote_accounts(epoch)?;
+        let recent_timestamps = stakes.keys().filter_map(|pubkey| {
+            let account = self.get_vote_account(pubkey)?;
             let vote_state = account.vote_state_view();
             let last_timestamp = vote_state.last_timestamp();
             let slot_delta = self.slot().checked_sub(last_timestamp.slot)?;
@@ -3216,8 +3149,6 @@ impl Bank {
                 )
             }
         };
-        let epoch = self.epoch_schedule().get_epoch(self.slot());
-        let stakes = self.epoch_vote_accounts(epoch)?;
         let stake_weighted_timestamp = calculate_stake_weighted_timestamp(
             recent_timestamps,
             stakes,
@@ -3391,7 +3322,7 @@ impl Bank {
                 "{pubkey} repeated in genesis config"
             );
             let account_shared_data = create_account_shared_data(account);
-            self.store_account_without_stakes_cache(pubkey, &account_shared_data);
+            self.store_account(pubkey, &account_shared_data);
             self.capitalization.fetch_add(account.lamports(), Relaxed);
             self.accounts_data_size_initial += account.data().len() as u64;
         }
@@ -3402,19 +3333,12 @@ impl Bank {
                 "{pubkey} repeated in genesis config"
             );
             let account_shared_data = create_account_shared_data(account);
-            self.store_account_without_stakes_cache(pubkey, &account_shared_data);
+            self.store_account(pubkey, &account_shared_data);
             self.accounts_data_size_initial += account.data().len() as u64;
         }
 
-        self.stakes_cache = StakesCache::new(Stakes::new_from_accounts_for_genesis(
-            self.new_warmup_cooldown_rate_epoch(),
-            genesis_config.accounts.iter(),
-        ));
-
-        // After storing genesis accounts, the bank stakes cache will be warmed
-        // up and can be used to set the leader id to the highest staked
-        // node.
-        let leader = self.stakes_cache.stakes().highest_staked_node();
+        let leader = self.current_reward_vote_accounts().find_max_by_delegated_stake()
+            .map(|(key, account)| SlotLeader { id: *account.node_pubkey(), vote_address: *key });
         // If a leader is specified for test purposes, use that and if no leader found, use a random one.
         #[cfg(feature = "dev-context-only-utils")]
         let leader = leader_for_tests
@@ -4616,11 +4540,6 @@ impl Bank {
             );
         });
 
-        // Cached vote and stake accounts are synchronized with accounts-db
-        // after each transaction.
-        let ((), update_stakes_cache_us) =
-            measure_us!(self.update_stakes_cache(sanitized_txs, &processing_results));
-
         let accounts_data_len_delta = processing_results
             .iter()
             .filter_map(|processing_result| processing_result.processed_transaction())
@@ -4640,10 +4559,6 @@ impl Bank {
         self.filter_program_errors_and_collect_fee_details(&processing_results);
 
         timings.saturating_add_in_place(ExecuteTimingType::StoreUs, store_accounts_us);
-        timings.saturating_add_in_place(
-            ExecuteTimingType::UpdateStakesCacheUs,
-            update_stakes_cache_us,
-        );
         timings.saturating_add_in_place(
             ExecuteTimingType::UpdateTransactionStatuses,
             update_transaction_statuses_us,
@@ -4956,57 +4871,57 @@ impl Bank {
         self.store_accounts((self.slot(), &[(pubkey, account)][..]), None)
     }
 
+    pub fn stake_accounts_for_rewards(&self) -> BankStakeAccounts<'_> {
+        BankStakeAccounts { bank: self }
+    }
+
+    fn load_reward_stake_history(&self) -> crate::stake_history::StakeHistory {
+        self.get_account(&stake_history::id())
+            .map(|account| wincode::deserialize(account.data()).expect("valid stake history sysvar"))
+            .unwrap_or_default()
+    }
+
+    fn load_reward_vote_accounts(&self, delegated_stakes: &crate::stakes::DelegatedStakes) -> VoteAccounts {
+        let accounts = self.rc.accounts.accounts_db.fold_reward_accounts(&self.ancestors, &solana_vote_program::id(),
+            VoteAccountsHashMap::default,
+            |mut accounts, key, account| {
+                if VoteStateVersions::is_correct_size_and_initialized(account.data()) {
+                    if let Ok(account) = VoteAccount::try_from(account) {
+                        accounts.insert(*key, (delegated_stakes.get(key).copied().unwrap_or_default(), account));
+                    }
+                }
+                accounts
+            }, |mut a, b| { a.extend(b); a });
+        VoteAccounts::from(Arc::new(accounts))
+    }
+
+    fn current_reward_vote_accounts(&self) -> VoteAccounts {
+        rewards_calculation_thread_pool().install(|| {
+            let history = self.load_reward_stake_history();
+            let delegated_stakes = Stakes::<StakeAccount<Delegation>>::calculate_delegated_stakes(
+                &self.stake_accounts_for_rewards(), self.epoch(), &history, self.new_warmup_cooldown_rate_epoch(),
+            );
+            self.load_reward_vote_accounts(&delegated_stakes)
+        })
+    }
+
+    /// Materialized fixture for dev utilities and tests; production rewards stream their inputs.
+    #[cfg(any(test, feature = "dev-context-only-utils"))]
+    fn reward_stakes(&self) -> Stakes<StakeAccount<Delegation>> {
+        let delegations = self.stake_accounts_for_rewards().fold(
+            solana_accounts_db::stakes_cache::StakesMap::default,
+            |mut accounts, key, account| { accounts.insert(*key, account.clone()); accounts },
+            |mut a, b| { a.extend(b); a });
+        Stakes::reward_fixture(self.epoch(), self.load_reward_stake_history(),
+            self.current_reward_vote_accounts(), delegations, self.new_warmup_cooldown_rate_epoch())
+    }
+
     // Store `accounts`.
     //
     // - Callers must ensure there are no duplicates in `accounts`.
     // - `thread_pool_for_loading_accounts` is used for accounts lt hashing,
     //   to load the previous version of accounts in parallel.
     pub fn store_accounts<'a>(
-        &self,
-        accounts: impl StorableAccounts<'a>,
-        thread_pool_for_loading_accounts: Option<&ThreadPool>,
-    ) {
-        assert!(!self.freeze_started());
-        let mut m = Measure::start("stakes_cache.check_and_store");
-        let new_warmup_cooldown_rate_epoch = self.new_warmup_cooldown_rate_epoch();
-        let in_epoch_rewards_period = self.in_epoch_rewards_period();
-        let remove_inactive_stakes = self.feature_set.snapshot().remove_inactive_stakes;
-
-        (0..accounts.len()).for_each(|i| {
-            // The unfortunately named `account_for_geyser()` is just a means to get
-            // a ref to the underlying `AccountSharedData`. The function may be
-            // `unimplemented!()`, but this is only done internally to accounts-db;
-            // every impl passed to `store_accounts()` is a wrapper over `AccountSharedData`.
-            accounts.account_for_geyser(i, |pubkey, account| {
-                self.stakes_cache.check_and_store(
-                    pubkey,
-                    account,
-                    new_warmup_cooldown_rate_epoch,
-                    in_epoch_rewards_period,
-                    remove_inactive_stakes,
-                )
-            })
-        });
-        self.store_accounts_without_stakes_cache(accounts, thread_pool_for_loading_accounts);
-        m.stop();
-        self.rc
-            .accounts
-            .accounts_db
-            .stats
-            .stakes_cache_check_and_store_us
-            .fetch_add(m.as_us(), Relaxed);
-    }
-
-    fn store_account_without_stakes_cache(&self, pubkey: &Pubkey, account: &AccountSharedData) {
-        self.store_accounts_without_stakes_cache((self.slot(), &[(pubkey, account)][..]), None)
-    }
-
-    // Store `accounts`, without updating the stakes cache.
-    //
-    // - Callers must ensure there are no duplicates in `accounts`.
-    // - `thread_pool_for_loading_accounts` is used for accounts lt hashing,
-    //   to load the previous version of accounts in parallel.
-    fn store_accounts_without_stakes_cache<'a>(
         &self,
         accounts: impl StorableAccounts<'a>,
         thread_pool_for_loading_accounts: Option<&ThreadPool>,
@@ -5880,64 +5795,45 @@ impl Bank {
         self.epoch_schedule().get_leader_schedule_epoch(slot)
     }
 
-    /// a bank-level cache of vote accounts and stake delegation info
-    fn update_stakes_cache(
-        &self,
-        txs: &[impl SVMMessage],
-        processing_results: &[TransactionProcessingResult],
-    ) {
-        debug_assert_eq!(txs.len(), processing_results.len());
-        let new_warmup_cooldown_rate_epoch = self.new_warmup_cooldown_rate_epoch();
-        let in_epoch_rewards_period = self.in_epoch_rewards_period();
-        let remove_inactive_stakes = self.feature_set.snapshot().remove_inactive_stakes;
-        txs.iter()
-            .zip(processing_results)
-            .filter_map(|(tx, processing_result)| {
-                processing_result
-                    .processed_transaction()
-                    .map(|processed_tx| (tx, processed_tx))
-            })
-            .filter_map(|(tx, processed_tx)| {
-                processed_tx
-                    .executed_transaction()
-                    .map(|executed_tx| (tx, executed_tx))
-            })
-            .filter(|(_, executed_tx)| executed_tx.was_successful())
-            .flat_map(|(tx, executed_tx)| {
-                let num_account_keys = tx.account_keys().len();
-                let loaded_tx = &executed_tx.loaded_transaction;
-                loaded_tx.accounts.iter().take(num_account_keys)
-            })
-            .for_each(|(pubkey, account)| {
-                // note that this could get timed to: self.rc.accounts.accounts_db.stats.stakes_cache_check_and_store_us,
-                //  but this code path is captured separately in ExecuteTimingType::UpdateStakesCacheUs
-                self.stakes_cache.check_and_store(
-                    pubkey,
-                    account,
-                    new_warmup_cooldown_rate_epoch,
-                    in_epoch_rewards_period,
-                    remove_inactive_stakes,
-                );
-            });
-    }
-
     #[cfg(feature = "dev-context-only-utils")]
-    pub fn stakes(&self) -> RwLockReadGuard<'_, Stakes<StakeAccount<Delegation>>> {
-        self.stakes_cache.stakes()
+    pub fn stakes(&self) -> Stakes<StakeAccount<Delegation>> {
+        self.reward_stakes()
     }
 
-    /// current vote accounts for this bank along with the stake
-    ///   attributed to each account
-    pub fn vote_accounts(&self) -> Arc<VoteAccountsHashMap> {
-        let stakes = self.stakes_cache.stakes();
-        Arc::from(stakes.vote_accounts())
+    /// Current account data for this epoch's validators, loaded on demand through accounts-db.
+    pub fn vote_accounts(&self) -> BankVoteAccounts<'_> {
+        BankVoteAccounts { bank: self }
     }
 
     /// Vote account for the given vote account pubkey.
     pub fn get_vote_account(&self, vote_account: &Pubkey) -> Option<VoteAccount> {
-        let stakes = self.stakes_cache.stakes();
-        let vote_account = stakes.vote_accounts().get(vote_account)?;
-        Some(vote_account.clone())
+        let account = self.get_account(vote_account)?;
+        if !VoteStateVersions::is_correct_size_and_initialized(account.data()) {
+            return None;
+        }
+        VoteAccount::try_from(account).ok()
+    }
+
+    /// RPC reads account state through normal scans, independently of the rooted
+    /// rewards cache, so historical banks do not observe later flushed roots.
+    pub fn vote_accounts_for_rpc(&self) -> ScanResult<Arc<VoteAccountsHashMap>> {
+        let stake_owner = solana_stake_interface::program::id();
+        let vote_owner = solana_vote_program::id();
+        let stake_accounts = self.get_program_accounts(&stake_owner)?;
+        let vote_accounts = self.get_program_accounts(&vote_owner)?;
+        let pubkeys_by_owner = [
+            (stake_owner, stake_accounts.iter().map(|(key, _)| *key).collect()),
+            (vote_owner, vote_accounts.iter().map(|(key, _)| *key).collect()),
+        ].into_iter().collect();
+        let accounts: ahash::HashMap<_, _> = stake_accounts.into_iter().chain(vote_accounts).collect();
+        let stake_history = self.get_account(&stake_history::id())
+            .map(|account| wincode::deserialize(account.data()).expect("valid stake history sysvar"))
+            .unwrap_or_default();
+        let stakes = Stakes::load_from_accounts(
+            self.epoch(), stake_history, self.new_warmup_cooldown_rate_epoch(),
+            pubkeys_by_owner, |key| accounts.get(key).cloned(),
+        );
+        Ok(Arc::from(stakes.vote_accounts()))
     }
 
     /// Get the EpochStakes for the current Bank::epoch
@@ -6204,12 +6100,6 @@ impl Bank {
         }
 
         self.compute_and_apply_features_after_snapshot_restore();
-        if self.feature_set.snapshot().remove_inactive_stakes {
-            self.stakes_cache.remove_inert_stake_delegations(
-                self.new_warmup_cooldown_rate_epoch(),
-                self.get_epoch_rewards_sysvar().active,
-            );
-        }
 
         self.recalculate_partitioned_rewards_if_active(rewards_thread_pool_builder);
 
@@ -6733,11 +6623,11 @@ impl Bank {
     /// Returns the `Stakes` as filtered by SIMD-0357
     /// See `VoteAccounts::clone_and_filter_for_vat` for the full criteria
     pub fn get_top_epoch_stakes(&self) -> Stakes<StakeAccount<Delegation>> {
-        self.stakes_cache.stakes().clone_and_filter_for_vat(
+        Stakes::new(self.current_reward_vote_accounts().clone_and_filter_for_vat(
             MAX_ALPENGLOW_VOTE_ACCOUNTS,
             self.minimum_vote_account_balance_for_vat(),
             self.feature_set.snapshot().block_revenue_sharing,
-        )
+        ), self.epoch())
     }
 
     /// Calculates and sets block id for `bank`.
@@ -6867,7 +6757,7 @@ impl fmt::Debug for Bank {
 impl Bank {
     /// Shared bank constructor used by `new_for_txn_tests` and
     /// `new_for_block_tests`. Builds only the `Bank` struct from deserialized
-    /// fields with the supplied `leader`, `stakes_cache`, and
+    /// fields with the supplied `leader` and
     /// `accounts_data_size_initial`. All post-init (feature application,
     /// sysvar cache fill, partitioned rewards recalc,
     /// `prepare_for_block_execution`, etc.) is the caller's responsibility.
@@ -6877,7 +6767,6 @@ impl Bank {
         feature_set: FeatureSet,
         epoch_stakes: HashMap<Epoch, VersionedEpochStakes>,
         leader: SlotLeader,
-        stakes_cache: StakesCache,
         accounts_data_size_initial: u64,
     ) -> Self {
         let slot = fields.slot;
@@ -6915,7 +6804,6 @@ impl Bank {
         );
         bank.epoch_schedule = fields.epoch_schedule;
         bank.inflation = Arc::new(RwLock::new(fields.inflation));
-        bank.stakes_cache = stakes_cache;
         bank.epoch_stakes = epoch_stakes;
         bank.is_delta = AtomicBool::new(fields.is_delta);
         bank.cluster_type = Some(ClusterType::Development);
@@ -6961,7 +6849,6 @@ impl Bank {
             feature_set,
             epoch_stakes,
             leader,
-            StakesCache::default(), /* Irrelevant for txn tests */
             0,                      /* Irrelevant to txn execution */
         );
 
@@ -6986,7 +6873,7 @@ impl Bank {
         fields: BankFieldsToDeserialize,
         feature_set: FeatureSet,
         epoch_stakes: HashMap<Epoch, VersionedEpochStakes>,
-        stakes: Stakes<StakeAccount<Delegation>>,
+        _stakes: Stakes<StakeAccount<Delegation>>,
         accounts_data_size_initial: u64,
     ) -> Self {
         let parent_epoch = fields.epoch_schedule.get_epoch(fields.parent_slot);
@@ -7000,7 +6887,6 @@ impl Bank {
             feature_set,
             epoch_stakes,
             leader,
-            StakesCache::new(stakes),
             accounts_data_size_initial,
         );
 
@@ -7009,12 +6895,6 @@ impl Bank {
         }
 
         bank.apply_activated_features();
-        if bank.feature_set.snapshot().remove_inactive_stakes {
-            bank.stakes_cache.remove_inert_stake_delegations(
-                bank.new_warmup_cooldown_rate_epoch(),
-                bank.get_epoch_rewards_sysvar().active,
-            );
-        }
 
         // If booting mid-distribution, recalculate reward partitions from the
         // EpochRewards sysvar (mirrors initialize_after_snapshot_restore).
@@ -7267,21 +7147,12 @@ impl Bank {
 
     /// Get stake and stake node accounts
     pub(crate) fn get_stake_accounts(&self, minimized_account_set: &DashSet<Pubkey>) {
-        self.stakes_cache
-            .stakes()
-            .stake_delegations()
-            .iter()
-            .for_each(|(pubkey, _)| {
-                minimized_account_set.insert(*pubkey);
-            });
-
-        self.stakes_cache
-            .stakes()
-            .staked_nodes()
-            .par_iter()
-            .for_each(|(pubkey, _)| {
-                minimized_account_set.insert(*pubkey);
-            });
+        self.stake_accounts_for_rewards().fold(|| (), |(), key, _| {
+            minimized_account_set.insert(*key);
+        }, |(), ()| ());
+        self.vote_accounts().par_iter().for_each(|(_, (_, account))| {
+            minimized_account_set.insert(*account.node_pubkey());
+        });
     }
 
     /// Returns true when this bank is using slot params beyond its genesis baseline.

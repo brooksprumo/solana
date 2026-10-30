@@ -219,11 +219,11 @@ fn graph_forks(bank_forks: &BankForks, config: &GraphConfig) -> String {
                 let entry = last_votes.entry(*vote_state_view.node_pubkey()).or_insert((
                     last_vote,
                     vote_state_view.clone(),
-                    *stake,
+                    stake,
                     total_stake,
                 ));
                 if entry.0 < last_vote {
-                    *entry = (last_vote, vote_state_view.clone(), *stake, total_stake);
+                    *entry = (last_vote, vote_state_view.clone(), stake, total_stake);
                 }
             }
         }

@@ -62,6 +62,7 @@ use {
         partitioned_rewards::PartitionedEpochRewardsConfig,
         read_only_accounts_cache::ReadOnlyAccountsCache,
         split_file,
+        stakes_cache::StakesCache,
         storable_accounts::{StorableAccounts, StorableAccountsBySlot},
         utils::{self, create_account_shared_data},
     },
@@ -759,6 +760,9 @@ pub struct AccountsDb {
 
     pub accounts_cache: AccountsCache,
 
+    /// Updated only by rooted cache flushes and startup index generation.
+    stakes_cache: parking_lot::RwLock<StakesCache>,
+
     write_cache_limit_bytes: Option<u64>,
 
     read_only_accounts_cache: ReadOnlyAccountsCache,
@@ -969,6 +973,7 @@ impl AccountsDb {
             active_stats: ActiveStats::default(),
             storage: AccountStorage::default(),
             accounts_cache: AccountsCache::default(),
+            stakes_cache: parking_lot::RwLock::default(),
             uncleaned_pubkeys: DashMap::default(),
             pubkeys_removed_from_cache: Mutex::default(),
             next_id: AtomicAccountsFileId::new(0),
@@ -2716,6 +2721,52 @@ impl AccountsDb {
             .filter(|(account, _)| !account.is_zero_lamport())
     }
 
+    /// Stream live stake or vote accounts through the normal loading path.
+    /// Callers must not store into the visible banks while scanning them.
+    /// The cache lock protects flush handoff; normal loads reuse that lock.
+    pub fn fold_reward_accounts<T: Send>(
+        &self,
+        ancestors: &Ancestors,
+        owner: &Pubkey,
+        identity: impl Fn() -> T + Send + Sync,
+        fold: impl Fn(T, &Pubkey, AccountSharedData) -> T + Send + Sync,
+        reduce: impl Fn(T, T) -> T + Send + Sync,
+    ) -> T {
+        let rooted = self.stakes_cache.read_recursive();
+        let accounts = if solana_sdk_ids::stake::check_id(owner) {
+            &rooted.stake_accounts
+        } else {
+            assert!(solana_sdk_ids::vote::check_id(owner));
+            &rooted.vote_accounts
+        };
+        let load = |key: &Pubkey| {
+            self.load(ancestors, key, PopulateReadCache::False,
+                None::<fn(u64, &Pubkey, usize) -> bool>)
+                .map(|(account, _)| account)
+                .filter(|account| account.lamports() != 0 && account.owner() == owner)
+        };
+        let result = accounts.par_iter().filter_map(|(key, _)| load(key).map(|account| (key, account)))
+            .fold(&identity, |acc, (key, account)| fold(acc, key, account)).reduce(&identity, &reduce);
+        let mut result = Some(result);
+        self.accounts_cache.for_each_visible_bank(ancestors, |cache| {
+            let writes = cache.fold_accounts(&identity, |acc, key, cached| {
+                if accounts.contains_key(key) || cached.account.lamports() == 0 || cached.account.owner() != owner {
+                    return acc;
+                }
+                let Some((latest, _)) = self.accounts_cache.load_latest(key, ancestors) else { return acc; };
+                if !Arc::ptr_eq(&latest, cached) {
+                    return acc;
+                }
+                match load(key) {
+                    Some(account) => fold(acc, key, account),
+                    None => acc,
+                }
+            }, &reduce);
+            result = Some(reduce(result.take().unwrap(), writes));
+        });
+        result.unwrap()
+    }
+
     fn do_load(
         &self,
         ancestors: &Ancestors,
@@ -2756,6 +2807,26 @@ impl AccountsDb {
                 load_filter(account.lamports(), account.owner(), account.data().len())
             });
 
+            return should_load_account.then_some((account, slot));
+        }
+
+        // Flushed stake and vote accounts are retained independently of the
+        // bounded read cache. Unflushed fork versions were checked above.
+        // The recorded slot prevents newer roots from leaking into older banks.
+        let get_cached = |stakes_cache: &StakesCache| {
+            stakes_cache.stake_accounts.get(pubkey)
+                .or_else(|| stakes_cache.vote_accounts.get(pubkey))
+                .filter(|(slot, _)| ancestors.is_ancestor(*slot))
+                .map(|(slot, account)| (account.clone(), *slot))
+        };
+        // Reward scans already hold a read guard while enumerating keys.
+        // Recursive reads also let normal loads proceed when a flush is waiting.
+        let cached = get_cached(&self.stakes_cache.read_recursive());
+        if let Some((account, slot)) = cached {
+            self.load_account_stats.num_loaded_from_stakes_cache.fetch_add(1, Ordering::Relaxed);
+            let should_load_account = load_filter.as_ref().is_none_or(|load_filter| {
+                load_filter(account.lamports(), account.owner(), account.data().len())
+            });
             return should_load_account.then_some((account, slot));
         }
 
@@ -3412,10 +3483,10 @@ impl AccountsDb {
         pubkeys_to_store: &PubkeysToStore,
     ) -> FlushStats {
         debug_assert!(self.accounts_cache.contains_unflushed_bank(bank_id));
+        let iter_items: Vec<_> = slot_cache.iter().collect();
         let slot = slot_cache.slot();
         let mut flush_stats = FlushStats::default();
         let mut skipped_zero_lamport_pubkeys = Vec::new();
-        let iter_items: Vec<_> = slot_cache.iter().collect();
 
         // Use ReclaimOldSlots to reclaim old slots if marking obsolete accounts and cleaning.
         // Cleaning is enabled if pubkeys_to_store is PubkeysToStore::Only
@@ -3483,12 +3554,21 @@ impl AccountsDb {
             flush_stats.store_accounts_total_us += Saturating(store_accounts_for_flush_us);
         }
 
+        // Publish retained accounts before removing their write-cache versions.
+        // Keep the cache lock out of storage I/O on the normal load path.
+        let mut stakes_cache = self.stakes_cache.write();
+        for entry in &iter_items {
+            // Include even accounts omitted from storage by flush cleaning.
+            stakes_cache.update(entry.key(), slot_cache.slot(), &entry.value().account);
+        }
+
         // Remove this slot from the cache, which will to AccountsDb's new readers should look like an
         // atomic switch from the cache to storage.
         let pubkeys_removed = self
             .accounts_cache
             .remove_bank(bank_id)
             .expect("slot must be in the cache when flushing");
+        drop(stakes_cache);
 
         // Zero-lamport accounts that were skipped above were never added to the primary
         // index, so their secondary index entries may be purgeable.
@@ -4414,13 +4494,6 @@ impl AccountsDb {
             datapoint_info!(
                 "accounts_db_store_timings",
                 (
-                    "stakes_cache_check_and_store_us",
-                    self.stats
-                        .stakes_cache_check_and_store_us
-                        .swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
                     "read_only_accounts_cache_entries",
                     self.read_only_accounts_cache.cache_len(),
                     i64
@@ -4769,6 +4842,15 @@ impl AccountsDb {
     ) -> IndexGenerationInfo {
         let mut total_time = Measure::start("generate_index");
 
+        // Always collect candidates for the rewards cache, regardless of which
+        // owners the caller requested or which RPC indexes are enabled.
+        let mut cache_owners = owners.to_vec();
+        for owner in [solana_sdk_ids::stake::id(), solana_sdk_ids::vote::id()] {
+            if !cache_owners.contains(&owner) {
+                cache_owners.push(owner);
+            }
+        }
+
         let mut storages = self.storage.all_storages();
         storages.sort_unstable_by_key(|storage| storage.slot());
         if let Some(limit) = limit_load_slot_count_from_snapshot {
@@ -4806,7 +4888,7 @@ impl AccountsDb {
                                 files_per_batch,
                                 &mut thread_accum,
                                 &num_processed,
-                                owners,
+                                &cache_owners,
                             );
                             thread_accum
                         })
@@ -5056,9 +5138,6 @@ impl AccountsDb {
         timings.num_obsolete_accounts_marked = obsolete_account_stats.accounts_marked_obsolete;
         timings.num_slots_removed_as_obsolete = obsolete_account_stats.slots_removed;
         timings.num_zero_lamport_pubkeys = total_accum.num_zero_lamport_pubkeys;
-        total_time.stop();
-        timings.total_time_us = total_time.as_us();
-        timings.report(self.accounts_index.get_startup_stats());
 
         self.accounts_index.log_secondary_indexes();
 
@@ -5099,6 +5178,32 @@ impl AccountsDb {
             pubkeys.par_sort_unstable();
             pubkeys.dedup();
         }
+        // Parallel storage scans can encounter versions in any order. Resolve
+        // candidates through the completed primary index so closures and owner
+        // changes in newer slots cannot resurrect stale stake or vote accounts.
+        let candidates: Vec<_> = [solana_sdk_ids::stake::id(), solana_sdk_ids::vote::id()]
+            .iter()
+            .filter_map(|owner| pubkeys_by_owner.get(owner))
+            .flatten()
+            .collect();
+        let stakes_cache = candidates.into_par_iter().fold(StakesCache::default, |mut cache, pubkey| {
+            if let Some((account, slot)) = self.load(
+                &Ancestors::default(), pubkey, PopulateReadCache::False,
+                None::<fn(u64, &Pubkey, usize) -> bool>,
+            ) {
+                cache.update(pubkey, slot, &account);
+            }
+            cache
+        }).reduce(StakesCache::default, |mut cache, other| {
+            cache.stake_accounts.extend(other.stake_accounts);
+            cache.vote_accounts.extend(other.vote_accounts);
+            cache
+        });
+        *self.stakes_cache.write() = stakes_cache;
+        pubkeys_by_owner.retain(|owner, _| owners.contains(owner));
+        total_time.stop();
+        timings.total_time_us = total_time.as_us();
+        timings.report(self.accounts_index.get_startup_stats());
         IndexGenerationInfo {
             accounts_data_len: total_accum.accounts_data_len,
             calculated_accounts_lt_hash: AccountsLtHash(accounts_lt_hash),

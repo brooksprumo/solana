@@ -134,7 +134,7 @@ fn stable_abi_sample_stake_delegations(
 mod tests {
     use {
         super::*,
-        crate::{serde_snapshot::deserialize_wincode_from, stake_utils, stakes::StakesCache},
+        crate::{serde_snapshot::deserialize_wincode_from, stake_utils},
         rand::Rng,
         solana_rent::Rent,
         solana_vote_interface::state::BLS_PUBLIC_KEY_COMPRESSED_SIZE,
@@ -158,11 +158,7 @@ mod tests {
         }
 
         let mut rng = rand::rng();
-        let stakes_cache = StakesCache::new(Stakes {
-            unused: rng.random(),
-            epoch: rng.random(),
-            ..Stakes::default()
-        });
+        let mut accounts = solana_accounts_db::stakes_cache::StakesCache::default();
         for _ in 0..rng.random_range(5usize..10) {
             let vote_pubkey = solana_pubkey::new_rand();
             let node_pubkey = solana_pubkey::new_rand();
@@ -179,7 +175,7 @@ mod tests {
                 &node_pubkey,
                 rng.random_range(0..1_000_000), // lamports
             );
-            stakes_cache.check_and_store(&vote_pubkey, &vote_account, None, false, false);
+            accounts.vote_accounts.insert(vote_pubkey, (0, vote_account.clone()));
             for _ in 0..rng.random_range(10usize..20) {
                 let stake_pubkey = solana_pubkey::new_rand();
                 let rent = Rent::free();
@@ -190,10 +186,11 @@ mod tests {
                     &rent,
                     rng.random_range(0..1_000_000), // lamports
                 );
-                stakes_cache.check_and_store(&stake_pubkey, &stake_account, None, false, false);
+                accounts.stake_accounts.insert(stake_pubkey, (0, stake_account));
             }
         }
-        let stakes: Stakes<StakeAccount> = stakes_cache.stakes().clone();
+        let mut stakes = Stakes::from_reward_accounts(rng.random(), StakeHistory::default(), &accounts, None);
+        stakes.unused = rng.random();
         assert!(stakes.vote_accounts.as_ref().len() >= 5);
         assert!(stakes.stake_delegations.len() >= 50);
         let dummy = SerializableDummy {

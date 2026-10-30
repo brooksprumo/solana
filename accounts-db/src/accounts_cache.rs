@@ -1,6 +1,7 @@
 use {
     crate::{ancestors::Ancestors, bank_id::BankId},
     dashmap::{DashMap, mapref::entry::Entry},
+    rayon::prelude::*,
     solana_account::{AccountSharedData, ReadableAccount},
     solana_clock::Slot,
     solana_nohash_hasher::BuildNoHashHasher,
@@ -65,6 +66,25 @@ impl Drop for SlotCache {
 }
 
 impl SlotCache {
+    /// Fold immutable slot entries without DashMap's allocating iterator guards.
+    pub(crate) fn fold_accounts<T: Send>(
+        &self,
+        identity: impl Fn() -> T + Send + Sync,
+        fold: impl Fn(T, &Pubkey, &Arc<CachedAccount>) -> T + Send + Sync,
+        reduce: impl Fn(T, T) -> T + Send + Sync,
+    ) -> T {
+        self.cache.shards().par_iter().map(|shard| {
+            let entries = shard.read();
+            // SAFETY: the shard read lock keeps its buckets alive and immutable
+            // for the entire iteration; no bucket reference escapes this closure.
+            unsafe { entries.iter() }.fold(identity(), |acc, bucket| {
+                // SAFETY: this bucket belongs to the table protected above.
+                let (key, account) = unsafe { bucket.as_ref() };
+                fold(acc, key, account.get())
+            })
+        }).reduce(&identity, reduce)
+    }
+
     pub fn len(&self) -> usize {
         self.accounts_count.load(Ordering::Acquire) as usize
     }
@@ -390,6 +410,32 @@ impl AccountsCache {
 
         // Found nothing, the version of the account in the cache must be on a different fork
         None
+    }
+
+    /// Visit visible slot caches without allocating a list of banks.
+    pub(crate) fn for_each_visible_bank(&self, ancestors: &Ancestors, mut visit: impl FnMut(&SlotCache)) {
+        for bank_id in ancestors.iter_bank_ids() {
+            if let Some(cache) = self.bank_cache(bank_id) {
+                visit(&cache);
+            }
+        }
+        let max_bank = ancestors.iter_bank_ids().next();
+        let mut after = None;
+        loop {
+            let next = {
+                use std::ops::Bound::{Excluded, Included, Unbounded};
+                let roots = self.unflushed_roots.read().unwrap();
+                roots.range((after.map_or(Unbounded, Excluded), max_bank.map_or(Unbounded, Included)))
+                    .next().map(|(bank, slot)| (*bank, *slot))
+            };
+            let Some((bank, slot)) = next else { break; };
+            after = Some(bank);
+            if !ancestors.contains_key(&slot) {
+                if let Some(cache) = self.bank_cache(bank) {
+                    visit(&cache);
+                }
+            }
+        }
     }
 
     /// Returns `bank_id`'s cache

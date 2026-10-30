@@ -1263,7 +1263,9 @@ impl JsonRpcRequestProcessor {
         let commission_rate_in_basis_points = bank
             .feature_set
             .is_active(&agave_feature_set::commission_rate_in_basis_points::id());
-        let vote_accounts = bank.vote_accounts();
+        let vote_accounts = bank.vote_accounts_for_rpc().map_err(|e| RpcCustomError::ScanError {
+            message: e.to_string(),
+        })?;
         let epoch_vote_accounts = bank
             .epoch_vote_accounts(bank.get_epoch_and_slot_index(bank.slot()).0)
             .ok_or_else(Error::invalid_request)?;
@@ -8813,7 +8815,7 @@ pub mod tests {
             &bank.get_sysvar_cache_for_tests().get_clock().unwrap(),
         );
         rpc.store_vote_account(&alice_vote_keypair.pubkey(), alice_vote_state);
-        assert_eq!(bank.vote_accounts().len(), 2);
+        assert_eq!(bank.vote_accounts_for_rpc().unwrap().len(), 2);
 
         // Check getVoteAccounts: the bootstrap validator vote account will be delinquent as it has
         // stake but has never voted, and the vote account with no stake should not be present.

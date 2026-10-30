@@ -37,7 +37,7 @@ use {
     solana_pubkey::Pubkey,
     solana_runtime::{bank::Bank, bank_forks::BankForks, commitment::VOTE_THRESHOLD_SIZE},
     solana_slot_history::{Check, SlotHistory},
-    solana_vote::{vote_account::VoteAccountsHashMap, vote_transaction::VoteTransaction},
+    solana_vote::{vote_account::{VoteAccountsHashMap, VoteAccountsReader}, vote_transaction::VoteTransaction},
     solana_vote_program::{
         vote_error::VoteError,
         vote_instruction,
@@ -413,7 +413,7 @@ impl Tower {
         bank_slot: Slot,
         parent_slot: Slot,
         root_slot: Slot,
-        vote_accounts: &VoteAccountsHashMap,
+        vote_accounts: &impl VoteAccountsReader,
         ancestors: &HashMap<Slot, HashSet<Slot>>,
         get_frozen_hash: impl Fn(Slot) -> Option<Hash>,
         latest_validator_votes_for_frozen_banks: &mut LatestValidatorVotesForFrozenBanks,
@@ -427,7 +427,8 @@ impl Tower {
         let mut total_stake = 0;
 
         let total_votes = vote_accounts
-            .values()
+            .iter()
+            .map(|(_, account)| account)
             .filter(|(voted_stake, _)| *voted_stake != 0)
             .map(|(_, account)| account.vote_state_view().votes_len())
             .sum();
@@ -435,7 +436,6 @@ impl Tower {
         let mut lockout_intervals = LockoutIntervals::with_capacity(total_votes);
         let mut my_latest_landed_vote = None;
         for (&key, (voted_stake, account)) in vote_accounts.iter() {
-            let voted_stake = *voted_stake;
             if voted_stake == 0 {
                 continue;
             }

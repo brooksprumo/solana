@@ -9,7 +9,6 @@ use {
             partitioned_epoch_rewards::EpochRewardPhase,
         },
         reward_info::RewardInfo,
-        stake_account::StakeAccount,
     },
     log::error,
     serde::{Deserialize, Serialize},
@@ -19,7 +18,6 @@ use {
     solana_accounts_db::stake_rewards::{StakeReward, StakeRewardInfo},
     solana_clock::Epoch,
     solana_measure::measure_us,
-    solana_pubkey::Pubkey,
     solana_rent::Rent,
     solana_reward_info::RewardType,
     solana_stake_history::StakeHistory,
@@ -258,21 +256,20 @@ impl Bank {
         distribution_epoch: u64,
         stake_history: &StakeHistory,
         new_warmup_cooldown_rate_epoch: Option<Epoch>,
-        stakes_cache_accounts: &imbl::HashMap<Pubkey, StakeAccount<Delegation>>,
+        stakes_cache_accounts: &impl crate::bank::StakeAccountsReader,
         partitioned_stake_reward: &PartitionedStakeReward,
         rent: &Rent,
         adjust_delegations_for_rent: bool,
     ) -> Result<StakeReward, DistributionError> {
         let stake_account = stakes_cache_accounts
             .get(&partitioned_stake_reward.stake_pubkey)
-            .ok_or(DistributionError::AccountNotFound)?
-            .clone();
+            .ok_or(DistributionError::AccountNotFound)?;
 
         let (mut account, stake_state): (AccountSharedData, StakeStateV2) = stake_account.into();
         let StakeStateV2::Stake(meta, stake, flags) = stake_state else {
-            // StakesCache only stores accounts where StakeStateV2::delegation().is_some()
+            // This rewards view only contains decoded delegations.
             unreachable!(
-                "StakesCache entry {:?} failed StakeStateV2 deserialization",
+                "reward stake account {:?} has no delegation",
                 partitioned_stake_reward.stake_pubkey
             )
         };
@@ -369,9 +366,10 @@ impl Bank {
                 )
             });
         let mut updated_stake_rewards = Vec::with_capacity(indices.len());
-        let stakes_cache = self.stakes_cache.stakes();
-        let stakes_cache_accounts = stakes_cache.stake_delegations();
-        let stake_history = stakes_cache.history();
+        let stakes_cache_accounts = self.stake_accounts_for_rewards();
+        let stake_history = self.get_account(&solana_sysvar::stake_history::id())
+            .map(|account| wincode::deserialize::<StakeHistory>(account.data()).expect("valid stake history sysvar"))
+            .unwrap_or_default();
         let new_warmup_cooldown_rate_epoch = self.new_warmup_cooldown_rate_epoch();
         let rent = &self.rent_collector.rent;
         for index in indices {
@@ -394,9 +392,9 @@ impl Bank {
 
             match Self::build_updated_stake_reward(
                 self.epoch,
-                stake_history,
+                &stake_history,
                 new_warmup_cooldown_rate_epoch,
-                stakes_cache_accounts,
+                &stakes_cache_accounts,
                 partitioned_stake_reward,
                 rent,
                 adjust_delegations_for_rent,
@@ -416,7 +414,6 @@ impl Bank {
                 }
             }
         }
-        drop(stakes_cache);
         self.store_accounts(
             (self.slot(), &updated_stake_rewards[..]),
             // Reuse the rewards calculation thread pool to parallelize
@@ -435,6 +432,7 @@ impl Bank {
 
 #[cfg(test)]
 mod tests {
+    use solana_pubkey::Pubkey;
     use {
         super::*,
         crate::{
@@ -846,7 +844,7 @@ mod tests {
             },
             block_reward,
         };
-        let stakes_cache = bank.stakes_cache.stakes();
+        let stakes_cache = bank.reward_stakes();
         let stakes_cache_accounts = stakes_cache.stake_delegations();
         assert_eq!(
             Bank::build_updated_stake_reward(
@@ -886,7 +884,7 @@ mod tests {
             },
             block_reward,
         };
-        let stakes_cache = bank.stakes_cache.stakes();
+        let stakes_cache = bank.reward_stakes();
         let stakes_cache_accounts = stakes_cache.stake_delegations();
         assert_eq!(
             Bank::build_updated_stake_reward(
@@ -936,7 +934,7 @@ mod tests {
             },
             block_reward,
         };
-        let stakes_cache = bank.stakes_cache.stakes();
+        let stakes_cache = bank.reward_stakes();
         let stakes_cache_accounts = stakes_cache.stake_delegations();
         let expected_lamports = starting_lamports + stake_reward + block_reward;
         let mut expected_stake_account = AccountSharedData::new(
@@ -1021,7 +1019,7 @@ mod tests {
             },
             block_reward: 0,
         };
-        let stakes_cache = bank.stakes_cache.stakes();
+        let stakes_cache = bank.reward_stakes();
         let stakes_cache_accounts = stakes_cache.stake_delegations();
         let expected_lamports = starting_lamports + stake_reward;
         let mut expected_stake_account = AccountSharedData::new(

@@ -1,3 +1,5 @@
+#[cfg(test)]
+use solana_vote::vote_account::VoteAccountsHashMap;
 #[cfg(feature = "dev-context-only-utils")]
 use qualifier_attr::qualifiers;
 #[cfg(any(test, feature = "dev-context-only-utils"))]
@@ -64,7 +66,7 @@ use {
     solana_svm_transaction::svm_message::SVMMessage,
     solana_transaction::TransactionVerificationMode,
     solana_transaction_error::{TransactionError, TransactionResult as Result},
-    solana_vote::{vote_account::VoteAccountsHashMap, vote_parser::is_valid_vote_only_transaction},
+    solana_vote::{vote_account::VoteAccountsReader, vote_parser::is_valid_vote_only_transaction},
     std::{
         cmp,
         collections::{HashMap, HashSet},
@@ -2345,17 +2347,17 @@ fn supermajority_root(roots: &[(Slot, u64)], total_epoch_stake: u64) -> Option<S
 
 fn supermajority_root_from_vote_accounts(
     total_epoch_stake: u64,
-    vote_accounts: &VoteAccountsHashMap,
+    vote_accounts: &impl VoteAccountsReader,
     migration_status: &MigrationStatus,
 ) -> Option<Slot> {
     let mut roots_stakes: Vec<(Slot, u64)> = vote_accounts
-        .values()
+        .iter().map(|(_, account)| account)
         .filter_map(|(stake, account)| {
-            if *stake == 0 {
+            if stake == 0 {
                 return None;
             }
 
-            Some((account.vote_state_view().root_slot()?, *stake))
+            Some((account.vote_state_view().root_slot()?, stake))
         })
         .collect();
 
