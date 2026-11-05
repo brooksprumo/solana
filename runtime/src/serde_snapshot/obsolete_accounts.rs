@@ -108,6 +108,21 @@ impl SerdeObsoleteAccountsMap {
         snapshot_storages: &[Arc<AccountStorageEntry>],
         snapshot_slot: Slot,
     ) -> Self {
+        use std::time::Instant;
+
+        let start = Instant::now();
+        let map2: Vec<_> = snapshot_storages
+            .iter()
+            .map(|storage| {
+                (
+                    storage.slot(),
+                    SerdeObsoleteAccounts::new_from_storage_entry_at_slot(storage, snapshot_slot),
+                )
+            })
+            .collect();
+        let dur = start.elapsed();
+
+        let start2 = Instant::now();
         let map = snapshot_storages
             .into_par_iter()
             .map(|storage| {
@@ -117,6 +132,13 @@ impl SerdeObsoleteAccountsMap {
                 )
             })
             .collect();
+        let dur2 = start2.elapsed();
+
+        log::error!(
+            "brooks DEBUG: new_from_storages() seq: {dur:?}, par: {dur2:?}, map2 len: {}",
+            map2.len()
+        );
+
         SerdeObsoleteAccountsMap { map }
     }
 
